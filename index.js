@@ -10,6 +10,23 @@ const { XMLParser } = require('fast-xml-parser');
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://notifyer-camx.onrender.com').replace(/\/$/, '');
 const LEGAL_BASE_URL = PUBLIC_BASE_URL;
 
+// NITTER_INSTANCES: Nitter mirrors to query for Twitter/X posts (no free official X
+// API exists). Mirrors get taken down and spun back up on their own schedule, so this
+// is hardcoded to a known-working list (checked against the community instance tracker
+// on 2026-09-07) rather than left as env-only, since it's easy to forget to set after a
+// redeploy. Override with a comma-separated NITTER_INSTANCES env var if the list goes
+// stale before this file gets updated.
+const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
+    ? process.env.NITTER_INSTANCES.split(',').map(s => s.trim()).filter(Boolean)
+    : [
+        'https://nitter.jaydenha.uk',
+        'https://nitter.kareem.one',
+        'https://nitter.meowing.monster',
+        'https://shitter.thepixora.com',
+        'https://nitter.xitter.cc',
+        'https://x.n0g.xyz',
+    ]);
+
 function postForm(urlStr, formData, extraHeaders = {}) {
     return new Promise((resolve, reject) => {
         const body = new URLSearchParams(formData).toString();
@@ -272,6 +289,35 @@ async function warnTwitterBrokenGuilds() {
     for (const guildId of guildIdsWithTwitter) await warnTwitterOutageForGuild(guildId);
 }
 
+// One-time (per guild) follow-up now that some Nitter mirrors have come back online.
+// Separate flag from twitterOutageWarned above so this sends once on its own even to
+// guilds that already got the original outage warning. Same mod-only-channel rule.
+async function announceTwitterMirrorTestForGuild(guildId) {
+    try {
+        const cfg = await getConfig(guildId);
+        if (cfg.twitterMirrorTestAnnounced) return;
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) return;
+        const channel = findAnnouncementChannel(guild);
+        if (!channel) return;
+        const embed = new EmbedBuilder().setColor('#FFA500').setTitle('🔎 Twitter/X update: testing a recovered mirror')
+            .setDescription(
+                'This server has one or more Twitter/X watches. Twitter/X tracking is still marked unavailable, but one of the public Nitter mirrors it depends on appears to be back online.\n\n' +
+                'We\'re monitoring it before turning Twitter/X tracking back on for everyone. Existing watches stay paused for now, no action needed on your end. We\'ll post again once this is confirmed stable.'
+            );
+        await channel.send({ embeds: [embed] }).catch(e => console.error(`twitter mirror test update send (${guildId}):`, e.message));
+        saveConfig(guildId, { ...cfg, twitterMirrorTestAnnounced: true });
+        console.log(`🔎 Sent Twitter mirror test update to ${guild.name} (#${channel.name})`);
+    } catch (e) {
+        console.error(`announceTwitterMirrorTestForGuild (${guildId}):`, e.message);
+    }
+}
+async function announceTwitterMirrorTestGuilds() {
+    const watches = await getAllWatches();
+    const guildIdsWithTwitter = [...new Set(watches.filter(w => w.platform === 'twitter').map(w => w.guild_id))];
+    for (const guildId of guildIdsWithTwitter) await announceTwitterMirrorTestForGuild(guildId);
+}
+
 async function getWatches(guildId) {
     const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 ORDER BY id', [guildId]);
     return res.rows;
@@ -433,14 +479,7 @@ async function fetchLatestTwitter(handle) {
     // Twitter/X has no free official API. Query several Nitter mirrors in
     // parallel and pick whichever returns the newest tweet (by numeric ID),
     // since individual instances are often stale/cached.
-    const instances = [
-        'https://nitter.net',
-        'https://nitter.privacydev.net',
-        'https://nitter.poast.org',
-        'https://nitter.tiekoetter.com',
-        'https://nitter.cz',
-        'https://lightbrd.com',
-    ];
+    const instances = NITTER_INSTANCES;
 
     const results = await Promise.allSettled(instances.map(async base => {
         const xml = await fetchText(`${base}/${handle}/rss`);
@@ -1022,7 +1061,7 @@ const HELP_CATEGORIES = [
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer — Info')
             .addFields(
                 { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
-                { name: '⚠️ Twitter/X unavailable', value: 'This bot reads X posts through public Nitter mirrors. X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, and every public mirror has since gone offline — so Twitter/X tracking currently doesn\'t work. Other platforms are unaffected, and this will resume automatically if a mirror ever comes back.' },
+                { name: '⚠️ Twitter/X unavailable', value: 'This bot reads X posts through public Nitter mirrors. X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, taking down every public mirror at the time. Some mirrors have come back online since, and we\'re currently testing whether they hold up before re-enabling Twitter/X tracking. Other platforms are unaffected.' },
                 { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`. For Live messages specifically, `{is/was}` renders as "is" when the stream starts and "was" once it ends — so one message works for both.' },
                 { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
@@ -1081,6 +1120,8 @@ client.once('ready', async () => {
 
     // One-time heads-up to servers with Twitter watches that X/Nitter is currently broken.
     await warnTwitterBrokenGuilds();
+    // One-time follow-up that a mirror is being tested for recovery.
+    await announceTwitterMirrorTestGuilds();
 });
 
 client.on('guildCreate', async (guild) => {

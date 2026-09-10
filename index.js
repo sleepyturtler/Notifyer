@@ -16,6 +16,10 @@ const LEGAL_BASE_URL = PUBLIC_BASE_URL;
 // on 2026-09-07) rather than left as env-only, since it's easy to forget to set after a
 // redeploy. Override with a comma-separated NITTER_INSTANCES env var if the list goes
 // stale before this file gets updated.
+// BOT_OWNER_ID: your Discord user ID. Required for /social addtwitter, an owner-only
+// escape hatch to track a Twitter/X account while mirror recovery is still being
+// tested — everyone else gets /social add, which keeps Twitter/X hidden from the
+// platform choices until it's confirmed stable and unflagged in PLATFORMS below.
 const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
     ? process.env.NITTER_INSTANCES.split(',').map(s => s.trim()).filter(Boolean)
     : [
@@ -218,9 +222,26 @@ function saveConfig(guildId, data) {
 
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
 
-// Finds an admin-only channel to post in: a text channel the bot can send in,
-// where @everyone does NOT have ViewChannel (i.e. it's restricted), preferring
-// names containing "admin"/"staff"/"mod". Falls back to the first postable channel.
+// Finds an announcement channel to post in: a text channel the bot can send in.
+// Preference order:
+//   1. Restricted from @everyone AND every role that can view it holds an elevated
+//      permission (Administrator/ManageGuild/ManageChannels/ManageRoles/ManageMessages/
+//      KickMembers/BanMembers) — i.e. actually gated behind a mod/admin-style role,
+//      not just some unrelated "verified"/"subscriber" role — with a name containing
+//      dev/admin/staff/mod/owner preferred within that set.
+//   2. Any channel restricted from @everyone (same name preference).
+//   3. First postable channel with a matching name.
+//   4. First postable channel, period.
+const ANNOUNCEMENT_NAME_HINT = /dev|admin|staff|mod|owner/i;
+const ELEVATED_PERMS = [
+    PermissionFlagsBits.Administrator,
+    PermissionFlagsBits.ManageGuild,
+    PermissionFlagsBits.ManageChannels,
+    PermissionFlagsBits.ManageRoles,
+    PermissionFlagsBits.ManageMessages,
+    PermissionFlagsBits.KickMembers,
+    PermissionFlagsBits.BanMembers,
+];
 function findAnnouncementChannel(guild) {
     const me = guild.members.me;
     if (!me) return null;
@@ -232,13 +253,24 @@ function findAnnouncementChannel(guild) {
     if (!textChannels.size) return null;
 
     const everyoneRole = guild.roles.everyone;
-    const restricted = textChannels.filter(c => !c.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel));
+    const everyoneCanView = c => c.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel);
+    // Non-@everyone roles that can actually view this channel (via overwrite or
+    // guild-wide grant not denied here).
+    const viewerRoles = c => guild.roles.cache.filter(r => r.id !== everyoneRole.id && c.permissionsFor(r)?.has(PermissionFlagsBits.ViewChannel));
+    const isElevatedRole = r => ELEVATED_PERMS.some(p => r.permissions.has(p));
+
+    const restricted = textChannels.filter(c => !everyoneCanView(c));
     if (restricted.size) {
-        const named = restricted.find(c => /admin|staff|mod|owner/i.test(c.name));
-        return named || restricted.first();
+        const highPriv = restricted.filter(c => {
+            const roles = viewerRoles(c);
+            return roles.size > 0 && roles.every(isElevatedRole);
+        });
+        const pool = highPriv.size ? highPriv : restricted;
+        const named = pool.find(c => ANNOUNCEMENT_NAME_HINT.test(c.name));
+        return named || pool.first();
     }
     // No restricted channel found — fall back to first available postable channel
-    const named = textChannels.find(c => /admin|staff|mod|owner|general/i.test(c.name));
+    const named = textChannels.find(c => ANNOUNCEMENT_NAME_HINT.test(c.name) || /general/i.test(c.name));
     return named || textChannels.first();
 }
 
@@ -432,7 +464,7 @@ function profileUrl(platform, handle) {
 }
 
 // ── Platform fetchers: each returns { id, url, title, author, thumbnail, timestamp } or null ──
-async function fetchLatestYouTube(handle) {
+async function fetchLatestYouTubeEntries(handle) {
     let channelId = handle;
     if (handle.startsWith('@') || !/^UC[\w-]{22}$/.test(handle)) {
         // Resolve handle -> channel id via the channel page.
@@ -458,21 +490,27 @@ async function fetchLatestYouTube(handle) {
     const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
     const xml = await fetchText(feedUrl);
     const data = xmlParser.parse(xml);
-    const entries = data?.feed?.entry;
-    if (!entries) return null;
-    const entry = Array.isArray(entries) ? entries[0] : entries;
-    const videoId = entry['yt:videoId'];
-    const url = entry.link?.['@_href'] || `https://www.youtube.com/watch?v=${videoId}`;
-    const postType = await detectYouTubePostType(videoId, url);
-    return {
-        id: videoId,
-        url,
-        title: entry.title,
-        author: data?.feed?.author?.name,
-        thumbnail: entry['media:group']?.['media:thumbnail']?.['@_url'],
-        timestamp: entry.published,
-        postType,
-    };
+    const rawEntries = data?.feed?.entry;
+    if (!rawEntries) return [];
+    // YouTube's channel feed returns recent uploads newest-first, typically up to 15.
+    // Return them ALL (not just the newest) so pollAll can catch up on every upload
+    // since the last check, not just whichever happened to be newest at poll time.
+    // postType is intentionally left uncomputed here — it costs 1-2 extra requests per
+    // video (see detectYouTubePostType), so it's only worth paying for entries that
+    // actually turn out to be new.
+    const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries];
+    return entries.map(entry => {
+        const videoId = entry['yt:videoId'];
+        const url = entry.link?.['@_href'] || `https://www.youtube.com/watch?v=${videoId}`;
+        return {
+            id: videoId,
+            url,
+            title: entry.title,
+            author: data?.feed?.author?.name,
+            thumbnail: entry['media:group']?.['media:thumbnail']?.['@_url'],
+            timestamp: entry.published,
+        };
+    });
 }
 
 async function fetchLatestTwitter(handle) {
@@ -696,7 +734,7 @@ async function detectYouTubePostType(videoId, url) {
 
 async function fetchLatestPost(platform, handle) {
     switch (platform) {
-        case 'youtube': return fetchLatestYouTube(handle);
+        case 'youtube': return null;   // handled separately in pollAll (fetchLatestYouTubeEntries)
         case 'twitter': return fetchLatestTwitter(handle);
         case 'twitch': return null;    // handled separately in pollAll (fetchLatestTwitchAll)
         case 'kick': return null;      // handled separately in pollAll (fetchLatestKickAll)
@@ -836,7 +874,30 @@ async function pollAll() {
             try {
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
-                if (w.platform === 'twitch' || w.platform === 'kick') {
+                if (w.platform === 'youtube') {
+                    // YouTube's feed can contain several new uploads between polls (bursty
+                    // uploaders, a missed/errored poll cycle, etc). Walk every entry not yet
+                    // seen instead of only comparing the single newest one, so nothing gets
+                    // silently skipped.
+                    const entries = await fetchLatestYouTubeEntries(w.handle);
+                    if (!entries.length) { await touchLastChecked(w.id); continue; }
+                    if (w.last_post_id === null) {
+                        // First check for this watch — seed the baseline, don't notify for
+                        // the channel's existing back-catalog.
+                        await updateLastPost(w.id, entries[0].id, entries.map(e => e.id));
+                        continue;
+                    }
+                    const newEntries = entries.filter(e => !seenIds.includes(e.id));
+                    if (!newEntries.length) { await touchLastChecked(w.id); continue; }
+                    // Notify oldest-to-newest so they land in upload order. postType is only
+                    // computed now, for entries confirmed new — see fetchLatestYouTubeEntries.
+                    for (const entry of [...newEntries].reverse()) {
+                        entry.postType = await detectYouTubePostType(entry.id, entry.url);
+                        if (shouldNotify(w, entry)) await sendNotification(w, entry);
+                    }
+                    const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
+                    await updateLastPost(w.id, entries[0].id, mergedSeen);
+                } else if (w.platform === 'twitch' || w.platform === 'kick') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
                     if (w.platform === 'twitch') {
@@ -1094,6 +1155,9 @@ client.once('ready', async () => {
                     .addChoices(...Object.entries(PLATFORMS).filter(([, v]) => !v.unavailable).map(([k, v]) => ({ name: v.label, value: k }))))
                 .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
                 .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+            .addSubcommand(s => s.setName('addtwitter').setDescription('Owner only: track a Twitter/X account while mirror recovery is being tested')
+                .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
+                .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
@@ -1139,6 +1203,91 @@ client.on('guildCreate', async (guild) => {
 // ── Interaction handling ────────────────────────────────────────────────────
 const pendingMessageEdits = new Map(); // userId_watchId -> { guildId }
 
+// Shared by /social add and the owner-only /social addtwitter — everything past the
+// "is this platform allowed for this caller" check is identical, so both subcommand
+// branches call into this once that check has passed.
+async function performAddWatch(interaction, guildId, platform, reply) {
+    const rawHandle = interaction.options.getString('handle');
+    const channel = interaction.options.getChannel('channel');
+    const handle = normalizeHandle(platform, rawHandle);
+    if (!handle) return reply('❌ Could not parse that handle/URL.');
+
+    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+
+    const watches = await getWatches(guildId);
+    if (watches.some(w => w.platform === platform && w.handle.toLowerCase() === handle.toLowerCase() && w.channel_id === channel.id)) {
+        return interaction.editReply('❌ That account is already being tracked in this channel.');
+    }
+    if (watches.length >= 50) return interaction.editReply('❌ This server has reached the maximum of 50 tracked accounts.');
+
+    let post = null;
+    try {
+        if (platform === 'twitch') {
+            const posts = await fetchLatestTwitchAll(handle);
+            post = posts[0] || null;
+        } else if (platform === 'kick') {
+            const posts = await fetchLatestKickAll(handle);
+            post = posts[0] || null;
+        } else {
+            post = await fetchLatestPost(platform, handle);
+        }
+    } catch (e) {
+        if (/HTTP 429/.test(e.message)) {
+            // Rate-limited on verify — account likely exists, proceed anyway
+            post = null;
+        } else {
+            return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}\nDouble-check the handle/URL and try again.`);
+        }
+    }
+
+    const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, addedBy: interaction.user.tag });
+    // Seed last_post_id so the first poll doesn't fire a notification for existing content
+    await updateLastPost(watch.id, post?.id || null);
+    if (platform === 'twitter') warnTwitterOutageForGuild(guildId).catch(() => {});
+
+    const p = PLATFORMS[platform];
+    const types = PLATFORM_NOTIFY_TYPES[platform];
+    const successEmbed = E('#00ff00', 'Now Tracking').addFields(
+        { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
+        { name: 'Account', value: handle, inline: true },
+        { name: 'Channel', value: `${channel}`, inline: true },
+        post?.title
+            ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
+            : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
+    );
+
+    // Single-type platforms (Kick, Twitter) skip the type-choice step entirely —
+    // there's only one kind of post, so go straight to a "set your message" button.
+    if (types.length <= 1) {
+        successEmbed.setDescription('One more step — set the notification message below.')
+            .addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
+        const msgRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
+        );
+        await interaction.editReply({ embeds: [successEmbed], components: [msgRow] });
+        return;
+    }
+
+    // Multi-type platforms: choose notification types first — selecting (or skipping)
+    // chains straight into the per-type message form, so this is a single guided path
+    // instead of separate optional buttons.
+    const typeEmbed = new EmbedBuilder().setColor('#5865F2')
+        .setTitle(`${p.emojiTag} Choose Notification Types`)
+        .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`)
+        .addFields({ name: 'Placeholders (for the message you set next)', value: PLACEHOLDER_HELP });
+    const typeRow = new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+            .setCustomId(`socialtypeadd_select_${watch.id}`)
+            .setPlaceholder('Select notification types…')
+            .setMinValues(1).setMaxValues(types.length)
+            .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
+    );
+    const skipRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
+    );
+    await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] });
+}
+
 client.on('interactionCreate', async interaction => {
   try {
     const guildId = interaction.guild?.id;
@@ -1180,86 +1329,15 @@ client.on('interactionCreate', async interaction => {
                 if (PLATFORMS[platform]?.unavailable) {
                     return reply(`❌ ${PLATFORMS[platform].label} is temporarily unavailable and can't be added right now (see \`/help\` → Info for details).`);
                 }
-                const rawHandle = interaction.options.getString('handle');
-                const channel = interaction.options.getChannel('channel');
-                const handle = normalizeHandle(platform, rawHandle);
-                if (!handle) return reply('❌ Could not parse that handle/URL.');
+                return performAddWatch(interaction, guildId, platform, reply);
+            }
 
-                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-
-                const watches = await getWatches(guildId);
-                if (watches.some(w => w.platform === platform && w.handle.toLowerCase() === handle.toLowerCase() && w.channel_id === channel.id)) {
-                    return interaction.editReply('❌ That account is already being tracked in this channel.');
+            if (sub === 'addtwitter') {
+                const ownerId = process.env.BOT_OWNER_ID;
+                if (!ownerId || interaction.user.id !== ownerId) {
+                    return reply('❌ This command is owner only.');
                 }
-                if (watches.length >= 50) return interaction.editReply('❌ This server has reached the maximum of 50 tracked accounts.');
-
-                let post = null;
-                try {
-                    if (platform === 'twitch') {
-                        const posts = await fetchLatestTwitchAll(handle);
-                        post = posts[0] || null;
-                    } else if (platform === 'kick') {
-                        const posts = await fetchLatestKickAll(handle);
-                        post = posts[0] || null;
-                    } else {
-                        post = await fetchLatestPost(platform, handle);
-                    }
-                } catch (e) {
-                    if (/HTTP 429/.test(e.message)) {
-                        // Rate-limited on verify — account likely exists, proceed anyway
-                        post = null;
-                    } else {
-                        return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}\nDouble-check the handle/URL and try again.`);
-                    }
-                }
-
-                const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, addedBy: interaction.user.tag });
-                // Seed last_post_id so the first poll doesn't fire a notification for existing content
-                await updateLastPost(watch.id, post?.id || null);
-                if (platform === 'twitter') warnTwitterOutageForGuild(guildId).catch(() => {});
-
-                const p = PLATFORMS[platform];
-                const types = PLATFORM_NOTIFY_TYPES[platform];
-                const successEmbed = E('#00ff00', 'Now Tracking').addFields(
-                    { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
-                    { name: 'Account', value: handle, inline: true },
-                    { name: 'Channel', value: `${channel}`, inline: true },
-                    post?.title
-                        ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
-                        : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
-                );
-
-                // Single-type platforms (Kick, Twitter) skip the type-choice step entirely —
-                // there's only one kind of post, so go straight to a "set your message" button.
-                if (types.length <= 1) {
-                    successEmbed.setDescription('One more step — set the notification message below.')
-                        .addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
-                    const msgRow = new ActionRowBuilder().addComponents(
-                        new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
-                    );
-                    await interaction.editReply({ embeds: [successEmbed], components: [msgRow] });
-                    return;
-                }
-
-                // Multi-type platforms: choose notification types first — selecting (or skipping)
-                // chains straight into the per-type message form, so this is a single guided path
-                // instead of separate optional buttons.
-                const typeEmbed = new EmbedBuilder().setColor('#5865F2')
-                    .setTitle(`${p.emojiTag} Choose Notification Types`)
-                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`)
-                    .addFields({ name: 'Placeholders (for the message you set next)', value: PLACEHOLDER_HELP });
-                const typeRow = new ActionRowBuilder().addComponents(
-                    new StringSelectMenuBuilder()
-                        .setCustomId(`socialtypeadd_select_${watch.id}`)
-                        .setPlaceholder('Select notification types…')
-                        .setMinValues(1).setMaxValues(types.length)
-                        .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
-                );
-                const skipRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
-                );
-                await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] });
-                return;
+                return performAddWatch(interaction, guildId, 'twitter', reply);
             }
 
             if (sub === 'list') {

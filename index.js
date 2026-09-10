@@ -10,16 +10,8 @@ const { XMLParser } = require('fast-xml-parser');
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://notifyer-camx.onrender.com').replace(/\/$/, '');
 const LEGAL_BASE_URL = PUBLIC_BASE_URL;
 
-// NITTER_INSTANCES: Nitter mirrors to query for Twitter/X posts (no free official X
-// API exists). Mirrors get taken down and spun back up on their own schedule, so this
-// is hardcoded to a known-working list (checked against the community instance tracker
-// on 2026-09-07) rather than left as env-only, since it's easy to forget to set after a
-// redeploy. Override with a comma-separated NITTER_INSTANCES env var if the list goes
-// stale before this file gets updated.
-// BOT_OWNER_ID: your Discord user ID. Required for /social addtwitter, an owner-only
-// escape hatch to track a Twitter/X account while mirror recovery is still being
-// tested — everyone else gets /social add, which keeps Twitter/X hidden from the
-// platform choices until it's confirmed stable and unflagged in PLATFORMS below.
+// NITTER_INSTANCES: Nitter mirrors for Twitter/X (no free official API exists).
+// Hardcoded default list, override with a comma-separated env var if it goes stale.
 const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
     ? process.env.NITTER_INSTANCES.split(',').map(s => s.trim()).filter(Boolean)
     : [
@@ -222,16 +214,11 @@ function saveConfig(guildId, data) {
 
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
 
-// Finds an announcement channel to post in: a text channel the bot can send in.
-// Preference order:
-//   1. Restricted from @everyone AND every role that can view it holds an elevated
-//      permission (Administrator/ManageGuild/ManageChannels/ManageRoles/ManageMessages/
-//      KickMembers/BanMembers) — i.e. actually gated behind a mod/admin-style role,
-//      not just some unrelated "verified"/"subscriber" role — with a name containing
-//      dev/admin/staff/mod/owner preferred within that set.
-//   2. Any channel restricted from @everyone (same name preference).
-//   3. First postable channel with a matching name.
-//   4. First postable channel, period.
+// Finds a channel to post admin/mod updates in. Prefers a channel hidden from
+// @everyone where every role that can view it has an elevated permission
+// (Administrator/Manage*/Kick/Ban), with dev/admin/staff/mod/owner in the name
+// preferred within that set. Falls back to any @everyone-hidden channel, then
+// any matching-named channel, then the first postable channel.
 const ANNOUNCEMENT_NAME_HINT = /dev|admin|staff|mod|owner/i;
 const ELEVATED_PERMS = [
     PermissionFlagsBits.Administrator,
@@ -254,8 +241,7 @@ function findAnnouncementChannel(guild) {
 
     const everyoneRole = guild.roles.everyone;
     const everyoneCanView = c => c.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel);
-    // Non-@everyone roles that can actually view this channel (via overwrite or
-    // guild-wide grant not denied here).
+    // Non-@everyone roles that can view this channel
     const viewerRoles = c => guild.roles.cache.filter(r => r.id !== everyoneRole.id && c.permissionsFor(r)?.has(PermissionFlagsBits.ViewChannel));
     const isElevatedRole = r => ELEVATED_PERMS.some(p => r.permissions.has(p));
 
@@ -321,9 +307,8 @@ async function warnTwitterBrokenGuilds() {
     for (const guildId of guildIdsWithTwitter) await warnTwitterOutageForGuild(guildId);
 }
 
-// One-time (per guild) follow-up now that some Nitter mirrors have come back online.
-// Separate flag from twitterOutageWarned above so this sends once on its own even to
-// guilds that already got the original outage warning. Same mod-only-channel rule.
+// One-time follow-up that a mirror is back — separate flag so it sends even to
+// guilds already warned about the outage.
 async function announceTwitterMirrorTestForGuild(guildId) {
     try {
         const cfg = await getConfig(guildId);
@@ -492,12 +477,9 @@ async function fetchLatestYouTubeEntries(handle) {
     const data = xmlParser.parse(xml);
     const rawEntries = data?.feed?.entry;
     if (!rawEntries) return [];
-    // YouTube's channel feed returns recent uploads newest-first, typically up to 15.
-    // Return them ALL (not just the newest) so pollAll can catch up on every upload
-    // since the last check, not just whichever happened to be newest at poll time.
-    // postType is intentionally left uncomputed here — it costs 1-2 extra requests per
-    // video (see detectYouTubePostType), so it's only worth paying for entries that
-    // actually turn out to be new.
+    // Return ALL recent entries (newest-first, up to ~15), not just the newest, so
+    // pollAll can catch up on every upload since the last check. postType is left
+    // uncomputed — only worth the extra requests for entries confirmed new.
     const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries];
     return entries.map(entry => {
         const videoId = entry['yt:videoId'];
@@ -788,11 +770,11 @@ function shouldNotify(w, post) {
 const POST_TYPE_BUTTON_LABEL = {
     youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
     twitter:   { posts: 'View Tweet' },
-    twitch:    { live: 'Watch Stream', vods: 'Watch VOD' },
-    kick:      { live: 'Watch Stream' },
+    twitch:    { live: 'Join Stream', vods: 'Watch VOD' },
+    kick:      { live: 'Join Stream' },
 };
 function buttonLabelFor(platform, post) {
-    if (post.isLive) return POST_TYPE_BUTTON_LABEL[platform]?.live || 'Watch Live';
+    if (post.isLive) return POST_TYPE_BUTTON_LABEL[platform]?.live || 'Join Stream';
     return POST_TYPE_BUTTON_LABEL[platform]?.[post.postType] || 'View Post';
 }
 
@@ -875,22 +857,18 @@ async function pollAll() {
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
                 if (w.platform === 'youtube') {
-                    // YouTube's feed can contain several new uploads between polls (bursty
-                    // uploaders, a missed/errored poll cycle, etc). Walk every entry not yet
-                    // seen instead of only comparing the single newest one, so nothing gets
-                    // silently skipped.
+                    // Walk every unseen entry, not just the newest, so bursty uploads
+                    // between polls don't get silently skipped.
                     const entries = await fetchLatestYouTubeEntries(w.handle);
                     if (!entries.length) { await touchLastChecked(w.id); continue; }
                     if (w.last_post_id === null) {
-                        // First check for this watch — seed the baseline, don't notify for
-                        // the channel's existing back-catalog.
+                        // First check — seed baseline, don't notify for the back-catalog
                         await updateLastPost(w.id, entries[0].id, entries.map(e => e.id));
                         continue;
                     }
                     const newEntries = entries.filter(e => !seenIds.includes(e.id));
                     if (!newEntries.length) { await touchLastChecked(w.id); continue; }
-                    // Notify oldest-to-newest so they land in upload order. postType is only
-                    // computed now, for entries confirmed new — see fetchLatestYouTubeEntries.
+                    // Notify oldest-to-newest so they land in upload order
                     for (const entry of [...newEntries].reverse()) {
                         entry.postType = await detectYouTubePostType(entry.id, entry.url);
                         if (shouldNotify(w, entry)) await sendNotification(w, entry);
@@ -1155,9 +1133,6 @@ client.once('ready', async () => {
                     .addChoices(...Object.entries(PLATFORMS).filter(([, v]) => !v.unavailable).map(([k, v]) => ({ name: v.label, value: k }))))
                 .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
                 .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
-            .addSubcommand(s => s.setName('addtwitter').setDescription('Owner only: track a Twitter/X account while mirror recovery is being tested')
-                .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
-                .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
@@ -1203,9 +1178,7 @@ client.on('guildCreate', async (guild) => {
 // ── Interaction handling ────────────────────────────────────────────────────
 const pendingMessageEdits = new Map(); // userId_watchId -> { guildId }
 
-// Shared by /social add and the owner-only /social addtwitter — everything past the
-// "is this platform allowed for this caller" check is identical, so both subcommand
-// branches call into this once that check has passed.
+// Shared handler for /social add's actual watch-creation logic.
 async function performAddWatch(interaction, guildId, platform, reply) {
     const rawHandle = interaction.options.getString('handle');
     const channel = interaction.options.getChannel('channel');
@@ -1330,14 +1303,6 @@ client.on('interactionCreate', async interaction => {
                     return reply(`❌ ${PLATFORMS[platform].label} is temporarily unavailable and can't be added right now (see \`/help\` → Info for details).`);
                 }
                 return performAddWatch(interaction, guildId, platform, reply);
-            }
-
-            if (sub === 'addtwitter') {
-                const ownerId = process.env.BOT_OWNER_ID;
-                if (!ownerId || interaction.user.id !== ownerId) {
-                    return reply('❌ This command is owner only.');
-                }
-                return performAddWatch(interaction, guildId, 'twitter', reply);
             }
 
             if (sub === 'list') {

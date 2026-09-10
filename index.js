@@ -1596,7 +1596,7 @@ const NOTIFYER_LOGO_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAAC
 function legalPage(title, bodyHtml) {
     return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} — Notifyer</title>
 <link rel="icon" type="image/png" href="${NOTIFYER_FAVICON_URI}">
-<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a1a1a;} .brand{display:flex;align-items:center;gap:10px;margin-bottom:20px;} .brand img{width:36px;height:36px;} .brand span{font-weight:600;font-size:1.15em;} h1{margin-bottom:4px;} .updated{color:#666;font-size:0.9em;margin-top:0;} h2{margin-top:28px;} a{color:#5865F2;}</style>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a1a1a;} .brand{display:flex;align-items:center;gap:10px;margin-bottom:20px;} .brand img{width:36px;height:36px;border-radius:8px;} .brand span{font-weight:600;font-size:1.15em;} h1{margin-bottom:4px;} .updated{color:#666;font-size:0.9em;margin-top:0;} h2{margin-top:28px;} a{color:#5865F2;}</style>
 </head><body><div class="brand"><img src="${NOTIFYER_LOGO_URI}" alt="Notifyer logo"><span>Notifyer</span></div>${bodyHtml}</body></html>`;
 }
 

@@ -7,19 +7,8 @@ const http = require('http'), https = require('https');
 const { XMLParser } = require('fast-xml-parser');
 
 // ── OAuth config (Instagram / TikTok) ───────────────────────────────────────
-// Set these env vars on Render. PUBLIC_BASE_URL should be your Render external
-// URL (e.g. https://yourbot.onrender.com) with no trailing slash — it's used
-// to build the OAuth redirect URIs, which must match EXACTLY what you register
-// in the Meta App dashboard / TikTok Developer Portal.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
 const LEGAL_BASE_URL = PUBLIC_BASE_URL || 'https://your-app.onrender.com';
-
-// NITTER_INSTANCES: Nitter mirrors to query for Twitter/X posts (no free official X
-// API exists). Mirrors get taken down and spun back up on their own schedule, so this
-// is hardcoded to a known-working list (checked against the community instance tracker
-// on 2026-09-07) rather than left as env-only, since it's easy to forget to set after a
-// redeploy. Override with a comma-separated NITTER_INSTANCES env var if the list goes
-// stale before this file gets updated. Kept in sync with the release build.
 const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
     ? process.env.NITTER_INSTANCES.split(',').map(s => s.trim()).filter(Boolean)
     : [
@@ -32,8 +21,6 @@ const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
     ]);
 const OAUTH_CONFIG = {
     instagram: {
-        // These come from Meta App Dashboard → your app → Instagram → "API setup with
-        // Instagram Login" → Business login settings — NOT the app's main Facebook App ID/Secret.
         clientId: process.env.INSTAGRAM_APP_ID,
         clientSecret: process.env.INSTAGRAM_APP_SECRET,
         redirectUri: `${PUBLIC_BASE_URL}/oauth/instagram/callback`,
@@ -46,19 +33,10 @@ const OAUTH_CONFIG = {
         clientSecret: process.env.TIKTOK_CLIENT_SECRET,
         redirectUri: `${PUBLIC_BASE_URL}/oauth/tiktok/callback`,
         authUrl: 'https://www.tiktok.com/v2/auth/authorize/',
-        // user.info.basic only grants display_name (the shown nickname) — the actual
-        // unique @username requires user.info.profile specifically.
         scope: 'user.info.basic,user.info.profile,video.list',
-        // TikTok deviates from standard OAuth naming: the authorize endpoint expects
-        // "client_key", not "client_id" — sending the wrong param name here produces
-        // errCode 10003 / error_type=client_key even with a correct, valid key.
         clientIdParam: 'client_key',
     },
 };
-// In-memory pending OAuth states: state -> { guildId, userId, platform, expires }
-// A Discord-side "link" always starts and finishes within a few minutes, so
-// memory (rather than the DB) is fine here — if the process restarts mid-flow
-// the user just runs /social link again.
 const pendingOAuthStates = new Map();
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 function createOAuthState(guildId, userId, platform) {
@@ -141,9 +119,6 @@ let pool; // created in initDB() after resolving the DB host to IPv4
 pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
 
-// Render's managed Postgres hostnames sometimes only resolve to IPv6 on the
-// default resolver, which Render's network can't route (ENETUNREACH). Force
-// an IPv4 lookup and rebuild the pool against the resolved IP if needed.
 async function ensureIPv4Pool() {
     if (!process.env.DATABASE_URL) return;
     try {
@@ -171,11 +146,6 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 
 const PLATFORMS = {
     youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
-    // Twitter/X is flagged unavailable to everyone except BOT_OWNER_ID — Nitter (the
-    // public mirrors this bot reads through) was shut down by an X Corp
-    // cease-and-desist in Aug 2026, but some mirrors have come back since. The owner
-    // can add Twitter/X watches to test mirror reliability before it's reopened to
-    // everyone; see isOwner() and the platform autocomplete handler below.
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2', unavailable: true, ownerOnly: true },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18' },
@@ -187,16 +157,6 @@ function isOwner(userId) {
     return Boolean(ownerId && userId === ownerId);
 }
 
-// Custom (application) emoji support — optional. Upload each platform's icon as an
-// application emoji (Discord Developer Portal → your app → Emojis, or the API —
-// these work in every server the bot is in, no per-guild upload needed), then set
-// EMOJI_<PLATFORM> to the full emoji tag Discord gives you (e.g. copy the emoji from
-// the portal or a message: EMOJI_YOUTUBE=<:yt_icon:1544605242748960859>). Leave unset
-// to keep using the plain Unicode emoji above — nothing breaks either way.
-// (EMOJI_<PLATFORM>_ID / EMOJI_<PLATFORM>_NAME still work too, as separate values, for
-// anyone already using that format — EMOJI_<PLATFORM> just takes priority if both are set.)
-// p.emojiTag    → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
-// p.emojiButton → for ButtonBuilder.setEmoji(p.emojiButton)
 const EMOJI_TAG_RE = /^<a?:(\w+):(\d+)>$/;
 for (const [key, p] of Object.entries(PLATFORMS)) {
     const tagMatch = (process.env[`EMOJI_${key.toUpperCase()}`] || '').match(EMOJI_TAG_RE);
@@ -230,13 +190,6 @@ const PLATFORM_NOTIFY_TYPES = {
     tiktok:    [{ id: 'videos', label: 'Videos', description: 'New TikTok videos' }],
 };
 
-// Two poll cadences instead of one uniform interval:
-//  - "Fast" platforms are all backed by official, generously-rate-limited APIs
-//    (TikTok's video.list/query and Instagram's oauth Graph API both allow 600+
-//    req/min; Twitch Helix and Kick's API are similarly generous) — nothing stops
-//    us from checking these often, so we poll them close to real-time.
-//  - "Slow" platforms are unofficial/scraped (YouTube's unofficial paths, Nitter
-//    for Twitter/X) and need the conservative cadence to avoid getting blocked.
 const FAST_POLL_INTERVAL_MS = 20 * 1000; // 20 seconds
 const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
@@ -294,12 +247,6 @@ async function initDB() {
     await migrateLegacyMessages();
 }
 
-// One-time (idempotent) migration: any watch still using the old single
-// message_template (from the removed /social add "message" option) gets that
-// same text copied into every post type under message_templates, so nothing
-// silently stops sending a message once the old field is phased out. Flagged
-// as legacy_migrated so the manage view can warn it hasn't been reviewed —
-// the wording was written for one generic message and may not fit every type.
 async function migrateLegacyMessages() {
     const res = await pool.query(`
         SELECT * FROM watches
@@ -331,10 +278,16 @@ function saveConfig(guildId, data) {
 }
 
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
-
-// Finds an admin-only channel to post in: a text channel the bot can send in,
-// where @everyone does NOT have ViewChannel (i.e. it's restricted), preferring
-// names containing "admin"/"staff"/"mod". Falls back to the first postable channel.
+const ANNOUNCEMENT_NAME_HINT = /dev|admin|staff|mod|owner/i;
+const ELEVATED_PERMS = [
+    PermissionFlagsBits.Administrator,
+    PermissionFlagsBits.ManageGuild,
+    PermissionFlagsBits.ManageChannels,
+    PermissionFlagsBits.ManageRoles,
+    PermissionFlagsBits.ManageMessages,
+    PermissionFlagsBits.KickMembers,
+    PermissionFlagsBits.BanMembers,
+];
 function findAnnouncementChannel(guild) {
     const me = guild.members.me;
     if (!me) return null;
@@ -346,13 +299,24 @@ function findAnnouncementChannel(guild) {
     if (!textChannels.size) return null;
 
     const everyoneRole = guild.roles.everyone;
-    const restricted = textChannels.filter(c => !c.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel));
+    const everyoneCanView = c => c.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel);
+    // Non-@everyone roles that can actually view this channel (via overwrite or
+    // guild-wide grant not denied here).
+    const viewerRoles = c => guild.roles.cache.filter(r => r.id !== everyoneRole.id && c.permissionsFor(r)?.has(PermissionFlagsBits.ViewChannel));
+    const isElevatedRole = r => ELEVATED_PERMS.some(p => r.permissions.has(p));
+
+    const restricted = textChannels.filter(c => !everyoneCanView(c));
     if (restricted.size) {
-        const named = restricted.find(c => /admin|staff|mod|owner/i.test(c.name));
-        return named || restricted.first();
+        const highPriv = restricted.filter(c => {
+            const roles = viewerRoles(c);
+            return roles.size > 0 && roles.every(isElevatedRole);
+        });
+        const pool = highPriv.size ? highPriv : restricted;
+        const named = pool.find(c => ANNOUNCEMENT_NAME_HINT.test(c.name));
+        return named || pool.first();
     }
     // No restricted channel found — fall back to first available postable channel
-    const named = textChannels.find(c => /admin|staff|mod|owner|general/i.test(c.name));
+    const named = textChannels.find(c => ANNOUNCEMENT_NAME_HINT.test(c.name) || /general/i.test(c.name));
     return named || textChannels.first();
 }
 
@@ -473,10 +437,6 @@ async function getSocialLinkById(id) {
 async function updateSocialLinkTokens(id, accessToken, refreshToken, expiresAt) {
     await pool.query('UPDATE social_links SET access_token = $1, refresh_token = COALESCE($2, refresh_token), expires_at = $3 WHERE id = $4', [accessToken, refreshToken, expiresAt, id]);
 }
-// Deletes a social_links row and detaches any watches still pointing at it
-// (those watches stop polling — see the "not linked yet" guard in pollAll —
-// rather than being deleted outright, so removing a link doesn't silently
-// wipe someone's tracked-account/channel setup).
 async function deleteSocialLink(guildId, id) {
     await pool.query('UPDATE watches SET social_link_id = NULL WHERE guild_id = $1 AND social_link_id = $2', [guildId, id]);
     const res = await pool.query('DELETE FROM social_links WHERE guild_id = $1 AND id = $2', [guildId, id]);
@@ -565,7 +525,7 @@ function profileUrl(platform, handle) {
 }
 
 // ── Platform fetchers: each returns { id, url, title, author, thumbnail, timestamp } or null ──
-async function fetchLatestYouTube(handle) {
+async function fetchLatestYouTubeEntries(handle) {
     let channelId = handle;
     if (handle.startsWith('@') || !/^UC[\w-]{22}$/.test(handle)) {
         // Resolve handle -> channel id via the channel page.
@@ -591,21 +551,21 @@ async function fetchLatestYouTube(handle) {
     const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
     const xml = await fetchText(feedUrl);
     const data = xmlParser.parse(xml);
-    const entries = data?.feed?.entry;
-    if (!entries) return null;
-    const entry = Array.isArray(entries) ? entries[0] : entries;
-    const videoId = entry['yt:videoId'];
-    const url = entry.link?.['@_href'] || `https://www.youtube.com/watch?v=${videoId}`;
-    const postType = await detectYouTubePostType(videoId, url);
-    return {
-        id: videoId,
-        url,
-        title: entry.title,
-        author: data?.feed?.author?.name,
-        thumbnail: entry['media:group']?.['media:thumbnail']?.['@_url'],
-        timestamp: entry.published,
-        postType,
-    };
+    const rawEntries = data?.feed?.entry;
+    if (!rawEntries) return [];
+    const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries];
+    return entries.map(entry => {
+        const videoId = entry['yt:videoId'];
+        const url = entry.link?.['@_href'] || `https://www.youtube.com/watch?v=${videoId}`;
+        return {
+            id: videoId,
+            url,
+            title: entry.title,
+            author: data?.feed?.author?.name,
+            thumbnail: entry['media:group']?.['media:thumbnail']?.['@_url'],
+            timestamp: entry.published,
+        };
+    });
 }
 
 async function fetchLatestTwitter(handle) {
@@ -735,8 +695,6 @@ async function fetchLatestTwitchAll(handle) {
             url: vod.url,
             title: vod.title,
             author: vod.user_name || handle,
-            // Twitch often leaves thumbnail_url empty for VODs (especially right after a
-            // stream ends, before the thumbnail's generated) — same fallback as above.
             thumbnail: vodThumb || profileImageUrl,
             timestamp: vod.published_at || vod.created_at,
             postType: 'vods',
@@ -746,9 +704,6 @@ async function fetchLatestTwitchAll(handle) {
 }
 
 // ── Kick ─────────────────────────────────────────────────────────────────
-// Kick's official public API. Live status is public data, so we use an
-// app-level Client Credentials token (no per-channel authorization needed) —
-// unlike Instagram/TikTok, this works for any public Kick channel.
 async function fetchKick(path) {
     const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
     if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
@@ -771,9 +726,6 @@ async function getKickAppToken() {
     return kickToken;
 }
 
-// Cache slug→channel info mappings to avoid repeated lookups. Stores the broadcaster ID
-// plus a fallback image (profile/banner picture) for when a specific livestream doesn't
-// have its own thumbnail set.
 const kickBroadcasterIdCache = new Map();
 async function getKickChannelInfo(slug) {
     if (kickBroadcasterIdCache.has(slug)) return kickBroadcasterIdCache.get(slug);
@@ -791,8 +743,6 @@ async function getKickBroadcasterId(slug) {
     return (await getKickChannelInfo(slug)).id;
 }
 
-// Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType, isLive}]
-// — only ever 0 or 1 entries, since Kick's public API currently exposes live status only.
 async function fetchLatestKickAll(handle) {
     const { id: broadcasterId, fallbackThumb } = await getKickChannelInfo(handle);
     const data = await fetchKick(`livestreams?broadcaster_user_id=${broadcasterId}`);
@@ -813,7 +763,6 @@ async function fetchLatestKickAll(handle) {
 
 // ── YouTube post type detection ────────────────────────────────────────────
 async function detectYouTubePostType(videoId, url) {
-    // Shorts have a distinctive URL pattern after redirect — check via oEmbed
     if (url?.includes('/shorts/')) return 'shorts';
     // Check if the video is a live stream via YouTube's oEmbed endpoint
     try {
@@ -829,27 +778,22 @@ async function detectYouTubePostType(videoId, url) {
 
 async function fetchLatestPost(platform, handle) {
     switch (platform) {
-        case 'youtube': return fetchLatestYouTube(handle);
+        case 'youtube': return null;
         case 'twitter': return fetchLatestTwitter(handle);
-        case 'twitch': return null;    // handled separately in pollAll (fetchLatestTwitchAll)
-        case 'kick': return null;      // handled separately in pollAll (fetchLatestKickAll)
-        case 'instagram': return null; // handled separately in pollAll (fetchLatestInstagramAll)
-        case 'tiktok': return null;    // handled separately in pollAll (fetchLatestTikTokAll)
+        case 'twitch': return null; 
+        case 'kick': return null;  
+        case 'instagram': return null; 
+        case 'tiktok': return null;   
         default: return null;
     }
 }
 
 // ── OAuth token refresh (Instagram / TikTok) ───────────────────────────────
-// Refreshes a stored social_links row's access token if it's near expiry.
-// Returns the (possibly updated) row, or throws if refresh fails — callers
-// should treat a throw as "the link is dead, tell the person to /social link again".
 async function ensureFreshToken(link) {
     const REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000; // refresh if <24h left
     if (!link.expires_at || link.expires_at - Date.now() > REFRESH_MARGIN_MS) return link;
 
     if (link.platform === 'instagram') {
-        // Instagram User tokens (Instagram Login flow) refresh via graph.instagram.com directly —
-        // no app client_id/secret needed for this call, just the current valid long-lived token.
         const { json } = await fetchJson(
             `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${encodeURIComponent(link.access_token)}`
         );
@@ -896,10 +840,6 @@ async function fetchLatestInstagramAll(link) {
 }
 
 // ── TikTok ───────────────────────────────────────────────────────────────
-// Best-effort: invalidates the token on TikTok's side so this app drops off
-// the user's "Manage app permissions" list. If it fails (already expired,
-// network hiccup, etc.) we still proceed to delete our local copy — an
-// already-dead token isn't a reason to keep the row around.
 async function revokeTikTokToken(link) {
     const cfg = OAUTH_CONFIG.tiktok;
     if (!cfg.clientId || !cfg.clientSecret || !link.access_token) return { ok: false, reason: 'missing credentials/token' };
@@ -989,14 +929,6 @@ function buttonLabelFor(platform, post) {
 // raw URL appears in the message content (not just inside a custom embed).
 const NATIVE_VIDEO_PLATFORMS = new Set(['youtube', 'tiktok']);
 
-// Discord's own crawler frequently fails to unfurl tiktok.com links — missing
-// thumbnails, or sometimes no embed at all — especially with the official API's
-// share_url, which has per-request utm_* tracking params attached (so the same
-// video's URL is never quite identical twice, defeating Discord's unfurl cache).
-// tnktok.com (fxTikTok) is a well-known Discord-embed-fixer mirror that reliably
-// produces a playable video card. We only use it for the auto-unfurled URL in the
-// message body — the "Watch Video" button below still links to the real tiktok.com
-// URL, so people always land on TikTok itself when they click through.
 function embeddableUrl(platform, url) {
     if (platform !== 'tiktok' || !url) return url;
     try {
@@ -1017,11 +949,6 @@ async function fetchTikTokOEmbed(url) {
     return { title: json.title || null, thumbnail: json.thumbnail_url || null, author: json.author_name || null };
 }
 
-// Discord unfurls links asynchronously after the message is sent, and — even with the
-// tnktok.com mirror trick above — sometimes just fails to attach an embed at all (crawler
-// timeout, mirror hiccup, etc.), leaving a bare link with no visual. This checks back a few
-// seconds later and, if nothing got attached, patches the message with a manual embed built
-// from TikTok's own oEmbed API so there's always a visual card, playable or not.
 async function ensureVideoEmbedFallback(channel, messageId, post) {
     await new Promise(r => setTimeout(r, 7000));
     try {
@@ -1080,9 +1007,6 @@ async function sendNotification(w, post) {
     return channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => { console.error('send notification:', e.message); return null; });
 }
 
-// Edits a previously-sent "went live" message to show the stream has ended, once a
-// later poll finds the channel no longer live. Falls back to just clearing the tracked
-// message ID if the message or channel can no longer be found (deleted, permissions, etc.).
 async function markStreamOffline(w) {
     if (!w.live_message_id) return;
     try {
@@ -1128,7 +1052,26 @@ async function pollAll(platforms = null) {
             try {
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
-                if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
+                if (w.platform === 'youtube') {
+                    const entries = await fetchLatestYouTubeEntries(w.handle);
+                    if (!entries.length) { await touchLastChecked(w.id); continue; }
+                    if (w.last_post_id === null) {
+                        // First check for this watch — seed the baseline, don't notify for
+                        // the channel's existing back-catalog.
+                        await updateLastPost(w.id, entries[0].id, entries.map(e => e.id));
+                        continue;
+                    }
+                    const newEntries = entries.filter(e => !seenIds.includes(e.id));
+                    if (!newEntries.length) { await touchLastChecked(w.id); continue; }
+                    // Notify oldest-to-newest so they land in upload order. postType is only
+                    // computed now, for entries confirmed new — see fetchLatestYouTubeEntries.
+                    for (const entry of [...newEntries].reverse()) {
+                        entry.postType = await detectYouTubePostType(entry.id, entry.url);
+                        if (shouldNotify(w, entry)) await sendNotification(w, entry);
+                    }
+                    const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
+                    await updateLastPost(w.id, entries[0].id, mergedSeen);
+                } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
                     if (w.platform === 'twitch') {
@@ -1152,10 +1095,6 @@ async function pollAll(platforms = null) {
                         const sent = await sendNotification(w, post);
                         if (post.isLive && sent) await setWatchLiveMessage(w.id, sent.id);
                     }
-                    // Stream-ended detection: we were tracking a "went live" message, but this
-                    // poll's results no longer include a live entry — edit that message to
-                    // show it ended instead of leaving it saying "is live" forever. (No-op for
-                    // Instagram/TikTok posts, which never set isLive in the first place.)
                     if (!posts.some(p => p.isLive) && w.live_message_id) await markStreamOffline(w);
                     if (w.last_post_id === null && posts.length) {
                         // Seed baseline from first check
@@ -1214,8 +1153,6 @@ async function buildWatchListEmbed(guildId) {
         if (w.role_id) lines.push(`Ping: <@&${w.role_id}>`);
         if (!w.active) lines.push('⏸️ Paused');
         if (p.unavailable) {
-            // "Greyed out" look — embeds can't apply literal text color, so we use the
-            // smaller/dimmer subtext style plus a clear label instead.
             lines.push(`-# ⚠️ ${p.label} is currently unavailable — see \`/help\` → Info for why.`);
             embed.addFields({
                 name: `${p.emojiTag} ${p.label} — ${w.handle} *(unavailable)*${w.active ? '' : ' (paused)'}`,
@@ -1344,7 +1281,7 @@ function buildManageView(w) {
     return { embeds: [embed], components: [row1, row2] };
 }
 
-// ── Help (tabbed) ────────────────────────────────────────────────────────
+// ── Help ────────────────────────────────────────────────────────
 const HELP_CATEGORIES = [
     {
         id: 'general', emoji: '🏠', label: 'General',
@@ -1958,8 +1895,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ── Select/skip: notification types from the guided /social add flow —
-    // chains straight into the per-type message modal instead of just confirming.
+    // ── Select/skip: notification types from the guided /social add flow —.
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtypeadd_select_')) {
         const id = parseInt(interaction.customId.slice(21), 10);
         const w = await getWatch(guildId, id);
@@ -2105,9 +2041,6 @@ process.on('unhandledRejection', e => console.error('⚠️ Unhandled rejection:
 client.on('error', e => console.error('⚠️ Discord client error:', e));
 
 // ── OAuth code exchange (called from the HTTP callback routes) ────────────
-// Uses the newer "Instagram API with Instagram Login" (launched July 2024) — unlike the
-// older Facebook Login flow, this does NOT require the account to be linked to a Facebook
-// Page. The account just needs to be an Instagram Business/Creator account.
 async function exchangeInstagramCode(code) {
     const cfg = OAUTH_CONFIG.instagram;
     // 1. Exchange the auth code for a short-lived Instagram User access token.
@@ -2136,9 +2069,6 @@ async function exchangeTikTokCode(code) {
         client_key: cfg.clientId, client_secret: cfg.clientSecret, code, grant_type: 'authorization_code', redirect_uri: cfg.redirectUri,
     });
     if (!json?.access_token) throw new Error(json?.error_description || 'TikTok token exchange failed');
-    // GET, not POST — the query string carries `fields`, there's no request body.
-    // `username` (needs user.info.profile scope) is the real @handle people type into
-    // /social add — display_name is just the shown nickname and often differs from it.
     const { json: userInfo } = await fetchJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,username', { Authorization: `Bearer ${json.access_token}` });
     const username = userInfo?.data?.user?.username || userInfo?.data?.user?.display_name || json.open_id;
     return {
@@ -2279,10 +2209,6 @@ http.createServer((req, res) => {
     }
     if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
     if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
-    // TikTok (and similar) URL-prefix/domain ownership verification: they give you a .txt
-    // file to download and host at a specific path. This is hardcoded from the actual
-    // downloaded file's content to avoid any copy/paste corruption through env vars — if
-    // TikTok ever issues a NEW verification file later, update these two constants.
     const TIKTOK_VERIFY_FILENAME = process.env.TIKTOK_VERIFY_FILENAME || 'tiktok54ye0zN8LYl3cx2fMAolswrgKzdRfnvK.txt';
     const TIKTOK_VERIFY_CONTENT = process.env.TIKTOK_VERIFY_CONTENT || 'tiktok-developers-site-verification=54ye0zN8LYl3cx2fMAolswrgKzdRfnvK';
     if (path === `/${TIKTOK_VERIFY_FILENAME}`) {

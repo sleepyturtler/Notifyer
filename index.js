@@ -7,15 +7,10 @@ const http = require('http'), https = require('https');
 const { XMLParser } = require('fast-xml-parser');
 
 // ── OAuth config (Instagram / TikTok) ───────────────────────────────────────
-// Set these env vars on Render. PUBLIC_BASE_URL should be your Render external
-// URL (e.g. https://yourbot.onrender.com) with no trailing slash — it's used
-// to build the OAuth redirect URIs, which must match EXACTLY what you register
-// in the Meta App dashboard / TikTok Developer Portal.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
 const LEGAL_BASE_URL = PUBLIC_BASE_URL || 'https://your-app.onrender.com';
 
 // NITTER_INSTANCES: Nitter mirrors for Twitter/X (no free official API exists).
-// Hardcoded default list, override with a comma-separated env var if it goes stale.
 const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
     ? process.env.NITTER_INSTANCES.split(',').map(s => s.trim()).filter(Boolean)
     : [
@@ -32,8 +27,6 @@ const LEGACY_MIGRATION_DATE = new Date('2026-10-01T00:00:00Z');
 const LEGACY_MIGRATION_TS = Math.floor(LEGACY_MIGRATION_DATE.getTime() / 1000);
 const OAUTH_CONFIG = {
     instagram: {
-        // These come from Meta App Dashboard → your app → Instagram → "API setup with
-        // Instagram Login" → Business login settings — NOT the app's main Facebook App ID/Secret.
         clientId: process.env.INSTAGRAM_APP_ID,
         clientSecret: process.env.INSTAGRAM_APP_SECRET,
         redirectUri: `${PUBLIC_BASE_URL}/oauth/instagram/callback`,
@@ -187,14 +180,8 @@ function isOwner(userId) {
     return Boolean(ownerId && userId === ownerId);
 }
 
-// Custom (application) emoji support — optional. Upload each platform's icon as an
-// application emoji (Discord Developer Portal → your app → Emojis, or the API —
-// these work in every server the bot is in, no per-guild upload needed), then set
-// EMOJI_<PLATFORM> to the full emoji tag Discord gives you (e.g. copy the emoji from
-// the portal or a message: EMOJI_YOUTUBE=<:yt_icon:1544605242748960859>). Leave unset
-// to keep using the plain Unicode emoji above — nothing breaks either way.
-// (EMOJI_<PLATFORM>_ID / EMOJI_<PLATFORM>_NAME still work too, as separate values, for
-// anyone already using that format — EMOJI_<PLATFORM> just takes priority if both are set.)
+// Custom (application) emoji support via EMOJI_<PLATFORM> env vars — optional,
+// falls back to the plain Unicode emoji above if unset.
 // p.emojiTag    → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
 // p.emojiButton → for ButtonBuilder.setEmoji(p.emojiButton)
 const EMOJI_TAG_RE = /^<a?:(\w+):(\d+)>$/;
@@ -2376,10 +2363,8 @@ http.createServer((req, res) => {
     }
     if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
     if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
-    // TikTok (and similar) URL-prefix/domain ownership verification: they give you a .txt
-    // file to download and host at a specific path. This is hardcoded from the actual
-    // downloaded file's content to avoid any copy/paste corruption through env vars — if
-    // TikTok ever issues a NEW verification file later, update these two constants.
+    // TikTok (and similar) domain-ownership verification file, hardcoded from the
+    // actual downloaded file's content to avoid copy/paste corruption through env vars.
     const TIKTOK_VERIFY_FILENAME = process.env.TIKTOK_VERIFY_FILENAME || 'tiktok54ye0zN8LYl3cx2fMAolswrgKzdRfnvK.txt';
     const TIKTOK_VERIFY_CONTENT = process.env.TIKTOK_VERIFY_CONTENT || 'tiktok-developers-site-verification=54ye0zN8LYl3cx2fMAolswrgKzdRfnvK';
     if (path === `/${TIKTOK_VERIFY_FILENAME}`) {

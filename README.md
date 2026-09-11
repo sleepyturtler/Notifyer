@@ -6,6 +6,7 @@ Get fast and free notifications from your favourite creators across YouTube, Twi
 - **/social add:** Track a new account,
 - **/social list:** Lists all tracked accounts.
 - **/social check:** Manually checks if new posts are available.
+- **/social link:** Link your Tiktok/Instagram account, so you can track it's posts.
 
 ## Other:
 - **/help:** Shows all commands and other useful info.

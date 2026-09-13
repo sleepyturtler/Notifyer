@@ -257,6 +257,8 @@ async function initDB() {
         -- Tracks the Discord message ID of an active "went live" notification, so it can be
         -- edited to "was live" once the stream ends. NULL when nothing is currently live.
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS live_message_id TEXT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_post_at BIGINT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_error TEXT;
         CREATE TABLE IF NOT EXISTS social_links (
             id SERIAL PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -528,15 +530,16 @@ async function getWatch(guildId, id) {
     return res.rows[0] || null;
 }
 const SEEN_HISTORY_SIZE = 20;
-async function updateLastPost(id, lastPostId, seenIds = []) {
+async function updateLastPost(id, lastPostId, seenIds = [], isNewPost = false) {
     const updated = [...new Set([lastPostId, ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-    await pool.query(
-        'UPDATE watches SET last_post_id = $1, last_checked = $2, seen_post_ids = $3 WHERE id = $4',
-        [lastPostId, Date.now(), JSON.stringify(updated), id]
-    );
+    const now = Date.now();
+    const setClause = isNewPost
+        ? 'last_post_id = $1, last_checked = $2, seen_post_ids = $3, last_error = NULL, last_post_at = $2'
+        : 'last_post_id = $1, last_checked = $2, seen_post_ids = $3, last_error = NULL';
+    await pool.query(`UPDATE watches SET ${setClause} WHERE id = $4`, [lastPostId, now, JSON.stringify(updated), id]);
 }
-async function touchLastChecked(id) {
-    await pool.query('UPDATE watches SET last_checked = $1 WHERE id = $2', [Date.now(), id]);
+async function touchLastChecked(id, errorMessage = null) {
+    await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1029,6 +1032,22 @@ function buttonLabelFor(platform, post) {
     return POST_TYPE_BUTTON_LABEL[platform]?.[post.postType] || 'View Post';
 }
 
+// Builds a fake-but-realistic post for /social preview — one per notify type so
+// people can check every custom message variant, not just whichever type happens
+// to post next in reality.
+function buildSamplePost(w, postType) {
+    return {
+        id: 'preview',
+        url: profileUrl(w.platform, w.handle) || 'https://example.com',
+        title: 'Sample post title for preview',
+        author: w.handle,
+        thumbnail: null,
+        timestamp: new Date().toISOString(),
+        postType,
+        isLive: postType === 'live',
+    };
+}
+
 // Platforms where Discord will render a native, playable video preview if the
 // raw URL appears in the message content (not just inside a custom embed).
 const NATIVE_VIDEO_PLATFORMS = new Set(['youtube', 'tiktok']);
@@ -1085,10 +1104,10 @@ async function ensureVideoEmbedFallback(channel, messageId, post) {
     }
 }
 
-async function sendNotification(w, post) {
-    const guild = client.guilds.cache.get(w.guild_id);
-    const channel = guild?.channels.cache.get(w.channel_id);
-    if (!channel) return null;
+// Builds the exact {content, embeds, components} a notification would use, without
+// sending anything — shared by sendNotification and /social preview so they can
+// never drift out of sync with each other.
+function buildNotificationPayload(w, post) {
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
     let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
@@ -1106,13 +1125,8 @@ async function sendNotification(w, post) {
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
         // thumbnail, and channel/author — a custom embed on top of that is redundant.
-        const sent = await channel.send({ content, components: [linkRow] }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
-        // Discord's crawler occasionally fails to unfurl TikTok links even via the mirror
-        // domain — check back shortly and backfill a manual embed if nothing showed up.
-        if (sent && w.platform === 'tiktok') ensureVideoEmbedFallback(channel, sent.id, post);
-        return sent;
+        return { content, embeds: [], components: [linkRow], wantsNativeVideo: true };
     }
-
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
         .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
@@ -1121,7 +1135,22 @@ async function sendNotification(w, post) {
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
-    return channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+    return { content, embeds: [embed], components: [linkRow], wantsNativeVideo: false };
+}
+
+async function sendNotification(w, post) {
+    const guild = client.guilds.cache.get(w.guild_id);
+    const channel = guild?.channels.cache.get(w.channel_id);
+    if (!channel) return null;
+    const payload = buildNotificationPayload(w, post);
+    if (payload.wantsNativeVideo) {
+        const sent = await channel.send({ content: payload.content, components: payload.components }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+        // Discord's crawler occasionally fails to unfurl TikTok links even via the mirror
+        // domain — check back shortly and backfill a manual embed if nothing showed up.
+        if (sent && w.platform === 'tiktok') ensureVideoEmbedFallback(channel, sent.id, post);
+        return sent;
+    }
+    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
 }
 
 // Edits a previously-sent "went live" message to show the stream has ended, once a
@@ -1190,7 +1219,7 @@ async function pollAll(platforms = null) {
                         if (shouldNotify(w, entry)) await sendNotification(w, entry);
                     }
                     const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-                    await updateLastPost(w.id, entries[0].id, mergedSeen);
+                    await updateLastPost(w.id, entries[0].id, mergedSeen, true);
                 } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
@@ -1224,7 +1253,7 @@ async function pollAll(platforms = null) {
                         // Seed baseline from first check
                         await updateLastPost(w.id, posts[0].id, posts.map(p => p.id));
                     } else if (updated) {
-                        await updateLastPost(w.id, newSeenIds[0], newSeenIds);
+                        await updateLastPost(w.id, newSeenIds[0], newSeenIds, true);
                     } else {
                         await touchLastChecked(w.id);
                     }
@@ -1236,7 +1265,7 @@ async function pollAll(platforms = null) {
                         continue;
                     }
                     if (seenIds.includes(post.id)) { await touchLastChecked(w.id); continue; }
-                    await updateLastPost(w.id, post.id, seenIds);
+                    await updateLastPost(w.id, post.id, seenIds, true);
                     if (!shouldNotify(w, post)) continue;
                     await sendNotification(w, post);
                 }
@@ -1246,7 +1275,7 @@ async function pollAll(platforms = null) {
                 } else {
                     console.error(`poll ${w.platform}/${w.handle}:`, e.message);
                 }
-                await touchLastChecked(w.id).catch(() => {});
+                await touchLastChecked(w.id, e.message).catch(() => {});
             }
             // Stagger with jitter to avoid hammering platforms all at once
             const jitter = 1000 + Math.random() * 1000;
@@ -1265,6 +1294,7 @@ async function buildWatchListEmbed(guildId) {
     if (!watches.length) {
         return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setDescription('No accounts are being tracked yet. Use `/social add` to add one.')], components: [] };
     }
+    const STALE_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setTimestamp()
         .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
     for (const w of watches.slice(0, 25)) {
@@ -1274,8 +1304,20 @@ async function buildWatchListEmbed(guildId) {
             `ID: \`${w.id}\``,
             w.message_template ? `Custom message: \`${w.message_template.slice(0, 80)}${w.message_template.length > 80 ? '…' : ''}\`` : 'Using default message',
         ];
+        if (w.last_post_at) {
+            lines.push(`Last post: <t:${Math.floor(w.last_post_at / 1000)}:R>`);
+        } else if (w.last_post_id === null) {
+            lines.push('Last post: not checked yet');
+        } else {
+            lines.push('Last post: none detected yet');
+        }
         if (w.role_id) lines.push(`Ping: <@&${w.role_id}>`);
         if (!w.active) lines.push('⏸️ Paused');
+        if (w.last_error) {
+            lines.push(`⚠️ Last check failed: \`${String(w.last_error).slice(0, 150)}\``);
+        } else if (w.last_post_at && (Date.now() - w.last_post_at) > STALE_MS) {
+            lines.push(`⚠️ No new posts in over 60 days`);
+        }
         if (p.unavailable) {
             // "Greyed out" look — embeds can't apply literal text color, so we use the
             // smaller/dimmer subtext style plus a clear label instead.
@@ -1424,6 +1466,7 @@ const HELP_CATEGORIES = [
             .addFields(
                 { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message. Instagram/TikTok accounts must be linked first (see the Linking tab).' },
                 { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
+                { name: '/social preview', value: 'See exactly what a notification will look like for a tracked account, one preview per notify type, without waiting for a real post.' },
                 { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
             ),
     },
@@ -1480,7 +1523,7 @@ function buildHelpView(activeId) {
 }
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`✅ Social notify bot online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Refreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
     const commands = [
@@ -1492,6 +1535,7 @@ client.once('ready', async () => {
                 .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
                 .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
+            .addSubcommand(s => s.setName('preview').setDescription('Preview what a tracked account\'s notifications will look like'))
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
             .addSubcommand(s => s.setName('debug').setDescription('Show live fetch result vs stored baseline for a watch')
                 .addIntegerOption(o => o.setName('id').setDescription('Watch ID (see /social list)').setRequired(true)))
@@ -1719,6 +1763,19 @@ client.on('interactionCreate', async interaction => {
                 return reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
             }
 
+            if (sub === 'preview') {
+                const watches = await getWatches(guildId);
+                if (!watches.length) return reply('❌ No accounts are being tracked yet. Use `/social add` first.');
+                const row = new ActionRowBuilder().addComponents(
+                    new StringSelectMenuBuilder().setCustomId(`socialpreview_pick_${guildId}`).setPlaceholder('Pick a watch to preview…')
+                        .addOptions(watches.slice(0, 25).map(w => ({
+                            label: `${PLATFORMS[w.platform]?.label || w.platform} — ${w.handle}`.slice(0, 100),
+                            value: `${w.id}`,
+                        })))
+                );
+                return reply({ content: 'Select a watch to preview its notification(s):', components: [row], flags: [MessageFlags.Ephemeral] });
+            }
+
             if (sub === 'check') {
                 await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
                 await pollAll();
@@ -1942,6 +1999,31 @@ client.on('interactionCreate', async interaction => {
         if (!w) return interaction.reply({ content: '❌ Watch not found (it may have been removed).', flags: [MessageFlags.Ephemeral] });
         const { embeds, components } = buildManageView(w);
         return interaction.update({ embeds, components });
+    }
+
+    // ── Select menu: /social preview watch picker ───────────────────────────
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialpreview_pick_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const id = parseInt(interaction.values[0], 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.update({ content: '❌ Watch not found (it may have been removed).', components: [] });
+        const p = PLATFORMS[w.platform];
+        const types = (PLATFORM_NOTIFY_TYPES[w.platform] || [{ id: null, label: 'Post' }]);
+        await interaction.update({ content: `Previewing **${p?.label || w.platform} — ${w.handle}** (${types.length} notify type${types.length > 1 ? 's' : ''}):`, components: [] });
+        for (const t of types) {
+            const post = buildSamplePost(w, t.id);
+            const payload = buildNotificationPayload(w, post);
+            const note = payload.wantsNativeVideo
+                ? `-# *${t.label}: Discord would normally show a native video/image embed here once posted with a real link.*\n`
+                : '';
+            await interaction.followUp({
+                content: `**— ${t.label} —**\n${note}${payload.content}`,
+                embeds: payload.embeds,
+                components: payload.components,
+                flags: [MessageFlags.Ephemeral],
+            }).catch(e => console.error(`social preview followUp (${w.id}, ${t.id}):`, e.message));
+        }
+        return;
     }
 
     // ── Buttons: manage view actions ─────────────────────────────────────────

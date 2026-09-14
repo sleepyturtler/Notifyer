@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, ContainerBuilder, SectionBuilder, SeparatorBuilder, SeparatorSpacingSize, TextDisplayBuilder } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns');
 const crypto = require('crypto');
@@ -259,6 +259,7 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS live_message_id TEXT;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_post_at BIGINT;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_error TEXT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS batch_header_template TEXT;
         CREATE TABLE IF NOT EXISTS social_links (
             id SERIAL PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -463,6 +464,9 @@ async function removeWatch(guildId, id) {
 }
 async function updateWatchTemplate(guildId, id, template) {
     await pool.query('UPDATE watches SET message_template = $1 WHERE guild_id = $2 AND id = $3', [template, guildId, id]);
+}
+async function updateWatchBatchHeader(guildId, id, template) {
+    await pool.query('UPDATE watches SET batch_header_template = $1 WHERE guild_id = $2 AND id = $3', [template, guildId, id]);
 }
 async function updateWatchRole(guildId, id, roleId) {
     await pool.query('UPDATE watches SET role_id = $1 WHERE guild_id = $2 AND id = $3', [roleId, guildId, id]);
@@ -1153,6 +1157,63 @@ async function sendNotification(w, post) {
     return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
 }
 
+// ── Batched notifications ───────────────────────────────────────────────────
+// When several new posts land for the same watch in a single poll cycle (a
+// bursty uploader, or a poll that got delayed a cycle), sending one message
+// per post pings the role N times in a row. At BATCH_THRESHOLD+ posts, send
+// one Components V2 message instead: a header line, then one compact
+// title+button "Section" per post with dividers between them. Below the
+// threshold, posts still send individually as before (unaffected by any of
+// this) — batching is specifically for the "several posts at once" case.
+const BATCH_THRESHOLD = 3;
+const DEFAULT_BATCH_HEADER = '**{author}** posted {count} times!';
+function renderBatchHeader(w, count) {
+    const tmpl = w.batch_header_template || DEFAULT_BATCH_HEADER;
+    return tmpl
+        .replace(/\{author\}/g, w.handle)
+        .replace(/\{handle\}/g, w.handle)
+        .replace(/\{platform\}/g, PLATFORMS[w.platform]?.label || w.platform)
+        .replace(/\{count\}/g, String(count));
+}
+function hexColorToInt(hex) {
+    return parseInt(String(hex).replace('#', ''), 16);
+}
+function buildBatchPayload(w, posts) {
+    const p = PLATFORMS[w.platform];
+    const rolePrefix = w.role_id ? `<@&${w.role_id}> ` : '';
+    const container = new ContainerBuilder()
+        .setAccentColor(hexColorToInt(p.color))
+        .addTextDisplayComponents(new TextDisplayBuilder().setContent(`${rolePrefix}${renderBatchHeader(w, posts.length)}`));
+    posts.forEach((post, i) => {
+        if (i > 0) container.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
+        const title = (post.title || '(untitled)').slice(0, 250);
+        container.addSectionComponents(
+            new SectionBuilder()
+                .addTextDisplayComponents(new TextDisplayBuilder().setContent(title))
+                .setButtonAccessory(new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton))
+        );
+    });
+    return { components: [container], flags: MessageFlags.IsComponentsV2 };
+}
+async function sendBatchNotification(w, posts) {
+    const guild = client.guilds.cache.get(w.guild_id);
+    const channel = guild?.channels.cache.get(w.channel_id);
+    if (!channel) return null;
+    return channel.send(buildBatchPayload(w, posts)).catch(e => { console.error(`send batch notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+}
+// Sends a batch message for 3+ posts, or individual messages (existing behavior,
+// unchanged) below that. Live posts (isLive) are the caller's responsibility to
+// send separately — their "went live"/"ended" message-edit tracking doesn't fit
+// the batch format and must stay individual regardless of count.
+async function dispatchNotifications(w, posts) {
+    if (!posts.length) return;
+    if (posts.length >= BATCH_THRESHOLD) {
+        await sendBatchNotification(w, posts);
+    } else {
+        for (const post of posts) await sendNotification(w, post);
+    }
+}
+
 // Edits a previously-sent "went live" message to show the stream has ended, once a
 // later poll finds the channel no longer live. Falls back to just clearing the tracked
 // message ID if the message or channel can no longer be found (deleted, permissions, etc.).
@@ -1213,11 +1274,12 @@ async function pollAll(platforms = null) {
                     }
                     const newEntries = entries.filter(e => !seenIds.includes(e.id));
                     if (!newEntries.length) { await touchLastChecked(w.id); continue; }
-                    // Notify oldest-to-newest so they land in upload order
-                    for (const entry of [...newEntries].reverse()) {
+                    // Chronological (oldest-first) so a batch reads/sends in upload order
+                    const chronological = [...newEntries].reverse();
+                    for (const entry of chronological) {
                         entry.postType = await detectYouTubePostType(entry.id, entry.url);
-                        if (shouldNotify(w, entry)) await sendNotification(w, entry);
                     }
+                    await dispatchNotifications(w, chronological.filter(e => shouldNotify(w, e)));
                     const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
                     await updateLastPost(w.id, entries[0].id, mergedSeen, true);
                 } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
@@ -1235,15 +1297,22 @@ async function pollAll(platforms = null) {
                     }
                     let newSeenIds = [...seenIds];
                     let updated = false;
+                    const toNotify = [];
                     for (const post of posts) {
                         if (w.last_post_id === null) continue; // first check — skip all
                         if (newSeenIds.includes(post.id)) continue;
-                        if (!shouldNotify(w, post)) { newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, 20); updated = true; continue; }
                         newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, 20);
                         updated = true;
-                        const sent = await sendNotification(w, post);
-                        if (post.isLive && sent) await setWatchLiveMessage(w.id, sent.id);
+                        if (shouldNotify(w, post)) toNotify.push(post);
                     }
+                    // Live posts keep their own message-edit tracking (see markStreamOffline
+                    // below) and always send individually — batching only applies to regular
+                    // posts/VODs, never to "went live" events.
+                    for (const post of toNotify.filter(p => p.isLive)) {
+                        const sent = await sendNotification(w, post);
+                        if (sent) await setWatchLiveMessage(w.id, sent.id);
+                    }
+                    await dispatchNotifications(w, toNotify.filter(p => !p.isLive));
                     // Stream-ended detection: we were tracking a "went live" message, but this
                     // poll's results no longer include a live entry — edit that message to
                     // show it ended instead of leaving it saying "is live" forever. (No-op for
@@ -1434,6 +1503,8 @@ function buildManageView(w) {
     if (isLegacyMessageFormat(w)) {
         embed.addFields({ name: '⚠️ Outdated message', value: 'This message was auto-migrated from the old single-message format and hasn\'t been reviewed. It was written as one generic message and may not read well for every post type — check each type below (**Per-Type Messages**) and edit as needed.' });
     }
+    const canBatch = ['youtube', 'twitch', 'kick', 'instagram', 'tiktok'].includes(w.platform);
+    if (canBatch) embed.addFields({ name: 'Batch header', value: w.batch_header_template ? `\`${w.batch_header_template}\`` : `Default: \`${DEFAULT_BATCH_HEADER}\`` });
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_msg_${w.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
@@ -1441,12 +1512,15 @@ function buildManageView(w) {
         new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary),
         ...(types.length > 1 ? [new ButtonBuilder().setCustomId(`socialpertype_open_${w.id}`).setLabel('Per-Type Messages').setStyle(ButtonStyle.Secondary)] : []),
     );
+    const row1b = canBatch ? [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`socialmanage_batchheader_${w.id}`).setLabel('📦 Batch Header').setStyle(ButtonStyle.Secondary),
+    )] : [];
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
         new ButtonBuilder().setCustomId(`socialmanage_remove_${w.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(`socialmanage_back_${w.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
     );
-    return { embeds: [embed], components: [row1, row2] };
+    return { embeds: [embed], components: [row1, ...row1b, row2] };
 }
 
 // ── Help (tabbed) ────────────────────────────────────────────────────────
@@ -1468,6 +1542,7 @@ const HELP_CATEGORIES = [
                 { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
                 { name: '/social preview', value: 'See exactly what a notification will look like for a tracked account, one preview per notify type, without waiting for a real post.' },
                 { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
+                { name: '📦 Batched notifications', value: 'If 3+ new posts land for the same account in one check, they\'re combined into a single message instead of one ping per post — a header line plus a compact title+button per post. Customize the header text from a watch\'s manage view ("📦 Batch Header"). "Went live" notifications are never batched.' },
             ),
     },
     {
@@ -2053,6 +2128,19 @@ client.on('interactionCreate', async interaction => {
             return interaction.showModal(modal);
         }
 
+        if (action === 'batchheader') {
+            const modal = new ModalBuilder().setCustomId(`socialbatchheader_modal_${id}`).setTitle('Edit Batch Header')
+                .addComponents(
+                    new ActionRowBuilder().addComponents(
+                        new TextInputBuilder().setCustomId('template').setLabel('Header shown when 3+ posts land at once')
+                            .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)
+                            .setValue(w.batch_header_template || '')
+                            .setPlaceholder(DEFAULT_BATCH_HEADER)
+                    )
+                );
+            return interaction.showModal(modal);
+        }
+
         if (action === 'channel') {
             return interaction.update({
                 embeds: [E('#5865F2', `Change Channel — ${w.handle}`).setDescription('Select the new channel for this watch\'s notifications.')],
@@ -2196,6 +2284,17 @@ client.on('interactionCreate', async interaction => {
         const id = parseInt(interaction.customId.slice(16), 10);
         const template = interaction.fields.getTextInputValue('template').trim() || null;
         await updateWatchTemplate(guildId, id, template);
+        await interaction.deferUpdate();
+        const w = await getWatch(guildId, id);
+        const { embeds, components } = buildManageView(w);
+        return interaction.editReply({ embeds, components });
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('socialbatchheader_modal_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const id = parseInt(interaction.customId.slice(25), 10);
+        const template = interaction.fields.getTextInputValue('template').trim() || null;
+        await updateWatchBatchHeader(guildId, id, template);
         await interaction.deferUpdate();
         const w = await getWatch(guildId, id);
         const { embeds, components } = buildManageView(w);

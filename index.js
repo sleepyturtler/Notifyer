@@ -556,7 +556,10 @@ const E = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
 function fetchText(url, headers = {}) {
     return new Promise((resolve, reject) => {
         const mod = url.startsWith('https') ? https : http;
-        const req = mod.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SocialNotifyBot/1.0)', ...headers } }, res => {
+        // Was a self-identifying "SocialNotifyBot/1.0" UA — swapped to a realistic
+        // browser string as a test against the YouTube 404s (Sept 2026), since a
+        // UA that announces itself as a bot is an easy, obvious anti-bot signal.
+        const req = mod.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', ...headers } }, res => {
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 return fetchText(res.headers.location, headers).then(resolve, reject);
             }

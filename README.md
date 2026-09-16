@@ -12,3 +12,4 @@ Get fast and free notifications from your favourite creators across YouTube, Twi
 ## Other:
 - **/help:** Shows all commands and other useful info.
 - **/invite:** Creates an invite with all the right permissions.
+- **/setup:** Onboarding command to learn about the bot.

@@ -5,13 +5,10 @@ const { URL } = require('url');
 const http = require('http'), https = require('https');
 const { XMLParser } = require('fast-xml-parser');
 
-// PUBLIC_BASE_URL should be your Render external URL (e.g. https://yourbot.onrender.com)
-// with no trailing slash — used only to build the /terms and /privacy links shown in /help.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://notifyer-camx.onrender.com').replace(/\/$/, '');
 const LEGAL_BASE_URL = PUBLIC_BASE_URL;
 
 // NITTER_INSTANCES: Nitter mirrors for Twitter/X (no free official API exists).
-// Hardcoded default list, override with a comma-separated env var if it goes stale.
 const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
     ? process.env.NITTER_INSTANCES.split(',').map(s => s.trim()).filter(Boolean)
     : [
@@ -103,13 +100,8 @@ const PLATFORMS = {
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18' },
 };
 
-// Custom (application) emoji support — optional. Upload each platform's icon as an
-// application emoji (Discord Developer Portal → your app → Emojis, or the API —
-// these work in every server the bot is in, no per-guild upload needed), then set
-// EMOJI_<PLATFORM>_ID (and EMOJI_<PLATFORM>_NAME if it's not just the platform key)
-// as env vars, e.g. EMOJI_YOUTUBE_ID=123456789012345678. Leave unset to keep using
-// the plain Unicode emoji above — nothing breaks either way. Update the env vars
-// (not this code) whenever you re-upload a new icon.
+// Custom (application) emoji support via EMOJI_<PLATFORM>_ID / EMOJI_<PLATFORM>_NAME
+// env vars — optional, falls back to the plain Unicode emoji above if unset.
 // p.emojiTag    → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
 // p.emojiButton → for ButtonBuilder.setEmoji(p.emojiButton)
 for (const [key, p] of Object.entries(PLATFORMS)) {
@@ -166,6 +158,8 @@ async function initDB() {
         -- Tracks the Discord message ID of an active "went live" notification, so it can be
         -- edited to "was live" once the stream ends. NULL when nothing is currently live.
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS live_message_id TEXT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_post_at BIGINT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_error TEXT;
     `);
     // Backfill seen_post_ids for existing rows so nothing re-fires after migration
     await pool.query(`
@@ -381,15 +375,16 @@ async function getWatch(guildId, id) {
     return res.rows[0] || null;
 }
 const SEEN_HISTORY_SIZE = 20;
-async function updateLastPost(id, lastPostId, seenIds = []) {
+async function updateLastPost(id, lastPostId, seenIds = [], isNewPost = false) {
     const updated = [...new Set([lastPostId, ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-    await pool.query(
-        'UPDATE watches SET last_post_id = $1, last_checked = $2, seen_post_ids = $3 WHERE id = $4',
-        [lastPostId, Date.now(), JSON.stringify(updated), id]
-    );
+    const now = Date.now();
+    const setClause = isNewPost
+        ? 'last_post_id = $1, last_checked = $2, seen_post_ids = $3, last_error = NULL, last_post_at = $2'
+        : 'last_post_id = $1, last_checked = $2, seen_post_ids = $3, last_error = NULL';
+    await pool.query(`UPDATE watches SET ${setClause} WHERE id = $4`, [lastPostId, now, JSON.stringify(updated), id]);
 }
-async function touchLastChecked(id) {
-    await pool.query('UPDATE watches SET last_checked = $1 WHERE id = $2', [Date.now(), id]);
+async function touchLastChecked(id, errorMessage = null) {
+    await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -782,10 +777,9 @@ function buttonLabelFor(platform, post) {
 // raw URL appears in the message content (not just inside a custom embed).
 const NATIVE_VIDEO_PLATFORMS = new Set(['youtube']);
 
-async function sendNotification(w, post) {
-    const guild = client.guilds.cache.get(w.guild_id);
-    const channel = guild?.channels.cache.get(w.channel_id);
-    if (!channel) return null;
+// Builds the exact {content, embeds, components} a notification would use, without
+// sending anything.
+function buildNotificationPayload(w, post) {
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
     let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
@@ -800,7 +794,7 @@ async function sendNotification(w, post) {
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
         // thumbnail, and channel/author — a custom embed on top of that is redundant.
-        return channel.send({ content, components: [linkRow] }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+        return { content, embeds: [], components: [linkRow], wantsNativeVideo: true };
     }
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
@@ -810,7 +804,18 @@ async function sendNotification(w, post) {
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
-    return channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+    return { content, embeds: [embed], components: [linkRow], wantsNativeVideo: false };
+}
+
+async function sendNotification(w, post) {
+    const guild = client.guilds.cache.get(w.guild_id);
+    const channel = guild?.channels.cache.get(w.channel_id);
+    if (!channel) return null;
+    const payload = buildNotificationPayload(w, post);
+    if (payload.wantsNativeVideo) {
+        return channel.send({ content: payload.content, components: payload.components }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+    }
+    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
 }
 
 // Edits a previously-sent "went live" message to show the stream has ended, once a
@@ -874,7 +879,7 @@ async function pollAll() {
                         if (shouldNotify(w, entry)) await sendNotification(w, entry);
                     }
                     const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-                    await updateLastPost(w.id, entries[0].id, mergedSeen);
+                    await updateLastPost(w.id, entries[0].id, mergedSeen, true);
                 } else if (w.platform === 'twitch' || w.platform === 'kick') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
@@ -902,7 +907,7 @@ async function pollAll() {
                         // Seed baseline from first check
                         await updateLastPost(w.id, posts[0].id, posts.map(p => p.id));
                     } else if (updated) {
-                        await updateLastPost(w.id, newSeenIds[0], newSeenIds);
+                        await updateLastPost(w.id, newSeenIds[0], newSeenIds, true);
                     } else {
                         await touchLastChecked(w.id);
                     }
@@ -914,7 +919,7 @@ async function pollAll() {
                         continue;
                     }
                     if (seenIds.includes(post.id)) { await touchLastChecked(w.id); continue; }
-                    await updateLastPost(w.id, post.id, seenIds);
+                    await updateLastPost(w.id, post.id, seenIds, true);
                     if (!shouldNotify(w, post)) continue;
                     await sendNotification(w, post);
                 }
@@ -924,7 +929,7 @@ async function pollAll() {
                 } else {
                     console.error(`poll ${w.platform}/${w.handle}:`, e.message);
                 }
-                await touchLastChecked(w.id).catch(() => {});
+                await touchLastChecked(w.id, e.message).catch(() => {});
             }
             // Stagger with jitter to avoid hammering platforms all at once
             const jitter = 1000 + Math.random() * 1000;
@@ -943,6 +948,7 @@ async function buildWatchListEmbed(guildId) {
     if (!watches.length) {
         return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setDescription('No accounts are being tracked yet. Use `/social add` to add one.')], components: [] };
     }
+    const STALE_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setTimestamp()
         .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
     for (const w of watches.slice(0, 25)) {
@@ -962,8 +968,20 @@ async function buildWatchListEmbed(guildId) {
             `ID: \`${w.id}\``,
             w.message_template ? `Custom message: \`${w.message_template.slice(0, 80)}${w.message_template.length > 80 ? '…' : ''}\`` : 'Using default message',
         ];
+        if (w.last_post_at) {
+            lines.push(`Last post: <t:${Math.floor(w.last_post_at / 1000)}:R>`);
+        } else if (w.last_post_id === null) {
+            lines.push('Last post: not checked yet');
+        } else {
+            lines.push('Last post: none detected yet');
+        }
         if (w.role_id) lines.push(`Ping: <@&${w.role_id}>`);
         if (!w.active) lines.push('⏸️ Paused');
+        if (w.last_error) {
+            lines.push(`⚠️ Last check failed: \`${String(w.last_error).slice(0, 150)}\``);
+        } else if (w.last_post_at && (Date.now() - w.last_post_at) > STALE_MS) {
+            lines.push(`⚠️ No new posts in over 60 days`);
+        }
         if (p.unavailable) {
             // "Greyed out" look — embeds can't apply literal text color, so we use the
             // smaller/dimmer subtext style plus a clear label instead.
@@ -1121,7 +1139,7 @@ function buildHelpView(activeId) {
 }
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`✅ Social notify bot online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Refreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
     const commands = [
@@ -1275,7 +1293,10 @@ client.on('interactionCreate', async interaction => {
 
         if (commandName === 'invite') {
             const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=2147485696&scope=bot%20applications.commands`;
-            return reply({ embeds: [E('#5865F2', 'Invite Social Notify Bot').setDescription(`[Click here to invite this bot to another server](${inviteUrl})`)], flags: [MessageFlags.Ephemeral] });
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setLabel('Invite Notifyer').setStyle(ButtonStyle.Link).setURL(inviteUrl)
+            );
+            return reply({ embeds: [E('#5865F2', 'Invite Social Notify Bot').setDescription('Click below to invite this bot to another server.')], components: [row], flags: [MessageFlags.Ephemeral] });
         }
 
         if (commandName === 'help') {
@@ -1561,8 +1582,10 @@ client.on('interactionCreate', async interaction => {
       if (error?.code === 40060) return;
       console.error('❌ Interaction error:', error);
       try {
-          if (interaction.deferred) await interaction.editReply({ content: '❌ Something went wrong. Please try again.' }).catch(() => {});
-          else if (!interaction.replied) await interaction.reply({ content: '❌ Something went wrong. Please try again.', flags: [MessageFlags.Ephemeral] }).catch(() => {});
+          const detail = error?.message ? `\n\`\`\`${String(error.message).slice(0, 500)}\`\`\`` : '';
+          const content = `❌ Something went wrong.${detail}\nIf this keeps happening, please try again or report it in the support server.`;
+          if (interaction.deferred) await interaction.editReply({ content }).catch(() => {});
+          else if (!interaction.replied) await interaction.reply({ content, flags: [MessageFlags.Ephemeral] }).catch(() => {});
       } catch {}
   }
 });
@@ -1669,15 +1692,32 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 <p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
 `);
 
-const STATUS_HTML = legalPage('Status', `
+const STATUS_HTML = legalPage('Notifyer — Social Media Notifications for Discord', `
 <h1>Notifyer</h1>
 <p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
-<p>This is the backend for a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
+<p style="font-size:1.1em;">Notifyer is a Discord bot that watches creators across YouTube, Twitter/X, Twitch, and Kick, and posts directly in a channel you choose the moment they upload, post, or go live.</p>
+
+<h2>What it does</h2>
+<ul>
+<li><strong>Multi-platform tracking</strong> — follow accounts on YouTube, Twitter/X, Twitch, and Kick from one bot, each with its own channel and settings.</li>
+<li><strong>Custom notification messages</strong> — write your own message per platform and per post type (video, short, live, VOD, etc.), with placeholders like <code>{author}</code>, <code>{title}</code>, and <code>{url}</code> filled in automatically.</li>
+<li><strong>Live stream tracking</strong> — a "went live" message updates itself in place once the stream ends, instead of posting a second message.</li>
+<li><strong>Native video embeds</strong> — YouTube links unfurl as playable video cards directly in Discord.</li>
+</ul>
+
+<h2>How it works</h2>
+<p>An admin invites Notifyer to a Discord server, then runs <code>/social add</code> to track an account: pick a platform, paste a handle, choose a channel. Notifyer checks each tracked account on a short interval and posts automatically the moment something new goes up.</p>
+
+<h2>Get started</h2>
+<p>
+<a href="https://top.gg/bot/1515779889737896006">Add Notifyer to your server</a> &nbsp;·&nbsp;
+<a href="https://github.com/DaniBottoni/Notifyer/tree/main">Source on GitHub</a>
+</p>
+
+<h2>Legal</h2>
 <p>
 <a href="/terms">Terms of Service</a> &nbsp;·&nbsp;
-<a href="/privacy">Privacy Policy</a> &nbsp;·&nbsp;
-<a href="https://github.com/DaniBottoni/Notifyer/tree/main">GitHub</a> &nbsp;·&nbsp;
-<a href="https://top.gg/bot/1515779889737896006">top.gg</a>
+<a href="/privacy">Privacy Policy</a>
 </p>
 `);
 
@@ -1692,10 +1732,8 @@ http.createServer((req, res) => {
     }
     if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
     if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
-    // TikTok URL-prefix verification for this domain (notifyer-camx.onrender.com).
-    // Hardcoded from the actual downloaded file's content to avoid any copy/paste
-    // corruption through env vars — if TikTok ever issues a NEW verification file for
-    // this domain later, update these two constants.
+    // TikTok domain-ownership verification file for this domain (notifyer-camx.onrender.com),
+    // hardcoded from the actual downloaded file's content to avoid copy/paste corruption through env vars.
     const TIKTOK_VERIFY_FILENAME = process.env.TIKTOK_VERIFY_FILENAME || 'tiktokR5eXVAWRLvpsbV1lUEzQ5lNpqbR6HyNR.txt';
     const TIKTOK_VERIFY_CONTENT = process.env.TIKTOK_VERIFY_CONTENT || 'tiktok-developers-site-verification=R5eXVAWRLvpsbV1lUEzQ5lNpqbR6HyNR';
     if (path === `/${TIKTOK_VERIFY_FILENAME}`) {

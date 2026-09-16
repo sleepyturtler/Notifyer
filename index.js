@@ -1584,6 +1584,7 @@ async function buildWatchListEmbed(guildId) {
                 .addOptions(watches.slice(0, 25).map(w => ({
                     label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${w.handle}`.slice(0, 100),
                     value: `${w.id}`,
+                    emoji: PLATFORMS[w.platform]?.emojiButton,
                 })))
         ),
         new ActionRowBuilder().addComponents(refreshBtn(`sociallist_refresh_${guildId}`)),
@@ -1608,6 +1609,7 @@ async function buildSocialLinksEmbed(guildId) {
                 .addOptions(allLinks.slice(0, 25).map(l => ({
                     label: `${PLATFORMS[l.platform].label} — ${l.external_username}`.slice(0, 100),
                     value: `${l.platform}:${l.id}`,
+                    emoji: PLATFORMS[l.platform]?.emojiButton,
                 })))
         ),
         new ActionRowBuilder().addComponents(refreshBtn(`sociallinks_refresh_${guildId}`)),
@@ -1768,7 +1770,7 @@ function buildSetupIntroEmbed() {
     return new EmbedBuilder().setColor('#5865F2').setTitle('👋 Welcome to Notifyer!')
         .setDescription(
             'This bot posts in a channel here whenever a tracked account uploads, posts, or goes live.\n\n' +
-            '**Supported platforms:** YouTube, Twitch, Kick, Instagram, TikTok. (Twitter/X is currently unavailable — see `/help` → Info for why.)\n\n' +
+            '**Supported platforms:** YouTube, Twitter/X, Twitch, Kick, Instagram, TikTok.\n\n' +
             '**Key commands, once you\'re set up:**\n' +
             '`/social add` — track another account\n' +
             '`/social list` — see everything you\'re tracking, with a manage menu for each\n' +
@@ -1823,11 +1825,11 @@ client.once('clientReady', async () => {
                 .addIntegerOption(o => o.setName('id').setDescription('Watch ID (see /social list)').setRequired(true)))
             .addSubcommand(s => s.setName('link').setDescription('Connect an Instagram or TikTok account via OAuth so it can be tracked')
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
-                    .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
+                    .addChoices({ name: '📸 Instagram', value: 'instagram' }, { name: '🎵 TikTok', value: 'tiktok' })))
             .addSubcommand(s => s.setName('links').setDescription('View accounts linked via OAuth in this server'))
             .addSubcommand(s => s.setName('oauthdebug').setDescription('Owner only: show the exact OAuth config being sent to a platform')
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
-                    .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
+                    .addChoices({ name: '📸 Instagram', value: 'instagram' }, { name: '🎵 TikTok', value: 'tiktok' })))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
         new SlashCommandBuilder().setName('killbot').setDescription('Owner only: suspend the Render service to stop usage'),
     ];
@@ -1889,7 +1891,7 @@ client.on('interactionCreate', async interaction => {
             const ownerHere = isOwner(interaction.user.id);
             const choices = Object.entries(PLATFORMS)
                 .filter(([, v]) => !v.unavailable || (v.ownerOnly && ownerHere))
-                .map(([k, v]) => ({ name: v.label, value: k }))
+                .map(([k, v]) => ({ name: `${v.emoji} ${v.label}`, value: k }))
                 .filter(c => c.name.toLowerCase().includes(focused));
             return interaction.respond(choices.slice(0, 25));
         }
@@ -1961,6 +1963,7 @@ client.on('interactionCreate', async interaction => {
                         .addOptions(watches.slice(0, 25).map(w => ({
                             label: `${PLATFORMS[w.platform]?.label || w.platform} — ${w.handle}`.slice(0, 100),
                             value: `${w.id}`,
+                            emoji: PLATFORMS[w.platform]?.emojiButton,
                         })))
                 );
                 return reply({ content: 'Select a watch to preview its notification(s):', components: [row], flags: [MessageFlags.Ephemeral] });
@@ -2308,9 +2311,31 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'remove') {
+            let unlinkNote = '';
+            if (w.social_link_id) {
+                // A linked account can be tracked into more than one channel — only
+                // unlink if no OTHER watch still references it, so removing one
+                // doesn't silently break a sibling watch of the same account.
+                const guildWatches = await getWatches(guildId);
+                const stillUsed = guildWatches.some(other => other.id !== w.id && other.social_link_id === w.social_link_id);
+                if (!stillUsed) {
+                    const link = await getSocialLinkById(w.social_link_id);
+                    if (link) {
+                        if (w.platform === 'tiktok') {
+                            const result = await revokeTikTokToken(link);
+                            unlinkNote = result.ok
+                                ? '\nAlso unlinked the TikTok account (token revoked with TikTok) since no other watches were using it.'
+                                : `\nAlso unlinked the TikTok account locally, though revoking the token with TikTok failed (${result.reason}) — the account owner may want to remove app access manually from TikTok's app permissions settings.`;
+                        } else if (w.platform === 'instagram') {
+                            unlinkNote = '\nAlso unlinked the Instagram account locally since no other watches were using it. Instagram doesn\'t let apps revoke their own tokens — the account owner can fully disconnect from Instagram → Settings → Apps and Websites → Notifyer → Remove.';
+                        }
+                        await deleteSocialLink(guildId, w.social_link_id);
+                    }
+                }
+            }
             await removeWatch(guildId, id);
             const { embeds, components } = await buildWatchListEmbed(guildId);
-            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform].label} — ${w.handle}.`, embeds, components });
+            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform].label} — ${w.handle}.${unlinkNote}`, embeds, components });
         }
 
         if (action === 'backto') {
@@ -2368,7 +2393,7 @@ client.on('interactionCreate', async interaction => {
         const ownerHere = isOwner(interaction.user.id);
         const options = Object.entries(PLATFORMS)
             .filter(([, v]) => !v.unavailable || (v.ownerOnly && ownerHere))
-            .map(([k, v]) => ({ label: v.label, value: k }));
+            .map(([k, v]) => ({ label: v.label, value: k, emoji: v.emojiButton }));
         const row = new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId('setup_platform_pick').setPlaceholder('Choose a platform…').addOptions(options)
         );
@@ -2695,15 +2720,34 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 <p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
 `);
 
-const STATUS_HTML = legalPage('Status', `
-<h1>Notifyer Beta</h1>
+const STATUS_HTML = legalPage('Notifyer — Social Media Notifications for Discord', `
+<h1>Notifyer</h1>
 <p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
-<p>This is the backend for the beta build of a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
+<p style="font-size:1.1em;">Notifyer is a Discord bot that watches creators across YouTube, Twitter/X, Twitch, Kick, Instagram, and TikTok, and posts directly in a channel you choose the moment they upload, post, or go live.</p>
+
+<h2>What it does</h2>
+<ul>
+<li><strong>Multi-platform tracking</strong> — follow accounts on YouTube, Twitter/X, Twitch, Kick, Instagram, and TikTok from one bot, each with its own channel and settings.</li>
+<li><strong>Custom notification messages</strong> — write your own message per platform and per post type (video, short, live, VOD, reel, story, etc.), with placeholders like <code>{author}</code>, <code>{title}</code>, and <code>{url}</code> filled in automatically.</li>
+<li><strong>Live stream tracking</strong> — a "went live" message updates itself in place once the stream ends, instead of posting a second message.</li>
+<li><strong>Smart batching</strong> — if several posts land at once (one prolific account, or several tracked accounts posting in the same channel back to back), they're combined into a single tidy message instead of flooding the channel.</li>
+<li><strong>Preview before it fires</strong> — see exactly what a notification will look like, styling and all, without waiting for a real post.</li>
+<li><strong>Consent-based linking</strong> — Instagram and TikTok accounts connect through official OAuth (<code>/social link</code>); Notifyer only ever reads accounts that have explicitly authorized it.</li>
+</ul>
+
+<h2>How it works</h2>
+<p>An admin invites Notifyer to a Discord server, then runs <code>/setup</code> for a guided walkthrough or <code>/social add</code> to track an account directly: pick a platform, paste a handle, choose a channel. Notifyer checks each tracked account on a short interval and posts automatically the moment something new goes up.</p>
+
+<h2>Get started</h2>
+<p>
+<a href="https://top.gg/bot/1515779889737896006">Add Notifyer to your server</a> &nbsp;·&nbsp;
+<a href="https://github.com/DaniBottoni/Notifyer/tree/main">Source on GitHub</a>
+</p>
+
+<h2>Legal</h2>
 <p>
 <a href="/terms">Terms of Service</a> &nbsp;·&nbsp;
-<a href="/privacy">Privacy Policy</a> &nbsp;·&nbsp;
-<a href="https://github.com/DaniBottoni/Notifyer/tree/main">GitHub</a> &nbsp;·&nbsp;
-<a href="https://top.gg/bot/1515779889737896006">top.gg</a>
+<a href="/privacy">Privacy Policy</a>
 </p>
 `);
 

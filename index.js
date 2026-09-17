@@ -22,6 +22,20 @@ const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
         'https://x.n0g.xyz',
     ]);
 
+// YouTube Data API v3 — replaces scraping youtube.com for uploads/Shorts/live
+// detection. Requires an API key from console.cloud.google.com (enable "YouTube
+// Data API v3", create an API key). Free quota is 10,000 units/day; this bot's
+// usage (1 unit per channel per poll, plus a couple units when something new is
+// actually found) stays well within that even for a good number of channels.
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+// WebSub (PubSubHubbub) lets YouTube push new-video/live-start notifications to
+// us instantly instead of waiting for the next poll, at zero API quota cost.
+// This token is generated fresh per process start and only needs to match
+// between our own subscribe call and our own callback verification — it's not
+// meant to be a long-lived secret.
+const WEBSUB_VERIFY_TOKEN = crypto.randomBytes(16).toString('hex');
+const WEBSUB_HUB_URL = 'https://pubsubhubbub.appspot.com/subscribe';
+
 // Cutoff for permanently retiring the old single-message-template system.
 const LEGACY_MIGRATION_DATE = new Date('2026-10-01T00:00:00Z');
 const LEGACY_MIGRATION_TS = Math.floor(LEGACY_MIGRATION_DATE.getTime() / 1000);
@@ -170,7 +184,7 @@ async function ensureIPv4Pool() {
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
 const PLATFORMS = {
-    youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
+    youtube:   { label: 'YouTube',   emoji: '📺', color: '#FF0000' },
     // Twitter/X was reopened to everyone after the owner-only mirror-reliability
     // testing period confirmed the recovered Nitter mirrors (see NITTER_INSTANCES)
     // hold up consistently.
@@ -265,6 +279,24 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_post_at BIGINT;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_error TEXT;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS batch_header_template TEXT;
+        -- YouTube Data API migration: cache the resolved channel + uploads-playlist ID
+        -- per watch so a handle is only ever resolved once (saves API quota and avoids
+        -- re-doing the one fragile lookup step on every poll).
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS youtube_channel_id TEXT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS youtube_uploads_playlist_id TEXT;
+        -- Video ID of a currently-tracked-as-live YouTube stream, so routine polling can
+        -- detect when it ends and call markStreamOffline — same mechanism live_message_id
+        -- already provides for Twitch/Kick.
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS youtube_live_video_id TEXT;
+        -- WebSub (PubSubHubbub) push subscriptions, one row per distinct YouTube channel
+        -- (not per watch — several watches/guilds can track the same channel and share
+        -- one subscription). Gives near-instant new-video/live-start notifications at
+        -- zero API quota cost; routine polling still runs underneath as a fallback in
+        -- case a push is ever missed.
+        CREATE TABLE IF NOT EXISTS youtube_subscriptions (
+            channel_id TEXT PRIMARY KEY,
+            expires_at BIGINT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS social_links (
             id SERIAL PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -491,6 +523,26 @@ async function updateWatchMessageTemplates(guildId, id, templatesObj) {
 async function setWatchLiveMessage(id, messageId) {
     await pool.query('UPDATE watches SET live_message_id = $1 WHERE id = $2', [messageId, id]);
 }
+async function updateWatchYouTubeIds(id, channelId, uploadsPlaylistId) {
+    await pool.query('UPDATE watches SET youtube_channel_id = $1, youtube_uploads_playlist_id = $2 WHERE id = $3', [channelId, uploadsPlaylistId, id]);
+}
+async function setWatchYouTubeLiveVideo(id, videoId) {
+    await pool.query('UPDATE watches SET youtube_live_video_id = $1 WHERE id = $2', [videoId, id]);
+}
+async function getWatchesByYouTubeChannel(channelId) {
+    const res = await pool.query('SELECT * FROM watches WHERE youtube_channel_id = $1 AND active = TRUE', [channelId]);
+    return res.rows;
+}
+async function getYouTubeSubscription(channelId) {
+    const res = await pool.query('SELECT * FROM youtube_subscriptions WHERE channel_id = $1', [channelId]);
+    return res.rows[0] || null;
+}
+async function upsertYouTubeSubscription(channelId, expiresAt) {
+    await pool.query(
+        'INSERT INTO youtube_subscriptions (channel_id, expires_at) VALUES ($1, $2) ON CONFLICT (channel_id) DO UPDATE SET expires_at = $2',
+        [channelId, expiresAt]
+    );
+}
 async function setWatchSocialLink(guildId, id, socialLinkId) {
     await pool.query('UPDATE watches SET social_link_id = $1 WHERE guild_id = $2 AND id = $3', [socialLinkId, guildId, id]);
 }
@@ -620,50 +672,74 @@ function profileUrl(platform, handle) {
 }
 
 // ── Platform fetchers: each returns { id, url, title, author, thumbnail, timestamp } or null ──
-async function fetchLatestYouTubeEntries(handle) {
-    let channelId = handle;
-    if (handle.startsWith('@') || !/^UC[\w-]{22}$/.test(handle)) {
-        // Resolve handle -> channel id via the channel page.
-        const url = handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/${handle.startsWith('c/') || handle.startsWith('user/') ? handle : '@' + handle}`;
-        const html = await fetchText(url);
-        // Prefer the canonical link (most reliable — points at the page's own channel)
-        let m = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/);
-        // Fall back to the channel metadata's externalId field
-        if (!m) m = html.match(/"externalId":"(UC[\w-]{22})"/);
-        // Last resort: first generic channelId occurrence
-        if (!m) m = html.match(/"channelId":"(UC[\w-]{22})"/);
-        if (!m) throw new Error('Could not resolve YouTube channel ID');
-        channelId = m[1];
+// Resolves a handle (or raw UC... channel ID) to its channel ID and uploads
+// playlist ID via the API — 1 quota unit, and only ever called once per watch
+// since the result gets cached (see updateWatchYouTubeIds / fetchLatestYouTubeEntries).
+async function resolveYouTubeChannel(handle) {
+    if (!YOUTUBE_API_KEY) throw new Error('YOUTUBE_API_KEY is not set');
+    const isRawId = /^UC[\w-]{22}$/.test(handle);
+    const url = isRawId
+        ? `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${handle}&key=${YOUTUBE_API_KEY}`
+        : `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle=${encodeURIComponent(handle.startsWith('@') ? handle : '@' + handle)}&key=${YOUTUBE_API_KEY}`;
+    const { status, json } = await fetchJson(url);
+    if (status !== 200) throw new Error(json?.error?.message || `HTTP ${status}`);
+    const item = json?.items?.[0];
+    if (!item) throw new Error('Could not resolve that YouTube channel — check the handle/URL');
+    return { channelId: item.id, uploadsPlaylistId: item.contentDetails.relatedPlaylists.uploads };
+}
 
-        // Sanity check: confirm the resolved channel's handle matches what was requested
-        if (handle.startsWith('@')) {
-            const handleMatch = html.match(/"channelHandleText":\{"runs":\[\{"text":"(@[^"]+)"/) || html.match(/"vanityChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
-            if (handleMatch && handleMatch[1].toLowerCase() !== handle.toLowerCase()) {
-                throw new Error(`Resolved to a different channel handle (${handleMatch[1]}) than requested (${handle}) — check the spelling/casing`);
-            }
-        }
+// Subscribes (or renews) a WebSub push subscription for a channel so new
+// uploads/live-starts get pushed to /youtube/websub instantly instead of
+// waiting for the next poll. Best-effort: routine polling still works as a
+// fallback even if this never confirms, so failures here are logged, not thrown.
+async function ensureYouTubeSubscription(channelId) {
+    if (!PUBLIC_BASE_URL) return; // no public URL to receive the callback on yet
+    try {
+        const existing = await getYouTubeSubscription(channelId);
+        const renewalThreshold = Date.now() + 24 * 60 * 60 * 1000; // renew if expiring within a day
+        if (existing && existing.expires_at > renewalThreshold) return; // still fresh
+        const leaseSeconds = 4 * 24 * 60 * 60; // ask for ~4 days; the hub may grant a different lease
+        await postForm(WEBSUB_HUB_URL, {
+            'hub.mode': 'subscribe',
+            'hub.topic': `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${channelId}`,
+            'hub.callback': `${PUBLIC_BASE_URL}/youtube/websub`,
+            'hub.verify': 'async',
+            'hub.lease_seconds': String(leaseSeconds),
+            'hub.verify_token': WEBSUB_VERIFY_TOKEN,
+        });
+        // The hub verifies asynchronously (a GET to our callback, handled in the HTTP
+        // server below) before the subscription actually takes effect — record our
+        // requested expiry optimistically now; the callback doesn't need to update this.
+        await upsertYouTubeSubscription(channelId, Date.now() + leaseSeconds * 1000);
+    } catch (e) {
+        console.error(`ensureYouTubeSubscription (${channelId}):`, e.message);
     }
-    const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
-    const xml = await fetchText(feedUrl);
-    const data = xmlParser.parse(xml);
-    const rawEntries = data?.feed?.entry;
-    if (!rawEntries) return [];
-    // Return ALL recent entries (newest-first, up to ~15), not just the newest, so
-    // pollAll can catch up on every upload since the last check. postType is left
-    // uncomputed — only worth the extra requests for entries confirmed new.
-    const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries];
-    return entries.map(entry => {
-        const videoId = entry['yt:videoId'];
-        const url = entry.link?.['@_href'] || `https://www.youtube.com/watch?v=${videoId}`;
-        return {
-            id: videoId,
-            url,
-            title: entry.title,
-            author: data?.feed?.author?.name,
-            thumbnail: entry['media:group']?.['media:thumbnail']?.['@_url'],
-            timestamp: entry.published,
-        };
-    });
+}
+
+async function fetchLatestYouTubeEntries(w) {
+    if (!YOUTUBE_API_KEY) throw new Error('YOUTUBE_API_KEY is not set');
+    let { youtube_channel_id: channelId, youtube_uploads_playlist_id: playlistId } = w;
+    if (!channelId || !playlistId) {
+        const resolved = await resolveYouTubeChannel(w.handle);
+        channelId = resolved.channelId;
+        playlistId = resolved.uploadsPlaylistId;
+        await updateWatchYouTubeIds(w.id, channelId, playlistId);
+    }
+    // Cheap no-op most of the time (only actually re-subscribes when a lease is
+    // genuinely close to expiring) — piggybacking on routine polling means no
+    // separate renewal scheduler is needed.
+    ensureYouTubeSubscription(channelId).catch(() => {});
+
+    const { status, json } = await fetchJson(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${playlistId}&maxResults=10&key=${YOUTUBE_API_KEY}`);
+    if (status !== 200) throw new Error(json?.error?.message || `HTTP ${status}`);
+    return (json.items || []).map(it => ({
+        id: it.contentDetails.videoId,
+        url: `https://www.youtube.com/watch?v=${it.contentDetails.videoId}`,
+        title: it.snippet.title,
+        author: it.snippet.channelTitle,
+        thumbnail: it.snippet.thumbnails?.medium?.url || it.snippet.thumbnails?.default?.url || null,
+        timestamp: it.contentDetails.videoPublishedAt || it.snippet.publishedAt,
+    }));
 }
 
 async function fetchLatestTwitter(handle) {
@@ -870,19 +946,33 @@ async function fetchLatestKickAll(handle) {
 }
 
 // ── YouTube post type detection ────────────────────────────────────────────
-async function detectYouTubePostType(videoId, url) {
-    // Shorts have a distinctive URL pattern after redirect — check via oEmbed
-    if (url?.includes('/shorts/')) return 'shorts';
-    // Check if the video is a live stream via YouTube's oEmbed endpoint
-    try {
-        const raw = await fetchText(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-        const data = JSON.parse(raw);
-        // oEmbed doesn't directly expose live status, so check if the page HTML has live indicators
-        const html = await fetchText(`https://www.youtube.com/watch?v=${videoId}`);
-        if (/"isLiveBroadcast"\s*:\s*true|"style"\s*:\s*"LIVE"/.test(html)) return 'live';
-        if (html.includes('"shorts"') || url?.includes('/shorts/')) return 'shorts';
-    } catch {}
-    return 'videos';
+// Classifies a batch of video IDs (video/short/live) in a SINGLE API call —
+// videos.list costs 1 quota unit per call regardless of how many IDs are
+// requested (up to 50), so always batch this rather than calling per-video.
+// Returns { [videoId]: { postType, isLive } }.
+async function classifyYouTubeVideos(videoIds) {
+    if (!videoIds.length) return {};
+    if (!YOUTUBE_API_KEY) throw new Error('YOUTUBE_API_KEY is not set');
+    const { status, json } = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${YOUTUBE_API_KEY}`);
+    if (status !== 200) throw new Error(json?.error?.message || `HTTP ${status}`);
+    const result = {};
+    for (const item of json.items || []) {
+        const isCurrentlyLive = item.snippet.liveBroadcastContent === 'live'
+            || (item.liveStreamingDetails && !item.liveStreamingDetails.actualEndTime && item.liveStreamingDetails.actualStartTime);
+        let postType = 'videos';
+        if (isCurrentlyLive) {
+            postType = 'live';
+        } else {
+            // Shorts heuristic: YouTube's own current cutoff is 3 minutes. ISO 8601
+            // duration like PT45S / PT2M30S — anything with an "H" (hours) component
+            // is never a Short, and the regex below simply won't match those anyway.
+            const m = item.contentDetails.duration?.match(/^PT(?:(\d+)M)?(?:(\d+)S)?$/);
+            const totalSeconds = m ? (parseInt(m[1] || '0', 10) * 60 + parseInt(m[2] || '0', 10)) : null;
+            if (totalSeconds !== null && totalSeconds <= 180) postType = 'shorts';
+        }
+        result[item.id] = { postType, isLive: isCurrentlyLive, hasEnded: Boolean(item.liveStreamingDetails?.actualEndTime) };
+    }
+    return result;
 }
 
 async function fetchLatestPost(platform, handle) {
@@ -1437,7 +1527,7 @@ async function pollAll(platforms = null) {
                 if (w.platform === 'youtube') {
                     // Walk every unseen entry, not just the newest, so bursty uploads
                     // between polls don't get silently skipped.
-                    const entries = await fetchLatestYouTubeEntries(w.handle);
+                    const entries = await fetchLatestYouTubeEntries(w);
                     if (!entries.length) { await touchLastChecked(w.id); continue; }
                     if (w.last_post_id === null) {
                         // First check — seed baseline, don't notify for the back-catalog
@@ -1445,15 +1535,48 @@ async function pollAll(platforms = null) {
                         continue;
                     }
                     const newEntries = entries.filter(e => !seenIds.includes(e.id));
-                    if (!newEntries.length) { await touchLastChecked(w.id); continue; }
-                    // Chronological (oldest-first) so a batch reads/sends in upload order
-                    const chronological = [...newEntries].reverse();
-                    for (const entry of chronological) {
-                        entry.postType = await detectYouTubePostType(entry.id, entry.url);
+                    if (!newEntries.length && !w.youtube_live_video_id) { await touchLastChecked(w.id); continue; }
+
+                    // Batch-classify every new entry PLUS whatever's currently tracked as
+                    // live (if it's not already among the new entries) in one API call —
+                    // videos.list costs 1 unit per call regardless of how many IDs, so
+                    // there's no reason to ever call it per-video.
+                    const idsToClassify = [...new Set([...newEntries.map(e => e.id), ...(w.youtube_live_video_id ? [w.youtube_live_video_id] : [])])];
+                    const classified = idsToClassify.length ? await classifyYouTubeVideos(idsToClassify) : {};
+
+                    // A previously-live video that's no longer live (or fell out of the
+                    // classify batch entirely, e.g. deleted) has ended — same "edit the
+                    // went-live message" mechanism Twitch/Kick already use.
+                    if (w.youtube_live_video_id) {
+                        const stillLive = classified[w.youtube_live_video_id]?.isLive;
+                        if (!stillLive) {
+                            await markStreamOffline(w);
+                            await setWatchYouTubeLiveVideo(w.id, null);
+                        }
                     }
-                    chronological.filter(e => shouldNotify(w, e)).forEach(e => batch.add(w, e));
-                    const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-                    await updateLastPost(w.id, entries[0].id, mergedSeen, true);
+
+                    if (newEntries.length) {
+                        // Chronological (oldest-first) so a batch reads/sends in upload order
+                        const chronological = [...newEntries].reverse();
+                        for (const entry of chronological) {
+                            const c = classified[entry.id];
+                            entry.postType = c?.postType || 'videos';
+                            entry.isLive = Boolean(c?.isLive);
+                        }
+                        const toNotify = chronological.filter(e => shouldNotify(w, e));
+                        // Live entries always send individually and immediately, with their
+                        // own message-edit tracking — never batched, same rule as every
+                        // other platform.
+                        for (const entry of toNotify.filter(e => e.isLive)) {
+                            const sent = await sendNotification(w, entry);
+                            if (sent) { await setWatchLiveMessage(w.id, sent.id); await setWatchYouTubeLiveVideo(w.id, entry.id); }
+                        }
+                        toNotify.filter(e => !e.isLive).forEach(e => batch.add(w, e));
+                        const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
+                        await updateLastPost(w.id, entries[0].id, mergedSeen, true);
+                    } else {
+                        await touchLastChecked(w.id);
+                    }
                 } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
@@ -2611,6 +2734,69 @@ function htmlResponse(res, status, title, message) {
     res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;"><h2>${title}</h2><p>${message}</p></body></html>`);
 }
 
+// ── YouTube WebSub (PubSubHubbub) callback ──────────────────────────────────
+// GET: the hub's subscribe/unsubscribe verification handshake — echo back
+// hub.challenge if hub.verify_token matches what we sent when subscribing.
+function handleYouTubeWebSubVerify(req, res) {
+    const u = new URL(req.url, `https://${req.headers.host}`);
+    const mode = u.searchParams.get('hub.mode');
+    const challenge = u.searchParams.get('hub.challenge');
+    const verifyToken = u.searchParams.get('hub.verify_token');
+    if ((mode === 'subscribe' || mode === 'unsubscribe') && verifyToken === WEBSUB_VERIFY_TOKEN && challenge) {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        return res.end(challenge);
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
+}
+// POST: the actual push — an Atom feed with one or more <entry> elements. Each
+// entry means "this video is new or was just updated" (a live stream typically
+// triggers this the moment it starts). We still share the same seen_post_ids
+// dedup as routine polling, so if a poll and a push both catch the same video,
+// only the first one to arrive actually sends anything.
+async function handleYouTubeWebSubPush(req, res) {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 1_000_000) req.destroy(); });
+    req.on('end', async () => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('OK'); // ack immediately, hub expects a quick 2xx
+        try {
+            const data = xmlParser.parse(body);
+            const rawEntries = data?.feed?.entry;
+            if (!rawEntries) return;
+            const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries];
+            for (const entry of entries) {
+                const videoId = entry['yt:videoId'];
+                const channelId = entry['yt:channelId'];
+                if (!videoId || !channelId) continue;
+                const watches = await getWatchesByYouTubeChannel(channelId);
+                for (const w of watches) {
+                    const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
+                    if (w.last_post_id === null || seenIds.includes(videoId)) continue; // baseline not seeded yet, or already handled
+                    const classified = await classifyYouTubeVideos([videoId]);
+                    const c = classified[videoId];
+                    const post = {
+                        id: videoId,
+                        url: `https://www.youtube.com/watch?v=${videoId}`,
+                        title: entry.title,
+                        author: entry.author?.name,
+                        thumbnail: null,
+                        timestamp: entry.published,
+                        postType: c?.postType || 'videos',
+                        isLive: Boolean(c?.isLive),
+                    };
+                    const mergedSeen = [...new Set([videoId, ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
+                    await updateLastPost(w.id, videoId, mergedSeen, true);
+                    if (!shouldNotify(w, post)) continue;
+                    const sent = await sendNotification(w, post);
+                    if (post.isLive && sent) { await setWatchLiveMessage(w.id, sent.id); await setWatchYouTubeLiveVideo(w.id, videoId); }
+                }
+            }
+        } catch (e) {
+            console.error('YouTube WebSub push handling:', e.message);
+        }
+    });
+}
+
 async function handleOAuthCallback(platform, req, res) {
     const u = new URL(req.url, `https://${req.headers.host}`);
     const code = u.searchParams.get('code');
@@ -2771,6 +2957,10 @@ http.createServer((req, res) => {
     }
     if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
     if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
+    if (path === '/youtube/websub') {
+        if (req.method === 'GET') return handleYouTubeWebSubVerify(req, res);
+        if (req.method === 'POST') return handleYouTubeWebSubPush(req, res);
+    }
     res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
 }).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
 

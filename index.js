@@ -93,7 +93,7 @@ setInterval(() => {
     for (const [k, v] of pendingOAuthStates) if (v.expires < now) pendingOAuthStates.delete(k);
 }, 5 * 60 * 1000);
 
-function postForm(urlStr, formData, extraHeaders = {}) {
+function postForm(urlStr, formData, extraHeaders = {}, timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
         const body = new URLSearchParams(formData).toString();
         const u = new URL(urlStr);
@@ -109,7 +109,7 @@ function postForm(urlStr, formData, extraHeaders = {}) {
             });
         });
         req.on('error', reject);
-        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
+        req.setTimeout(timeoutMs, () => req.destroy(new Error('Timeout')));
         req.write(body); req.end();
     });
 }
@@ -706,7 +706,7 @@ async function ensureYouTubeSubscription(channelId) {
             'hub.verify': 'async',
             'hub.lease_seconds': String(leaseSeconds),
             'hub.verify_token': WEBSUB_VERIFY_TOKEN,
-        });
+        }, {}, 30000); // this hub is known to be occasionally slow — 30s instead of the 15s default
         // The hub verifies asynchronously (a GET to our callback, handled in the HTTP
         // server below) before the subscription actually takes effect — record our
         // requested expiry optimistically now; the callback doesn't need to update this.

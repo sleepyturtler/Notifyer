@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, ContainerBuilder, SectionBuilder, SeparatorBuilder, SeparatorSpacingSize, TextDisplayBuilder } = require('discord.js');
+íconst { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, ContainerBuilder, SectionBuilder, SeparatorBuilder, SeparatorSpacingSize, TextDisplayBuilder } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns');
 const crypto = require('crypto');
@@ -1562,6 +1562,7 @@ async function pollAll(platforms = null) {
                             const c = classified[entry.id];
                             entry.postType = c?.postType || 'videos';
                             entry.isLive = Boolean(c?.isLive);
+                            if (entry.postType === 'shorts') entry.url = `https://www.youtube.com/shorts/${entry.id}`;
                         }
                         const toNotify = chronological.filter(e => shouldNotify(w, e));
                         // Live entries always send individually and immediately, with their
@@ -2776,7 +2777,7 @@ async function handleYouTubeWebSubPush(req, res) {
                     const c = classified[videoId];
                     const post = {
                         id: videoId,
-                        url: `https://www.youtube.com/watch?v=${videoId}`,
+                        url: c?.postType === 'shorts' ? `https://www.youtube.com/shorts/${videoId}` : `https://www.youtube.com/watch?v=${videoId}`,
                         title: entry.title,
                         author: entry.author?.name,
                         thumbnail: null,
@@ -2906,9 +2907,14 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 <p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
 `);
 
-const STATUS_HTML = legalPage('Notifyer — Social Media Notifications for Discord', `
+function buildStatusHTML() {
+    const isUp = client.isReady();
+    const statusLine = isUp
+        ? '<p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>'
+        : '<p class="updated" style="background:#f8d7da;color:#842029;padding:10px 14px;border-radius:6px;display:inline-block;">🔴 <strong>Bot is currently down</strong> — this page is still up, but the Discord connection is not. Check back shortly.</p>';
+    return legalPage('Notifyer — Social Media Notifications for Discord', `
 <h1>Notifyer</h1>
-<p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
+${statusLine}
 <p style="font-size:1.1em;">Notifyer is a Discord bot that watches creators across YouTube, Twitter/X, Twitch, Kick, Instagram, and TikTok, and posts directly in a channel you choose the moment they upload, post, or go live.</p>
 
 <h2>What it does</h2>
@@ -2936,6 +2942,7 @@ const STATUS_HTML = legalPage('Notifyer — Social Media Notifications for Disco
 <a href="/privacy">Privacy Policy</a>
 </p>
 `);
+}
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
@@ -2944,7 +2951,7 @@ http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('OK');
     }
     if (path === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(STATUS_HTML);
+        res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(buildStatusHTML());
     }
     if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
     if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }

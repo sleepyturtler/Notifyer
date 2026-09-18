@@ -241,8 +241,12 @@ const PLATFORM_NOTIFY_TYPES = {
 //    (TikTok's video.list/query and Instagram's oauth Graph API both allow 600+
 //    req/min; Twitch Helix and Kick's API are similarly generous) — nothing stops
 //    us from checking these often, so we poll them close to real-time.
-//  - "Slow" platforms are unofficial/scraped (YouTube's unofficial paths, Nitter
-//    for Twitter/X) and need the conservative cadence to avoid getting blocked.
+//  - "Slow" platforms stay on a conservative cadence for other reasons: YouTube
+//    is on the official Data API v3 now (see fetchLatestYouTubeEntries), but
+//    routine polling still costs quota per check, so 2-minute polling keeps
+//    quota usage low — WebSub covers near-instant live/upload detection
+//    separately. Twitter/X still has no official free API and goes through
+//    Nitter scraping, which does need the gentler pace to avoid getting blocked.
 const FAST_POLL_INTERVAL_MS = 20 * 1000; // 20 seconds
 const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
@@ -1376,18 +1380,20 @@ async function sendNotification(w, post) {
 }
 
 // ── Batched notifications ───────────────────────────────────────────────────
-// When several new posts land in the same channel for the same platform during
-// one poll cycle — whether from one bursty account or several different ones —
-// sending one message per post pings the role N times in a row. At
-// BATCH_THRESHOLD+ posts, send one Components V2 message instead: a header
-// line (its own top-level component, outside the accent-colored box), then
-// one compact title+button "Section" per post inside the box, with dividers
-// between them. Below the threshold, posts still send individually as before.
+// Same channel+platform posts batch into one Components V2 message instead of
+// pinging separately — but the trigger is now a rolling time window, not a
+// per-cycle count. The first post in a window still sends as a normal single
+// embed; the moment a SECOND post for that channel+platform lands within
+// BATCH_WINDOW_MS of the last one (whether that's the same poll cycle, a
+// later cycle, or a WebSub push), that original message is retroactively
+// edited into a batch and the new post is appended to it. Each append slides
+// the window forward, so a channel posting every few minutes keeps extending
+// the same batch indefinitely instead of starting a new one each time.
 // Live posts (isLive) never batch — their "went live"/"ended" message-edit
 // tracking doesn't fit the batch format — and batches never cross platforms,
 // only same channel+platform groups are batchable, even across different
 // tracked accounts.
-const BATCH_THRESHOLD = 3;
+const BATCH_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_BATCH_HEADER = '**{author}** posted {count} times!';
 function renderBatchHeader(w, count) {
     const tmpl = w.batch_header_template || DEFAULT_BATCH_HEADER;
@@ -1403,7 +1409,7 @@ function formatCreatorList(handles) {
     if (unique.length === 2) return `${unique[0]} and ${unique[1]}`;
     return `${unique.slice(0, -1).join(', ')}, and ${unique[unique.length - 1]}`;
 }
-// entries: [{ w, post }] all sharing one channel+platform (see createBatchCollector).
+// entries: [{ w, post }] all sharing one channel+platform (see sendOrExtendBatch).
 function renderBatchHeaderForEntries(entries) {
     const handles = entries.map(e => e.w.handle);
     const unique = [...new Set(handles)];
@@ -1449,31 +1455,64 @@ async function sendBatchNotification(entries) {
     if (!channel) return null;
     return channel.send(buildBatchPayload(entries)).catch(e => { console.error(`send batch notification (${guild.name}/#${channel.name}, ${entries.length} posts):`, e.message); return null; });
 }
-// Collects { w, post } entries across an entire poll cycle, grouped by
-// channel+platform, so posts from different watches/creators posting to the
-// same channel can batch together. pollAll calls .add() per new non-live post
-// while walking watches, then .flush() once after the whole cycle — each
-// group sends as one batch if it hit BATCH_THRESHOLD, or individually
-// (unchanged single-post behavior) otherwise.
-function createBatchCollector() {
-    const groups = new Map(); // `${channel_id}::${platform}` -> [{w, post}]
-    return {
-        add(w, post) {
-            const key = `${w.channel_id}::${w.platform}`;
-            if (!groups.has(key)) groups.set(key, []);
-            groups.get(key).push({ w, post });
-        },
-        async flush() {
-            for (const entries of groups.values()) {
-                if (entries.length >= BATCH_THRESHOLD) {
-                    await sendBatchNotification(entries);
-                } else {
-                    for (const { w, post } of entries) await sendNotification(w, post);
-                }
-            }
-        },
-    };
+// Rolling per-channel+platform batch window — see the comment block above.
+// Not persisted: a process restart just starts fresh windows, which is fine
+// since it only affects whether the next post joins an existing message or
+// starts a new one, never notification delivery itself.
+const recentBatchState = new Map(); // `${channel_id}::${platform}` -> { messageId, entries, lastAt }
+// pollAll's YouTube branch and the WebSub push handler can both call this for the
+// same channel+platform key around the same time (a push landing mid-poll-cycle).
+// Without serializing per key, two concurrent calls could both read the same stale
+// state and one write would clobber the other's, silently dropping an entry from
+// the visible batch. This chains calls for the same key one after another.
+const batchLocks = new Map(); // key -> promise chain tail
+function withBatchLock(key, fn) {
+    const prev = batchLocks.get(key) || Promise.resolve();
+    const run = prev.then(fn, fn);
+    batchLocks.set(key, run.catch(() => {}));
+    return run;
 }
+async function sendOrExtendBatch(w, post) {
+    const key = `${w.channel_id}::${w.platform}`;
+    return withBatchLock(key, () => sendOrExtendBatchLocked(w, post, key));
+}
+async function sendOrExtendBatchLocked(w, post, key) {
+    const state = recentBatchState.get(key);
+    const now = Date.now();
+
+    if (state && (now - state.lastAt) <= BATCH_WINDOW_MS) {
+        state.entries.push({ w, post });
+        state.lastAt = now;
+        const guild = client.guilds.cache.get(w.guild_id);
+        const channel = guild?.channels.cache.get(w.channel_id);
+        if (!channel) { recentBatchState.delete(key); return null; }
+        try {
+            const msg = await channel.messages.fetch(state.messageId);
+            // Converting a normal single-embed/content message into Components V2
+            // (or re-editing one that already is) requires explicitly nulling out
+            // content/embeds/stickers/poll on the edit — passing only
+            // flags+components isn't enough for Discord to accept the switch.
+            return await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
+        } catch (e) {
+            // Original message is gone (deleted, too old to fetch, lost permissions)
+            // — fall back to sending a fresh batch message with everything collected
+            // so far, so nothing in the window gets silently dropped.
+            console.error(`extend batch (${key}):`, e.message);
+            const sent = await sendBatchNotification(state.entries);
+            if (sent) recentBatchState.set(key, { messageId: sent.id, entries: state.entries, lastAt: now });
+            else recentBatchState.delete(key);
+            return sent;
+        }
+    }
+
+    // No live window for this channel+platform — send as a normal single
+    // notification and open a new window in case something else lands soon.
+    const sent = await sendNotification(w, post);
+    if (sent) recentBatchState.set(key, { messageId: sent.id, entries: [{ w, post }], lastAt: now });
+    else recentBatchState.delete(key);
+    return sent;
+}
+
 
 // Edits a previously-sent "went live" message to show the stream has ended, once a
 // later poll finds the channel no longer live. Falls back to just clearing the tracked
@@ -1516,7 +1555,6 @@ async function pollAll(platforms = null) {
     try {
         let watches = await getAllWatches();
         if (platforms) watches = watches.filter(w => platforms.has(w.platform));
-        const batch = createBatchCollector();
         for (const w of watches) {
             if (!w.active) continue;
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
@@ -1572,7 +1610,7 @@ async function pollAll(platforms = null) {
                             const sent = await sendNotification(w, entry);
                             if (sent) { await setWatchLiveMessage(w.id, sent.id); await setWatchYouTubeLiveVideo(w.id, entry.id); }
                         }
-                        toNotify.filter(e => !e.isLive).forEach(e => batch.add(w, e));
+                        for (const entry of toNotify.filter(e => !e.isLive)) await sendOrExtendBatch(w, entry);
                         const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
                         await updateLastPost(w.id, entries[0].id, mergedSeen, true);
                     } else {
@@ -1608,7 +1646,7 @@ async function pollAll(platforms = null) {
                         const sent = await sendNotification(w, post);
                         if (sent) await setWatchLiveMessage(w.id, sent.id);
                     }
-                    toNotify.filter(p => !p.isLive).forEach(p => batch.add(w, p));
+                    for (const post of toNotify.filter(p => !p.isLive)) await sendOrExtendBatch(w, post);
                     // Stream-ended detection: we were tracking a "went live" message, but this
                     // poll's results no longer include a live entry — edit that message to
                     // show it ended instead of leaving it saying "is live" forever. (No-op for
@@ -1632,7 +1670,7 @@ async function pollAll(platforms = null) {
                     if (seenIds.includes(post.id)) { await touchLastChecked(w.id); continue; }
                     await updateLastPost(w.id, post.id, seenIds, true);
                     if (!shouldNotify(w, post)) continue;
-                    batch.add(w, post);
+                    await sendOrExtendBatch(w, post);
                 }
             } catch (e) {
                 if (/HTTP 429/.test(e.message)) {
@@ -1646,7 +1684,6 @@ async function pollAll(platforms = null) {
             const jitter = 1000 + Math.random() * 1000;
             await new Promise(r => setTimeout(r, jitter));
         }
-        await batch.flush();
     } finally {
         pollInProgress[lockKey] = false;
     }
@@ -1848,7 +1885,7 @@ const HELP_CATEGORIES = [
                 { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
                 { name: '/social preview', value: 'See exactly what a notification will look like for a tracked account, one preview per notify type, without waiting for a real post.' },
                 { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
-                { name: '📦 Batched notifications', value: 'If 3+ new posts land in the same channel for the same platform in one check — whether from one account or several tracked accounts posting at once — they\'re combined into a single message instead of one ping per post: a header line, then a compact title+button per post. With multiple accounts involved the header lists them (e.g. "A and B posted 4 times!"); with just one, that watch\'s custom header (set from its manage view, "📦 Batch Header") is used. "Went live" notifications are never batched.' },
+                { name: '📦 Batched notifications', value: 'If a second new post lands in the same channel for the same platform within 10 minutes of the last one — whether from one account or several tracked accounts — the earlier message is turned into a combined one instead of pinging again: a header line, then a compact title+button per post. Each further post within 10 minutes of the last keeps extending the same message. With multiple accounts involved the header lists them (e.g. "A and B posted 4 times!"); with just one, that watch\'s custom header (set from its manage view, "📦 Batch Header") is used. "Went live" notifications are never batched.' },
             ),
     },
     {
@@ -1873,7 +1910,7 @@ const HELP_CATEGORIES = [
             .addFields(
                 { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
                 { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`. For Live messages specifically, `{is/was}` renders as "is" when the stream starts and "was" once it ends — so one message works for both.' },
-                { name: 'Notes', value: 'TikTok, Instagram, Twitch, and Kick are checked about every 20 seconds; YouTube and Twitter are checked every 2 minutes (they rely on unofficial/scraped access, which needs a gentler pace). New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
+                { name: 'Notes', value: 'TikTok, Instagram, Twitch, and Kick are checked about every 20 seconds; YouTube and Twitter are checked every 2 minutes — YouTube to conserve API quota (new uploads/live starts still arrive near-instantly via push notifications), Twitter because it relies on unofficial scraping and needs a gentler pace. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
                 { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),
@@ -2108,7 +2145,8 @@ client.on('interactionCreate', async interaction => {
 
                 let post = null, fetchError = null;
                 try {
-                    if (w.platform === 'twitch') post = (await fetchLatestTwitchAll(w.handle))[0] || null;
+                    if (w.platform === 'youtube') post = (await fetchLatestYouTubeEntries(w))[0] || null;
+                    else if (w.platform === 'twitch') post = (await fetchLatestTwitchAll(w.handle))[0] || null;
                     else if (w.platform === 'kick') post = (await fetchLatestKickAll(w.handle))[0] || null;
                     else if (w.platform === 'instagram' || w.platform === 'tiktok') {
                         if (!w.social_link_id) throw new Error('Not linked — run /social link first.');
@@ -2765,6 +2803,10 @@ async function handleYouTubeWebSubPush(req, res) {
             const rawEntries = data?.feed?.entry;
             if (!rawEntries) return;
             const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries];
+            // Non-live entries go through the same rolling batch window as routine
+            // polling (see sendOrExtendBatch) — a single push can carry several
+            // <entry> elements at once (e.g. a channel bulk-uploading), and this
+            // makes sure a burst still collapses into one message the same way.
             for (const entry of entries) {
                 const videoId = entry['yt:videoId'];
                 const channelId = entry['yt:channelId'];
@@ -2788,8 +2830,14 @@ async function handleYouTubeWebSubPush(req, res) {
                     const mergedSeen = [...new Set([videoId, ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
                     await updateLastPost(w.id, videoId, mergedSeen, true);
                     if (!shouldNotify(w, post)) continue;
-                    const sent = await sendNotification(w, post);
-                    if (post.isLive && sent) { await setWatchLiveMessage(w.id, sent.id); await setWatchYouTubeLiveVideo(w.id, videoId); }
+                    if (post.isLive) {
+                        // Live entries always send individually and immediately, with their
+                        // own message-edit tracking — never batched, same rule as pollAll.
+                        const sent = await sendNotification(w, post);
+                        if (sent) { await setWatchLiveMessage(w.id, sent.id); await setWatchYouTubeLiveVideo(w.id, videoId); }
+                    } else {
+                        await sendOrExtendBatch(w, post);
+                    }
                 }
             }
         } catch (e) {

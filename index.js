@@ -92,6 +92,14 @@ setInterval(() => {
     const now = Date.now();
     for (const [k, v] of pendingOAuthStates) if (v.expires < now) pendingOAuthStates.delete(k);
 }, 5 * 60 * 1000);
+// pendingSetupPicks has the same "entries only get cleaned up when read back"
+// shape, but /setup flows that get abandoned partway (user closes Discord,
+// never finishes the modal/channel-select) never get read back at all — without
+// this, those entries would sit in memory forever on a long-running process.
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of pendingSetupPicks) if (v.expires < now) pendingSetupPicks.delete(k);
+}, 5 * 60 * 1000);
 
 function postForm(urlStr, formData, extraHeaders = {}, timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
@@ -487,7 +495,19 @@ async function getWatches(guildId) {
     const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 ORDER BY id', [guildId]);
     return res.rows;
 }
-async function getAllWatches() {
+// Unfiltered variant kept for the rare, non-hot-path callers below (startup
+// announcements) that need to see every watch regardless of platform/active
+// status. pollAll (the actual hot path — runs every 20s/2min) passes
+// `platforms` and gets the filtering pushed into SQL instead: previously it
+// pulled every row in the whole table on every single cycle and threw most
+// of them away in JS afterward, which is wasted DB I/O and network transfer
+// that scales with total watches across every server, not just the ones
+// this cycle actually needs.
+async function getAllWatches(platforms = null) {
+    if (platforms) {
+        const res = await pool.query('SELECT * FROM watches WHERE active = TRUE AND platform = ANY($1) ORDER BY id', [[...platforms]]);
+        return res.rows;
+    }
     const res = await pool.query('SELECT * FROM watches ORDER BY id');
     return res.rows;
 }
@@ -1296,6 +1316,11 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
                 const posts = await fetchLatestKickAll(handle);
                 post = posts[0] || null;
                 baselineSeenIds = posts.map(p => p.id);
+            } else if (platform === 'youtube') {
+                // fetchLatestPost() has no YouTube case — it's handled separately via
+                // the Data API + playlist-ID cache (fetchLatestYouTubeEntries), which
+                // needs a real watch.id to cache the resolved channel/playlist IDs
+                // against. Deferred until after addWatch() below, once we have one.
             } else {
                 post = await fetchLatestPost(platform, handle);
                 baselineSeenIds = post?.id ? [post.id] : [];
@@ -1312,6 +1337,21 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
 
     const watch = await addWatch({ guildId, platform, handle, channelId, addedBy: addedByTag });
     if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
+
+    if (platform === 'youtube') {
+        try {
+            const posts = await fetchLatestYouTubeEntries(watch);
+            post = posts[0] || null;
+            baselineSeenIds = posts.map(p => p.id);
+        } catch (e) {
+            // Same "proceed anyway" leniency as the 429 case above for other
+            // platforms — don't fail watch creation over this. Baseline will
+            // just seed itself on the first routine poll instead, same as it
+            // always has for a watch with no baseline yet.
+            console.error(`YouTube baseline fetch for new watch (${watch.id}):`, e.message);
+        }
+    }
+
     // Seed last_post_id AND seen_post_ids so the first poll doesn't fire
     // notifications for content that already existed before tracking started.
     await updateLastPost(watch.id, post?.id || null, baselineSeenIds);
@@ -1339,7 +1379,7 @@ function buildAddWatchSuccessResponse(watch, post, handle, channel) {
         successEmbed.setDescription('One more step — set the notification message below.')
             .addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
         const msgRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
+            new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}_new`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
         );
         return { embeds: [successEmbed], components: [msgRow] };
     }
@@ -1364,9 +1404,14 @@ function buildAddWatchSuccessResponse(watch, post, handle, channel) {
     return { embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] };
 }
 
-async function sendNotification(w, post) {
+// Shared by every place that needs to resolve a watch's target channel — sending
+// a notification, editing a batch message, or updating a live-status message.
+function resolveWatchChannel(w) {
     const guild = client.guilds.cache.get(w.guild_id);
-    const channel = guild?.channels.cache.get(w.channel_id);
+    return { guild, channel: guild?.channels.cache.get(w.channel_id) };
+}
+async function sendNotification(w, post) {
+    const { guild, channel } = resolveWatchChannel(w);
     if (!channel) return null;
     const payload = buildNotificationPayload(w, post);
     if (payload.wantsNativeVideo) {
@@ -1395,11 +1440,15 @@ async function sendNotification(w, post) {
 // tracked accounts.
 const BATCH_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_BATCH_HEADER = '**{author}** posted {count} times!';
-function renderBatchHeader(w, count) {
+// allHandles: every distinct handle contributing to this batch (just [w.handle]
+// for a single-creator batch) — lets {creators} resolve correctly even when the
+// template being rendered belongs to one specific watch in a multi-creator batch.
+function renderBatchHeader(w, count, allHandles = [w.handle]) {
     const tmpl = w.batch_header_template || DEFAULT_BATCH_HEADER;
     return tmpl
         .replace(/\{author\}/g, w.handle)
         .replace(/\{handle\}/g, w.handle)
+        .replace(/\{creators\}/g, formatCreatorList(allHandles))
         .replace(/\{platform\}/g, PLATFORMS[w.platform]?.label || w.platform)
         .replace(/\{count\}/g, String(count));
 }
@@ -1415,12 +1464,16 @@ function renderBatchHeaderForEntries(entries) {
     const unique = [...new Set(handles)];
     if (unique.length === 1) {
         // Single creator — honor that watch's own customizable header template.
-        return renderBatchHeader(entries[0].w, entries.length);
+        return renderBatchHeader(entries[0].w, entries.length, unique);
     }
-    // Multiple creators contributed — always the generic "A and B posted N
-    // times!" form, since one watch's custom {author}-based template wouldn't
-    // make sense once more than one account is involved.
-    return `${formatCreatorList(handles)} posted ${entries.length} times!`;
+    // Multiple creators contributed. Prefer whichever contributing watch has
+    // actually customized its header — that's how someone opts a template with
+    // {creators} in it into the multi-creator case specifically. If nobody in
+    // this batch has customized anything, fall back to the generic "A and B
+    // posted N times!" form.
+    const customized = entries.find(e => e.w.batch_header_template);
+    if (customized) return renderBatchHeader(customized.w, entries.length, unique);
+    return `${formatCreatorList(unique)} posted ${entries.length} times!`;
 }
 function hexColorToInt(hex) {
     return parseInt(String(hex).replace('#', ''), 16);
@@ -1440,18 +1493,24 @@ function buildBatchPayload(entries) {
     entries.forEach(({ w, post }, i) => {
         if (i > 0) container.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
         const title = (post.title || '(untitled)').slice(0, 250);
+        // Compute the URL explicitly here rather than trusting post.url was already
+        // shorts-corrected upstream — same result when it was, but this guarantees a
+        // Short still opens in the Shorts viewer (not the regular watch page) even if
+        // something earlier in the pipeline ever passes through an uncorrected entry.
+        const url = (w.platform === 'youtube' && post.postType === 'shorts' && post.id)
+            ? `https://www.youtube.com/shorts/${post.id}`
+            : post.url;
         container.addSectionComponents(
             new SectionBuilder()
                 .addTextDisplayComponents(new TextDisplayBuilder().setContent(title))
-                .setButtonAccessory(new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton))
+                .setButtonAccessory(new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(url).setEmoji(p.emojiButton))
         );
     });
     return { components: [header, container], flags: MessageFlags.IsComponentsV2 };
 }
 async function sendBatchNotification(entries) {
     const w0 = entries[0].w;
-    const guild = client.guilds.cache.get(w0.guild_id);
-    const channel = guild?.channels.cache.get(w0.channel_id);
+    const { guild, channel } = resolveWatchChannel(w0);
     if (!channel) return null;
     return channel.send(buildBatchPayload(entries)).catch(e => { console.error(`send batch notification (${guild.name}/#${channel.name}, ${entries.length} posts):`, e.message); return null; });
 }
@@ -1472,6 +1531,15 @@ function withBatchLock(key, fn) {
     batchLocks.set(key, run.catch(() => {}));
     return run;
 }
+// Same "grows forever, nothing ever removes an entry" shape as pendingOAuthStates
+// above — a channel+platform pair that stops posting (watch removed, channel
+// deleted, server leaves) would otherwise sit in both maps for the life of the
+// process. Anything past the window is no longer "recent" anyway.
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of recentBatchState) if (now - v.lastAt > BATCH_WINDOW_MS) recentBatchState.delete(k);
+    for (const k of batchLocks.keys()) if (!recentBatchState.has(k)) batchLocks.delete(k);
+}, 5 * 60 * 1000);
 async function sendOrExtendBatch(w, post) {
     const key = `${w.channel_id}::${w.platform}`;
     return withBatchLock(key, () => sendOrExtendBatchLocked(w, post, key));
@@ -1483,8 +1551,7 @@ async function sendOrExtendBatchLocked(w, post, key) {
     if (state && (now - state.lastAt) <= BATCH_WINDOW_MS) {
         state.entries.push({ w, post });
         state.lastAt = now;
-        const guild = client.guilds.cache.get(w.guild_id);
-        const channel = guild?.channels.cache.get(w.channel_id);
+        const { channel } = resolveWatchChannel(w);
         if (!channel) { recentBatchState.delete(key); return null; }
         try {
             const msg = await channel.messages.fetch(state.messageId);
@@ -1520,8 +1587,7 @@ async function sendOrExtendBatchLocked(w, post, key) {
 async function markStreamOffline(w) {
     if (!w.live_message_id) return;
     try {
-        const guild = client.guilds.cache.get(w.guild_id);
-        const channel = guild?.channels.cache.get(w.channel_id);
+        const { channel } = resolveWatchChannel(w);
         const msg = channel ? await channel.messages.fetch(w.live_message_id).catch(() => null) : null;
         if (msg) {
             const p = PLATFORMS[w.platform];
@@ -1553,8 +1619,13 @@ async function pollAll(platforms = null) {
     if (pollInProgress[lockKey]) return;
     pollInProgress[lockKey] = true;
     try {
-        let watches = await getAllWatches();
-        if (platforms) watches = watches.filter(w => platforms.has(w.platform));
+        // platforms filtering (and active=TRUE) now happens in SQL when a
+        // platform set is passed — see getAllWatches. The in-memory !w.active
+        // check below stays as a safety net for the no-args (/social check)
+        // path, which still fetches unfiltered.
+        const watches = await getAllWatches(platforms);
+        // Scoped to this one poll pass only — see the instagram/tiktok branch below.
+        const socialLinkPostsCache = new Map(); // social_link_id -> Promise<posts[] | null>
         for (const w of watches) {
             if (!w.active) continue;
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
@@ -1625,9 +1696,21 @@ async function pollAll(platforms = null) {
                         posts = await fetchLatestKickAll(w.handle);
                     } else {
                         if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
-                        const link = await getSocialLinkById(w.social_link_id);
-                        if (!link) { await touchLastChecked(w.id); continue; } // link was removed
-                        posts = w.platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
+                        // Multiple watches (even across channels/guilds) can share one linked
+                        // account — see /social remove's "does another watch still use this
+                        // link" check. Without caching, each one re-hits the actual
+                        // Instagram/TikTok API independently for the identical account, every
+                        // cycle — a real external call against a real rate limit, not just a
+                        // DB read, so it's worth sharing across the whole poll pass.
+                        if (!socialLinkPostsCache.has(w.social_link_id)) {
+                            socialLinkPostsCache.set(w.social_link_id, (async () => {
+                                const link = await getSocialLinkById(w.social_link_id);
+                                if (!link) return null; // link was removed
+                                return w.platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
+                            })());
+                        }
+                        posts = await socialLinkPostsCache.get(w.social_link_id);
+                        if (posts === null) { await touchLastChecked(w.id); continue; } // link was removed
                     }
                     let newSeenIds = [...seenIds];
                     let updated = false;
@@ -1800,10 +1883,13 @@ function isLegacyMessageFormat(w) {
 
 // Shared modal builder used both from the manage view's "Per-Type Messages"
 // button and from the new guided /social add flow, so both stay in sync.
-function buildPerTypeMessageModal(w) {
+// isNewFlow tags the modal's customId so its submit handler knows whether to
+// continue the add-flow wizard (offer the batch-header step next) or just
+// return to the manage view, since this same modal serves both entry points.
+function buildPerTypeMessageModal(w, isNewFlow = false) {
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const templates = w.message_templates || {};
-    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}`).setTitle(`Per-Type Messages — ${w.handle}`.slice(0, 45));
+    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}${isNewFlow ? '_new' : ''}`).setTitle(`Per-Type Messages — ${w.handle}`.slice(0, 45));
     // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
     modal.addComponents(
         ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
@@ -1818,6 +1904,30 @@ function buildPerTypeMessageModal(w) {
     return modal;
 }
 
+// Shared by the manage view's "📦 Batch Header" button and the guided add-flow's
+// optional batch-header step below, so both stay in sync.
+function buildBatchHeaderModal(w) {
+    return new ModalBuilder().setCustomId(`socialbatchheader_modal_${w.id}`).setTitle('Edit Batch Header')
+        .addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId('template').setLabel('Header shown when 2+ posts land within 10 min')
+                    .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)
+                    .setValue(w.batch_header_template || '')
+                    .setPlaceholder(DEFAULT_BATCH_HEADER)
+            )
+        );
+}
+// A watch can only ever contribute to a batch if at least one of its active
+// notify types isn't "live" — live events always send individually (see
+// pollAll), so a Kick watch (live-only) or a YouTube watch restricted to just
+// Live can never actually batch, regardless of platform. Shared by the manage
+// view and the guided add-flow's post-setup batch-header step.
+function canWatchBatch(w) {
+    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+    const nonLiveTypes = types.filter(t => t.id !== 'live');
+    const activeTypeIds = (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types : types.map(t => t.id);
+    return nonLiveTypes.length > 0 && activeTypeIds.some(id => id !== 'live');
+}
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
@@ -1843,10 +1953,8 @@ function buildManageView(w) {
     // notify types isn't "live" — live events always send individually (see
     // pollAll), so a Kick watch (live-only) or a YouTube watch restricted to
     // just Live can never actually batch, regardless of platform.
-    const nonLiveTypes = types.filter(t => t.id !== 'live');
-    const activeTypeIds = (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types : types.map(t => t.id);
-    const canBatch = nonLiveTypes.length > 0 && activeTypeIds.some(id => id !== 'live');
-    if (canBatch) embed.addFields({ name: 'Batch header', value: w.batch_header_template ? `\`${w.batch_header_template}\`` : `Default: \`${DEFAULT_BATCH_HEADER}\`` });
+    const canBatch = canWatchBatch(w);
+    if (canBatch) embed.addFields({ name: 'Batch header', value: `${w.batch_header_template ? `\`${w.batch_header_template}\`` : `Default: \`${DEFAULT_BATCH_HEADER}\``}\n\`{author}\`/\`{handle}\`/\`{platform}\`/\`{count}\` work as usual; use \`{creators}\` instead of \`{author}\` if you want this header to also read well when more than one tracked account contributes to the same batch (e.g. "X and Y posted 5 times!").` });
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_msg_${w.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
@@ -1885,7 +1993,7 @@ const HELP_CATEGORIES = [
                 { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
                 { name: '/social preview', value: 'See exactly what a notification will look like for a tracked account, one preview per notify type, without waiting for a real post.' },
                 { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
-                { name: '📦 Batched notifications', value: 'If a second new post lands in the same channel for the same platform within 10 minutes of the last one — whether from one account or several tracked accounts — the earlier message is turned into a combined one instead of pinging again: a header line, then a compact title+button per post. Each further post within 10 minutes of the last keeps extending the same message. With multiple accounts involved the header lists them (e.g. "A and B posted 4 times!"); with just one, that watch\'s custom header (set from its manage view, "📦 Batch Header") is used. "Went live" notifications are never batched.' },
+                { name: '📦 Batched notifications', value: 'If a second new post lands in the same channel for the same platform within 10 minutes of the last one — whether from one account or several tracked accounts — the earlier message is turned into a combined one instead of pinging again: a header line, then a compact title+button per post. Each further post within 10 minutes of the last keeps extending the same message. Customize the header from a watch\'s manage view ("📦 Batch Header") — use `{creators}` instead of `{author}` if you want it to also read well with multiple accounts (e.g. "X and Y posted 5 times!"); otherwise a batch with more than one account falls back to that generic form automatically. "Went live" notifications are never batched.' },
             ),
     },
     {
@@ -2409,16 +2517,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'batchheader') {
-            const modal = new ModalBuilder().setCustomId(`socialbatchheader_modal_${id}`).setTitle('Edit Batch Header')
-                .addComponents(
-                    new ActionRowBuilder().addComponents(
-                        new TextInputBuilder().setCustomId('template').setLabel('Header shown when 3+ posts land at once')
-                            .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)
-                            .setValue(w.batch_header_template || '')
-                            .setPlaceholder(DEFAULT_BATCH_HEADER)
-                    )
-                );
-            return interaction.showModal(modal);
+            return interaction.showModal(buildBatchHeaderModal(w));
         }
 
         if (action === 'channel') {
@@ -2514,7 +2613,7 @@ client.on('interactionCreate', async interaction => {
         if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
         await updateWatchNotifyTypes(guildId, id, interaction.values);
         const updated = await getWatch(guildId, id);
-        return interaction.showModal(buildPerTypeMessageModal(updated));
+        return interaction.showModal(buildPerTypeMessageModal(updated, true));
     }
     if (interaction.isButton() && interaction.customId.startsWith('socialtypeadd_skip_')) {
         const id = parseInt(interaction.customId.slice(19), 10);
@@ -2522,7 +2621,7 @@ client.on('interactionCreate', async interaction => {
         if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
         await updateWatchNotifyTypes(guildId, id, null);
         const updated = await getWatch(guildId, id);
-        return interaction.showModal(buildPerTypeMessageModal(updated));
+        return interaction.showModal(buildPerTypeMessageModal(updated, true));
     }
 
     // ── Select: notification types (post-add and manage flows) ──────────────
@@ -2664,17 +2763,19 @@ client.on('interactionCreate', async interaction => {
 
     // ── Button: open per-post-type custom message popup form ────────────────
     if (interaction.isButton() && interaction.customId.startsWith('socialpertype_open_')) {
-        const id = parseInt(interaction.customId.slice(19), 10);
+        const isNewFlow = interaction.customId.endsWith('_new');
+        const id = parseInt(interaction.customId.slice(19), 10); // parseInt stops at the trailing "_new" on its own
         const w = await getWatch(guildId, id);
         if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        return interaction.showModal(buildPerTypeMessageModal(w));
+        return interaction.showModal(buildPerTypeMessageModal(w, isNewFlow));
     }
 
     // ── Modal: save per-post-type custom messages ────────────────────────────
     if (interaction.isModalSubmit() && interaction.customId.startsWith('socialpertype_modal_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(20), 10);
+        const isNewFlow = interaction.customId.endsWith('_new');
+        const id = parseInt(interaction.customId.slice(20), 10); // parseInt stops at the trailing "_new" on its own
         const w = await getWatch(guildId, id);
         if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
         const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
@@ -2686,8 +2787,39 @@ client.on('interactionCreate', async interaction => {
         await updateWatchMessageTemplates(guildId, id, updatedTemplates);
         await interaction.deferUpdate();
         const updated = await getWatch(guildId, id);
+        // Still mid-wizard (came from /social add or /setup, not a later manage-view
+        // edit) and this watch can actually batch — offer the batch-header step as
+        // its own explicit part of the flow, rather than only ever being reachable
+        // by noticing the button buried in the manage view afterward.
+        if (isNewFlow && canWatchBatch(updated)) {
+            const embed = new EmbedBuilder().setColor(PLATFORMS[updated.platform].color)
+                .setTitle('One more optional step')
+                .setDescription(`Want a custom header for when 2+ posts from ${updated.handle} (or another watch in the same channel) land within 10 minutes of each other? Default is \`${DEFAULT_BATCH_HEADER}\`.`);
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`socialbatchheaderadd_open_${id}`).setLabel('Set Batch Header').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId(`socialbatchheaderadd_skip_${id}`).setLabel('Skip').setStyle(ButtonStyle.Secondary)
+            );
+            return interaction.editReply({ embeds: [embed], components: [row] });
+        }
         const { embeds, components } = buildManageView(updated);
         return interaction.editReply({ embeds, components });
+    }
+
+    // ── Buttons: optional batch-header step at the end of the add-flow wizard ──
+    if (interaction.isButton() && interaction.customId.startsWith('socialbatchheaderadd_open_')) {
+        const id = parseInt(interaction.customId.slice(26), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        return interaction.showModal(buildBatchHeaderModal(w));
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('socialbatchheaderadd_skip_')) {
+        const id = parseInt(interaction.customId.slice(26), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.update({ content: '❌ Watch not found (it may have been removed).', embeds: [], components: [] });
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const { embeds, components } = buildManageView(w);
+        return interaction.update({ embeds, components });
     }
 
   } catch (error) {
@@ -2768,6 +2900,14 @@ async function exchangeTikTokCode(code) {
     };
 }
 
+// Escapes text that gets interpolated into htmlResponse's message/title strings.
+// htmlResponse itself can't escape blindly — its `message` argument is a mix of
+// HTML we wrote on purpose (e.g. <code>, <b>, <br>) and dynamic values baked into
+// that string — so each dynamic value has to be escaped individually before it's
+// interpolated, at the call site, not the whole final string.
+function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 function htmlResponse(res, status, title, message) {
     res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;"><h2>${title}</h2><p>${message}</p></body></html>`);
@@ -2795,6 +2935,10 @@ function handleYouTubeWebSubVerify(req, res) {
 // only the first one to arrive actually sends anything.
 async function handleYouTubeWebSubPush(req, res) {
     let body = '';
+    // Without this, a client that aborts mid-upload emits an unhandled 'error' on
+    // req — which (unlike a rejected promise) isn't caught anywhere and crashes
+    // the whole process, the same class of issue as the top-level HTTP try/catch.
+    req.on('error', e => console.error('YouTube WebSub push request:', e.message));
     req.on('data', chunk => { body += chunk; if (body.length > 1_000_000) req.destroy(); });
     req.on('end', async () => {
         res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('OK'); // ack immediately, hub expects a quick 2xx
@@ -2812,10 +2956,18 @@ async function handleYouTubeWebSubPush(req, res) {
                 const channelId = entry['yt:channelId'];
                 if (!videoId || !channelId) continue;
                 const watches = await getWatchesByYouTubeChannel(channelId);
+                // Classify once per video, not once per watch — several servers can
+                // track the same channel, and classifyYouTubeVideos is a real,
+                // quota-costed API call, so doing it per-watch was hitting the same
+                // endpoint N times for what's always the same answer. Lazy (only
+                // fires if at least one watch actually needs it) so a video that's
+                // already-seen/pre-baseline for every watch still skips it entirely,
+                // same as before.
+                let classified = null;
                 for (const w of watches) {
                     const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
                     if (w.last_post_id === null || seenIds.includes(videoId)) continue; // baseline not seeded yet, or already handled
-                    const classified = await classifyYouTubeVideos([videoId]);
+                    if (!classified) classified = await classifyYouTubeVideos([videoId]);
                     const c = classified[videoId];
                     const post = {
                         id: videoId,
@@ -2852,7 +3004,7 @@ async function handleOAuthCallback(platform, req, res) {
     const state = u.searchParams.get('state');
     const oauthError = u.searchParams.get('error');
     const oauthErrorDescription = u.searchParams.get('error_description') || u.searchParams.get('error_reason');
-    if (oauthError) return htmlResponse(res, 400, 'Authorization denied', `${platform === 'instagram' ? 'Meta' : 'TikTok'} returned: <code>${oauthError}</code>${oauthErrorDescription ? ` — ${oauthErrorDescription}` : ''}.<br>You can close this tab and run /social link again if this wasn't intentional.`);
+    if (oauthError) return htmlResponse(res, 400, 'Authorization denied', `${platform === 'instagram' ? 'Meta' : 'TikTok'} returned: <code>${escapeHtml(oauthError)}</code>${oauthErrorDescription ? ` — ${escapeHtml(oauthErrorDescription)}` : ''}.<br>You can close this tab and run /social link again if this wasn't intentional.`);
 
     const stateEntry = state ? consumeOAuthState(state) : null;
     if (!stateEntry || stateEntry.platform !== platform) return htmlResponse(res, 400, 'Invalid or expired link', 'Run /social link again in Discord and try once more within 10 minutes.');
@@ -2866,10 +3018,10 @@ async function handleOAuthCallback(platform, req, res) {
             accessToken: identity.accessToken, refreshToken: identity.refreshToken, expiresAt: identity.expiresAt,
             linkedBy: stateEntry.userId,
         });
-        return htmlResponse(res, 200, 'Linked!', `<b>${identity.externalUsername}</b> is now linked. You can close this tab and go back to Discord, then use <code>/social add</code> to start tracking it.`);
+        return htmlResponse(res, 200, 'Linked!', `<b>${escapeHtml(identity.externalUsername)}</b> is now linked. You can close this tab and go back to Discord, then use <code>/social add</code> to start tracking it.`);
     } catch (e) {
         console.error(`OAuth callback (${platform}):`, e.message);
-        return htmlResponse(res, 500, 'Link failed', `${e.message} — you can close this tab and try /social link again.`);
+        return htmlResponse(res, 500, 'Link failed', `${escapeHtml(e.message)} — you can close this tab and try /social link again.`);
     }
 }
 
@@ -2994,29 +3146,38 @@ ${statusLine}
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
-    const path = req.url.split('?')[0];
-    if (path === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('OK');
+    // A single malformed request (e.g. one that trips new URL(req.url, ...) in a
+    // sub-handler) used to throw synchronously here with nothing to catch it,
+    // which crashes the *entire* Node process — not just that one request. This
+    // wraps routing so a bad request gets a 500 instead of taking the bot down.
+    try {
+        const path = req.url.split('?')[0];
+        if (path === '/health') {
+            res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('OK');
+        }
+        if (path === '/') {
+            res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(buildStatusHTML());
+        }
+        if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
+        if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
+        // TikTok (and similar) domain-ownership verification file, hardcoded from the
+        // actual downloaded file's content to avoid copy/paste corruption through env vars.
+        const TIKTOK_VERIFY_FILENAME = process.env.TIKTOK_VERIFY_FILENAME || 'tiktok54ye0zN8LYl3cx2fMAolswrgKzdRfnvK.txt';
+        const TIKTOK_VERIFY_CONTENT = process.env.TIKTOK_VERIFY_CONTENT || 'tiktok-developers-site-verification=54ye0zN8LYl3cx2fMAolswrgKzdRfnvK';
+        if (path === `/${TIKTOK_VERIFY_FILENAME}`) {
+            res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(TIKTOK_VERIFY_CONTENT);
+        }
+        if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
+        if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
+        if (path === '/youtube/websub') {
+            if (req.method === 'GET') return handleYouTubeWebSubVerify(req, res);
+            if (req.method === 'POST') return handleYouTubeWebSubPush(req, res);
+        }
+        res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
+    } catch (e) {
+        console.error('HTTP request handling:', e.message);
+        if (!res.headersSent) { res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end('Internal error'); }
     }
-    if (path === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(buildStatusHTML());
-    }
-    if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
-    if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
-    // TikTok (and similar) domain-ownership verification file, hardcoded from the
-    // actual downloaded file's content to avoid copy/paste corruption through env vars.
-    const TIKTOK_VERIFY_FILENAME = process.env.TIKTOK_VERIFY_FILENAME || 'tiktok54ye0zN8LYl3cx2fMAolswrgKzdRfnvK.txt';
-    const TIKTOK_VERIFY_CONTENT = process.env.TIKTOK_VERIFY_CONTENT || 'tiktok-developers-site-verification=54ye0zN8LYl3cx2fMAolswrgKzdRfnvK';
-    if (path === `/${TIKTOK_VERIFY_FILENAME}`) {
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(TIKTOK_VERIFY_CONTENT);
-    }
-    if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
-    if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
-    if (path === '/youtube/websub') {
-        if (req.method === 'GET') return handleYouTubeWebSubVerify(req, res);
-        if (req.method === 'POST') return handleYouTubeWebSubPush(req, res);
-    }
-    res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
 }).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
 
 // Keep-alive: ping our own URL periodically so Render's free tier doesn't spin down.

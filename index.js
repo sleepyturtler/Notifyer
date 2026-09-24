@@ -91,7 +91,7 @@ async function ensureIPv4Pool() {
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
 const PLATFORMS = {
-    youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
+    youtube:   { label: 'YouTube',   emoji: '📺', color: '#FF0000' },
     // Twitter/X is flagged unavailable — Nitter (the public mirrors this bot reads
     // through) was shut down by an X Corp cease-and-desist in Aug 2026. See the
     // in-app warning shown to servers with existing Twitter watches for details.
@@ -207,6 +207,14 @@ function saveConfig(guildId, data) {
 }
 
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
+
+// The old single-message-template format is being permanently retired on this
+// date — see announceLegacyMigrationForGuild below. A fixed Unix timestamp (not
+// a recomputed "days left" string) lets Discord's own <t:...:R> formatting show
+// a live, client-side countdown with zero bot-side upkeep.
+const LEGACY_MIGRATION_DATE = new Date('2026-10-01T00:00:00Z');
+const LEGACY_MIGRATION_TS = Math.floor(LEGACY_MIGRATION_DATE.getTime() / 1000);
+const LEGACY_MIGRATION_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000; // re-warn a guild at most once a day
 
 // Finds a channel to post admin/mod updates in. Prefers a channel hidden from
 // @everyone where every role that can view it has an elevated permission
@@ -327,6 +335,45 @@ async function announceTwitterMirrorTestGuilds() {
     const watches = await getAllWatches();
     const guildIdsWithTwitter = [...new Set(watches.filter(w => w.platform === 'twitter').map(w => w.guild_id))];
     for (const guildId of guildIdsWithTwitter) await announceTwitterMirrorTestForGuild(guildId);
+}
+
+// Recurring (not one-time) heads-up to servers still on the legacy message
+// format about the permanent October 1st migration. Unlike the Twitter notices
+// above, this re-sends every LEGACY_MIGRATION_REMINDER_INTERVAL_MS per guild —
+// tracked as a timestamp rather than a boolean — and stops on its own once that
+// guild has no legacy watches left (reviewed/re-saved, or auto-migrated once
+// the deadline passes and isLegacyMessageFormat elsewhere reverts them).
+async function announceLegacyMigrationForGuild(guildId) {
+    try {
+        const cfg = await getConfig(guildId);
+        const lastWarnedAt = cfg.legacyMigrationLastWarnedAt || 0;
+        if (Date.now() - lastWarnedAt < LEGACY_MIGRATION_REMINDER_INTERVAL_MS) return;
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) return;
+        const channel = findAnnouncementChannel(guild);
+        if (!channel) return;
+        const embed = new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Important Notice!')
+            .setDescription(
+                'The bot is permanently switching to the new post text format, which was introduced in the last update.\n\n' +
+                'The old system will be removed on October the 1st, any servers that fail to migrate will be migrated automatically, by reverting all their custom text to the default values.\n\n' +
+                'Servers still on the old system will get multiple reminders and warnings.\n\n' +
+                `**Migration date:** <t:${LEGACY_MIGRATION_TS}:F> (<t:${LEGACY_MIGRATION_TS}:R>)`
+            );
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('legacymigration_viewwatches').setLabel('📋 View My Watches').setStyle(ButtonStyle.Primary)
+        );
+        await channel.send({ embeds: [embed], components: [row] }).catch(e => console.error(`legacy migration reminder send (${guildId}):`, e.message));
+        saveConfig(guildId, { ...cfg, legacyMigrationLastWarnedAt: Date.now() });
+        console.log(`⚠️ Sent legacy migration reminder to ${guild.name} (#${channel.name})`);
+    } catch (e) {
+        console.error(`announceLegacyMigrationForGuild (${guildId}):`, e.message);
+    }
+}
+async function announceLegacyMigrationGuilds() {
+    const watches = await getAllWatches();
+    const guildIdsWithLegacy = [...new Set(watches.filter(w => isLegacyMessageFormat(w)).map(w => w.guild_id))];
+    console.log(`⚠️ ${guildIdsWithLegacy.length} server(s) still on the legacy message format`);
+    for (const guildId of guildIdsWithLegacy) await announceLegacyMigrationForGuild(guildId);
 }
 
 async function getWatches(guildId) {
@@ -1179,6 +1226,14 @@ client.once('clientReady', async () => {
     await warnTwitterBrokenGuilds();
     // One-time follow-up that a mirror is being tested for recovery.
     await announceTwitterMirrorTestGuilds();
+
+    // Recurring (re-sends every couple of days per guild, see its own cooldown
+    // check) warning to servers still on the legacy message format about the
+    // October 1st cutover. Runs at startup, then on its own loop, since — unlike
+    // the one-off Twitter notices above — this needs to keep re-checking for as
+    // long as the bot stays up, not just once at boot.
+    await announceLegacyMigrationGuilds().catch(e => console.error('legacy migration announce:', e.message));
+    setInterval(() => announceLegacyMigrationGuilds().catch(e => console.error('legacy migration announce loop:', e.message)), 6 * 60 * 60 * 1000);
 });
 
 client.on('guildCreate', async (guild) => {
@@ -1362,6 +1417,17 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const { embeds, components } = await buildWatchListEmbed(guildId);
         return interaction.update({ embeds, components });
+    }
+
+    // ── Button: view watches from the legacy migration warning ─────────────
+    // Ephemeral reply rather than interaction.update(), since this button sits
+    // on a public announcement message that other members can also see and
+    // click — updating it in place would turn a shared notice into whichever
+    // clicker's own watch list.
+    if (interaction.isButton() && interaction.customId === 'legacymigration_viewwatches') {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const { embeds, components } = await buildWatchListEmbed(guildId);
+        return interaction.reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
     }
 
     // ── Select: open manage view for a watch ────────────────────────────────

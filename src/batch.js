@@ -1,0 +1,191 @@
+// Rolling 10-minute batching: retroactively turns single notifications into Components V2 batches.
+// Moved verbatim out of the former single-file index.js; only the require/export lines are new.
+
+const { TextDisplayBuilder, ContainerBuilder, MessageFlags, SeparatorBuilder, SeparatorSpacingSize, SectionBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { PLATFORMS } = require('./config.js');
+const { buttonLabelFor, resolveWatchChannel, sendNotification } = require('./notify.js');
+
+// ── Batched notifications ───────────────────────────────────────────────────
+// Same channel+platform posts batch into one Components V2 message instead of
+// pinging separately — but the trigger is now a rolling time window, not a
+// per-cycle count. The first post in a window still sends as a normal single
+// embed; the moment a SECOND post for that channel+platform lands within
+// BATCH_WINDOW_MS of the last one (whether that's the same poll cycle, a
+// later cycle, or a WebSub push), that original message is retroactively
+// edited into a batch and the new post is appended to it. Each append slides
+// the window forward, so a channel posting every few minutes keeps extending
+// the same batch indefinitely instead of starting a new one each time.
+// Live posts (isLive) never batch — their "went live"/"ended" message-edit
+// tracking doesn't fit the batch format — and batches never cross platforms,
+// only same channel+platform groups are batchable, even across different
+// tracked accounts.
+const BATCH_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
+const DEFAULT_BATCH_HEADER = '**{author}** posted {count} times!';
+
+// allHandles: every distinct handle contributing to this batch (just [w.handle]
+// for a single-creator batch) — lets {creators} resolve correctly even when the
+// template being rendered belongs to one specific watch in a multi-creator batch.
+function renderBatchHeader(w, count, allHandles = [w.handle]) {
+    const tmpl = w.batch_header_template || DEFAULT_BATCH_HEADER;
+    return tmpl
+        .replace(/\{author\}/g, w.handle)
+        .replace(/\{handle\}/g, w.handle)
+        .replace(/\{creators\}/g, formatCreatorList(allHandles))
+        .replace(/\{platform\}/g, PLATFORMS[w.platform]?.label || w.platform)
+        .replace(/\{count\}/g, String(count));
+}
+
+function formatCreatorList(handles) {
+    const unique = [...new Set(handles)];
+    if (unique.length === 1) return unique[0];
+    if (unique.length === 2) return `${unique[0]} and ${unique[1]}`;
+    return `${unique.slice(0, -1).join(', ')}, and ${unique[unique.length - 1]}`;
+}
+
+// entries: [{ w, post }] all sharing one channel+platform (see sendOrExtendBatch).
+function renderBatchHeaderForEntries(entries) {
+    const handles = entries.map(e => e.w.handle);
+    const unique = [...new Set(handles)];
+    if (unique.length === 1) {
+        // Single creator — honor that watch's own customizable header template.
+        return renderBatchHeader(entries[0].w, entries.length, unique);
+    }
+    // Multiple creators contributed. Prefer whichever contributing watch has
+    // actually customized its header — that's how someone opts a template with
+    // {creators} in it into the multi-creator case specifically. If nobody in
+    // this batch has customized anything, fall back to the generic "A and B
+    // posted N times!" form.
+    const customized = entries.find(e => e.w.batch_header_template);
+    if (customized) return renderBatchHeader(customized.w, entries.length, unique);
+    return `${formatCreatorList(unique)} posted ${entries.length} times!`;
+}
+
+function hexColorToInt(hex) {
+    return parseInt(String(hex).replace('#', ''), 16);
+}
+
+function buildBatchPayload(entries) {
+    const platform = entries[0].w.platform;
+    const p = PLATFORMS[platform];
+    // Union every distinct ping role across the contributing watches — a post
+    // from any of them is still something someone asked to be pinged for.
+    const roleIds = [...new Set(entries.map(e => e.w.role_id).filter(Boolean))];
+    const rolePrefix = roleIds.map(id => `<@&${id}> `).join('');
+    // The header is its own top-level component — NOT inside the container —
+    // so it renders outside the accent-colored box, only the per-post list
+    // sits inside it.
+    const header = new TextDisplayBuilder().setContent(`${rolePrefix}${renderBatchHeaderForEntries(entries)}`);
+    const container = new ContainerBuilder().setAccentColor(hexColorToInt(p.color));
+    entries.forEach(({ w, post }, i) => {
+        if (i > 0) container.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
+        const title = (post.title || '(untitled)').slice(0, 250);
+        // Compute the URL explicitly here rather than trusting post.url was already
+        // shorts-corrected upstream — same result when it was, but this guarantees a
+        // Short still opens in the Shorts viewer (not the regular watch page) even if
+        // something earlier in the pipeline ever passes through an uncorrected entry.
+        const url = (w.platform === 'youtube' && post.postType === 'shorts' && post.id)
+            ? `https://www.youtube.com/shorts/${post.id}`
+            : post.url;
+        container.addSectionComponents(
+            new SectionBuilder()
+                .addTextDisplayComponents(new TextDisplayBuilder().setContent(title))
+                .setButtonAccessory(new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(url).setEmoji(p.emojiButton))
+        );
+    });
+    return { components: [header, container], flags: MessageFlags.IsComponentsV2 };
+}
+
+async function sendBatchNotification(entries) {
+    const w0 = entries[0].w;
+    const { guild, channel } = resolveWatchChannel(w0);
+    if (!channel) return null;
+    return channel.send(buildBatchPayload(entries)).catch(e => { console.error(`send batch notification (${guild.name}/#${channel.name}, ${entries.length} posts):`, e.message); return null; });
+}
+
+// Rolling per-channel+platform batch window — see the comment block above.
+// Not persisted: a process restart just starts fresh windows, which is fine
+// since it only affects whether the next post joins an existing message or
+// starts a new one, never notification delivery itself.
+const recentBatchState = new Map(); // `${channel_id}::${platform}` -> { messageId, entries, lastAt }
+
+// pollAll's YouTube branch and the WebSub push handler can both call this for the
+// same channel+platform key around the same time (a push landing mid-poll-cycle).
+// Without serializing per key, two concurrent calls could both read the same stale
+// state and one write would clobber the other's, silently dropping an entry from
+// the visible batch. This chains calls for the same key one after another.
+const batchLocks = new Map(); // key -> promise chain tail
+
+function withBatchLock(key, fn) {
+    const prev = batchLocks.get(key) || Promise.resolve();
+    const run = prev.then(fn, fn);
+    batchLocks.set(key, run.catch(() => {}));
+    return run;
+}
+
+// Same "grows forever, nothing ever removes an entry" shape as pendingOAuthStates
+// above — a channel+platform pair that stops posting (watch removed, channel
+// deleted, server leaves) would otherwise sit in both maps for the life of the
+// process. Anything past the window is no longer "recent" anyway.
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of recentBatchState) if (now - v.lastAt > BATCH_WINDOW_MS) recentBatchState.delete(k);
+    for (const k of batchLocks.keys()) if (!recentBatchState.has(k)) batchLocks.delete(k);
+}, 5 * 60 * 1000);
+
+// Discord's Components V2 messages have a hard cap on total nested components
+// (40). Each batch entry costs a Section (title + button) plus a Separator
+// between entries, so an uncapped batch would eventually hit that ceiling —
+// and when it did, the whole send/edit call gets rejected by Discord, which
+// previously meant losing every entry in the batch, not just the ones that
+// didn't fit. 15 entries costs at most 15*2 + 2 (header + container) = 32
+// components, comfortably under the limit with headroom for future component
+// additions.
+const MAX_BATCH_ENTRIES_PER_MESSAGE = 15;
+
+async function sendOrExtendBatch(w, post) {
+    const key = `${w.channel_id}::${w.platform}`;
+    return withBatchLock(key, () => sendOrExtendBatchLocked(w, post, key));
+}
+
+async function sendOrExtendBatchLocked(w, post, key) {
+    const state = recentBatchState.get(key);
+    const now = Date.now();
+
+    if (state && (now - state.lastAt) <= BATCH_WINDOW_MS && state.entries.length < MAX_BATCH_ENTRIES_PER_MESSAGE) {
+        state.entries.push({ w, post });
+        state.lastAt = now;
+        const { channel } = resolveWatchChannel(w);
+        if (!channel) { recentBatchState.delete(key); return null; }
+        try {
+            const msg = await channel.messages.fetch(state.messageId);
+            // Converting a normal single-embed/content message into Components V2
+            // (or re-editing one that already is) requires explicitly nulling out
+            // content/embeds/stickers/poll on the edit — passing only
+            // flags+components isn't enough for Discord to accept the switch.
+            return await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
+        } catch (e) {
+            // Original message is gone (deleted, too old to fetch, lost permissions)
+            // — fall back to sending a fresh batch message with everything collected
+            // so far, so nothing in the window gets silently dropped.
+            console.error(`extend batch (${key}):`, e.message);
+            const sent = await sendBatchNotification(state.entries);
+            if (sent) recentBatchState.set(key, { messageId: sent.id, entries: state.entries, lastAt: now });
+            else recentBatchState.delete(key);
+            return sent;
+        }
+    }
+
+    // No live window for this channel+platform, OR the current batch already
+    // hit MAX_BATCH_ENTRIES_PER_MESSAGE — either way, send as a normal single
+    // notification and open a fresh window/message. When this is the "batch is
+    // full" case, the old message is simply left as-is (still showing its full,
+    // valid set of entries) and this starts spillover into a brand new message
+    // rather than trying to cram more onto one that's already at the ceiling.
+    const sent = await sendNotification(w, post);
+    if (sent) recentBatchState.set(key, { messageId: sent.id, entries: [{ w, post }], lastAt: now });
+    else recentBatchState.delete(key);
+    return sent;
+}
+
+module.exports = { DEFAULT_BATCH_HEADER, sendOrExtendBatch };

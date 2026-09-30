@@ -7,6 +7,11 @@ const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.j
 const { DEFAULT_BATCH_HEADER } = require('./batch.js');
 const { DEFAULT_TEMPLATE, PLACEHOLDER_HELP } = require('./notify.js');
 const { canWatchBatch, isLegacyMessageFormat } = require('./helpers.js');
+const fs = require('fs');
+const path = require('path');
+// Beta-only "Admin" help category (see debugTools.js) — only added if that file is
+// present in this build's src/.
+const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
 
 // ── Embeds / UI builders ──────────────────────────────────────────────────
 const refreshBtn = (id) => new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
@@ -243,17 +248,10 @@ const HELP_CATEGORIES = [
                 { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),
     },
-    {
-        id: 'admin', emoji: '🔧', label: 'Admin',
-        build: () => new EmbedBuilder().setColor('#ED4245').setTitle('🔔 Notifyer Beta — Admin')
-            .setDescription('These commands are gated to the bot owner (`BOT_OWNER_ID`) and mainly exist for debugging this beta build.')
-            .addFields(
-                { name: '/social debug', value: 'Show a watch\'s live fetch result vs its stored baseline, to check whether it\'d fire a notification.' },
-                { name: '/social oauthdebug', value: 'Show the exact OAuth config (client ID, redirect URI, scope, full authorize URL) currently being sent for a platform.' },
-                { name: '/killbot', value: 'Suspend the Render service to stop usage/billing. Falls back to crashing the process if RENDER_API_KEY/RENDER_SERVICE_ID aren\'t set.' },
-            ),
-    },
 ];
+// Beta-only — see debugTools.js. Pushed here rather than inline above so this array
+// is identical whether or not that file is present.
+if (debugTools) HELP_CATEGORIES.push(debugTools.getExtraHelpCategory());
 
 // ── /setup wizard ────────────────────────────────────────────────────────
 function buildSetupIntroEmbed() {

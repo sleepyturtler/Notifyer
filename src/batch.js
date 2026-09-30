@@ -134,14 +134,23 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // Discord's Components V2 messages have a hard cap on total nested components
-// (40). Each batch entry costs a Section (title + button) plus a Separator
-// between entries, so an uncapped batch would eventually hit that ceiling —
-// and when it did, the whole send/edit call gets rejected by Discord, which
-// previously meant losing every entry in the batch, not just the ones that
-// didn't fit. 15 entries costs at most 15*2 + 2 (header + container) = 32
-// components, comfortably under the limit with headroom for future component
-// additions.
-const MAX_BATCH_ENTRIES_PER_MESSAGE = 15;
+// (40) — and nested components DO count individually toward that cap, not
+// just top-level ones. Each batch entry costs 4: the Section itself, its
+// child TextDisplay (title text), its Button accessory, and a Separator
+// before it (skipped for the first entry). Plus 2 more for the header
+// TextDisplay and the Container, both top-level. So total cost is
+// 4*N + 1 (N separators is N-1, but +2 header/container -1 makes +1 net).
+// The previous cap of 15 assumed ~2 components per entry (Section+Separator
+// only, missing the Section's own two children) — its real cost was 61
+// components, which Discord rejects outright. That silent rejection is what
+// caused batches to visibly cap out well before 15 (whatever count first
+// crossed 40) and then, worse, wipe their own state entirely once the resend
+// fallback below also failed for the same reason — the next post for that
+// channel+platform then had no existing batch to join and went out as its
+// own lone single notification, looking like cross-creator batching had
+// silently stopped working. 8 entries costs 4*8 + 1 = 33 components,
+// comfortably under 40 with real headroom this time.
+const MAX_BATCH_ENTRIES_PER_MESSAGE = 8;
 
 async function sendOrExtendBatch(w, post) {
     const key = `${w.channel_id}::${w.platform}`;
@@ -165,12 +174,21 @@ async function sendOrExtendBatchLocked(w, post, key) {
             // flags+components isn't enough for Discord to accept the switch.
             return await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
         } catch (e) {
-            // Original message is gone (deleted, too old to fetch, lost permissions)
-            // — fall back to sending a fresh batch message with everything collected
-            // so far, so nothing in the window gets silently dropped.
+            // Original message is gone (deleted, too old to fetch, lost permissions),
+            // OR this batch still somehow exceeds Discord's limits despite the cap
+            // above — fall back to sending a fresh batch message. If it's the
+            // size problem, retrying with the exact same over-sized entries would
+            // just fail again identically, so trim to the cap (keeping the most
+            // recent entries) before retrying, rather than losing the whole batch.
             console.error(`extend batch (${key}):`, e.message);
-            const sent = await sendBatchNotification(state.entries);
-            if (sent) recentBatchState.set(key, { messageId: sent.id, entries: state.entries, lastAt: now });
+            let retryEntries = state.entries;
+            let sent = await sendBatchNotification(retryEntries);
+            if (!sent && retryEntries.length > MAX_BATCH_ENTRIES_PER_MESSAGE) {
+                console.error(`extend batch (${key}): retrying with the most recent ${MAX_BATCH_ENTRIES_PER_MESSAGE} of ${retryEntries.length} entries`);
+                retryEntries = retryEntries.slice(-MAX_BATCH_ENTRIES_PER_MESSAGE);
+                sent = await sendBatchNotification(retryEntries);
+            }
+            if (sent) recentBatchState.set(key, { messageId: sent.id, entries: retryEntries, lastAt: now });
             else recentBatchState.delete(key);
             return sent;
         }
@@ -187,5 +205,6 @@ async function sendOrExtendBatchLocked(w, post, key) {
     else recentBatchState.delete(key);
     return sent;
 }
+
 
 module.exports = { DEFAULT_BATCH_HEADER, sendOrExtendBatch };

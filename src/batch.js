@@ -4,6 +4,26 @@
 const { TextDisplayBuilder, ContainerBuilder, MessageFlags, SeparatorBuilder, SeparatorSpacingSize, SectionBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS } = require('./config.js');
 const { buttonLabelFor, resolveWatchChannel, sendNotification } = require('./notify.js');
+const { getConfig } = require('./db.js');
+
+// Per-guild batching preferences, stored on the same JSONB config blob as
+// everything else in db.js (getConfig/saveConfig) — no schema change needed.
+// batchMinThreshold: how many posts must land in the window before anything
+// actually gets combined (default 2 — the original behavior, where even a
+// 2nd post triggers a merge). Raising it means the first (threshold - 1)
+// posts send as their own normal messages first; only once the threshold is
+// reached do they get retroactively merged into one batch message (deleting
+// the standalone messages for the interim posts, editing the very first one
+// into the batch). Clamped to [2, MAX_BATCH_ENTRIES_PER_MESSAGE] — 1 isn't a
+// batch, and anything above the hard component cap could never be honored.
+// batchCrossChannel: if true, posts for the same platform batch together
+// across every channel in the guild, not just within the same channel. The
+// merged message always lives in whichever channel the FIRST post in that
+// window was headed to — see getBatchHostWatch below.
+function getBatchMinThreshold(cfg) {
+    const n = Number(cfg.batchMinThreshold) || 2;
+    return Math.min(Math.max(n, 2), MAX_BATCH_ENTRIES_PER_MESSAGE);
+}
 
 // ── Batched notifications ───────────────────────────────────────────────────
 // Same channel+platform posts batch into one Components V2 message instead of
@@ -153,58 +173,105 @@ setInterval(() => {
 const MAX_BATCH_ENTRIES_PER_MESSAGE = 8;
 
 async function sendOrExtendBatch(w, post) {
-    const key = `${w.channel_id}::${w.platform}`;
-    return withBatchLock(key, () => sendOrExtendBatchLocked(w, post, key));
+    const cfg = await getConfig(w.guild_id);
+    // Cross-channel mode keys purely by guild+platform instead of channel+platform,
+    // so watches in different channels can share one batch. Same-channel (default)
+    // keeps channel_id in the key so unrelated channels never merge.
+    const key = cfg.batchCrossChannel ? `${w.guild_id}::${w.platform}` : `${w.channel_id}::${w.platform}`;
+    return withBatchLock(key, () => sendOrExtendBatchLocked(w, post, key, cfg));
 }
 
-async function sendOrExtendBatchLocked(w, post, key) {
+async function sendOrExtendBatchLocked(w, post, key, cfg) {
     const state = recentBatchState.get(key);
     const now = Date.now();
+    const minThreshold = getBatchMinThreshold(cfg);
 
     if (state && (now - state.lastAt) <= BATCH_WINDOW_MS && state.entries.length < MAX_BATCH_ENTRIES_PER_MESSAGE) {
         state.entries.push({ w, post });
         state.lastAt = now;
-        const { channel } = resolveWatchChannel(w);
+        // The merged message always lives in the channel of whichever watch started
+        // this window — matters once batchCrossChannel lets different channels'
+        // watches share one key; without it, entries[0].w.channel_id always equals
+        // w.channel_id anyway, so this is a no-op for the default, same-channel case.
+        const { channel } = resolveWatchChannel(state.entries[0].w);
         if (!channel) { recentBatchState.delete(key); return null; }
-        try {
-            const msg = await channel.messages.fetch(state.messageId);
-            // Converting a normal single-embed/content message into Components V2
-            // (or re-editing one that already is) requires explicitly nulling out
-            // content/embeds/stickers/poll on the edit — passing only
-            // flags+components isn't enough for Discord to accept the switch.
-            return await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
-        } catch (e) {
-            // Original message is gone (deleted, too old to fetch, lost permissions),
-            // OR this batch still somehow exceeds Discord's limits despite the cap
-            // above — fall back to sending a fresh batch message. If it's the
-            // size problem, retrying with the exact same over-sized entries would
-            // just fail again identically, so trim to the cap (keeping the most
-            // recent entries) before retrying, rather than losing the whole batch.
-            console.error(`extend batch (${key}):`, e.message);
-            let retryEntries = state.entries;
-            let sent = await sendBatchNotification(retryEntries);
-            if (!sent && retryEntries.length > MAX_BATCH_ENTRIES_PER_MESSAGE) {
-                console.error(`extend batch (${key}): retrying with the most recent ${MAX_BATCH_ENTRIES_PER_MESSAGE} of ${retryEntries.length} entries`);
-                retryEntries = retryEntries.slice(-MAX_BATCH_ENTRIES_PER_MESSAGE);
-                sent = await sendBatchNotification(retryEntries);
+
+        if (state.isBatch) {
+            // Already converted on an earlier post — normal edit-extend.
+            try {
+                const msg = await channel.messages.fetch(state.messageId);
+                // Converting a normal single-embed/content message into Components V2
+                // (or re-editing one that already is) requires explicitly nulling out
+                // content/embeds/stickers/poll on the edit — passing only
+                // flags+components isn't enough for Discord to accept the switch.
+                return await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
+            } catch (e) {
+                // Original message is gone (deleted, too old to fetch, lost permissions),
+                // OR this batch still somehow exceeds Discord's limits despite the cap
+                // above — fall back to sending a fresh batch message. If it's the size
+                // problem, retrying with the exact same over-sized entries would just
+                // fail again identically, so trim to the cap (keeping the most recent
+                // entries) before retrying, rather than losing the whole batch.
+                console.error(`extend batch (${key}):`, e.message);
+                let retryEntries = state.entries;
+                let sent = await sendBatchNotification(retryEntries);
+                if (!sent && retryEntries.length > MAX_BATCH_ENTRIES_PER_MESSAGE) {
+                    console.error(`extend batch (${key}): retrying with the most recent ${MAX_BATCH_ENTRIES_PER_MESSAGE} of ${retryEntries.length} entries`);
+                    retryEntries = retryEntries.slice(-MAX_BATCH_ENTRIES_PER_MESSAGE);
+                    sent = await sendBatchNotification(retryEntries);
+                }
+                if (sent) { state.messageId = sent.id; state.entries = retryEntries; }
+                else recentBatchState.delete(key);
+                return sent;
             }
-            if (sent) recentBatchState.set(key, { messageId: sent.id, entries: retryEntries, lastAt: now });
-            else recentBatchState.delete(key);
-            return sent;
         }
+
+        if (state.entries.length >= minThreshold) {
+            // Just reached the threshold for the first time — merge everything sent
+            // so far into one message: edit the very first post's own message into a
+            // batch (preserving its message ID/timestamp/link), and delete every
+            // OTHER standalone message in between (the brand new post that triggered
+            // this never had one sent yet, so it's naturally excluded). With the
+            // default threshold of 2 there's nothing to delete — this edits the first
+            // message in place exactly like before thresholds existed.
+            for (let i = 1; i < state.entries.length - 1; i++) {
+                const id = state.entries[i].standaloneMessageId;
+                if (id) await channel.messages.delete(id).catch(() => {});
+            }
+            try {
+                const msg = await channel.messages.fetch(state.entries[0].standaloneMessageId);
+                const edited = await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
+                state.messageId = state.entries[0].standaloneMessageId;
+                state.isBatch = true;
+                return edited;
+            } catch (e) {
+                console.error(`merge batch (${key}):`, e.message);
+                const sent = await sendBatchNotification(state.entries);
+                if (sent) { state.messageId = sent.id; state.isBatch = true; }
+                else recentBatchState.delete(key);
+                return sent;
+            }
+        }
+
+        // Still below the threshold — this post sends as its own normal message
+        // too, same as it would with batching off, while still being tracked in
+        // case a future post within the window pushes the count over the line.
+        const sent = await sendNotification(w, post);
+        state.entries[state.entries.length - 1].standaloneMessageId = sent?.id || null;
+        return sent;
     }
 
-    // No live window for this channel+platform, OR the current batch already
-    // hit MAX_BATCH_ENTRIES_PER_MESSAGE — either way, send as a normal single
-    // notification and open a fresh window/message. When this is the "batch is
-    // full" case, the old message is simply left as-is (still showing its full,
-    // valid set of entries) and this starts spillover into a brand new message
-    // rather than trying to cram more onto one that's already at the ceiling.
+    // No live window for this channel (+platform, or +guild in cross-channel mode),
+    // OR the current batch already hit MAX_BATCH_ENTRIES_PER_MESSAGE — either way,
+    // send as a normal single notification and open a fresh window/message. When
+    // this is the "batch is full" case, the old message is simply left as-is (still
+    // showing its full, valid set of entries) and this starts spillover into a
+    // brand new message rather than trying to cram more onto one at the ceiling.
     const sent = await sendNotification(w, post);
-    if (sent) recentBatchState.set(key, { messageId: sent.id, entries: [{ w, post }], lastAt: now });
+    if (sent) recentBatchState.set(key, { messageId: sent.id, entries: [{ w, post, standaloneMessageId: sent.id }], lastAt: now, isBatch: false });
     else recentBatchState.delete(key);
     return sent;
 }
 
 
-module.exports = { DEFAULT_BATCH_HEADER, sendOrExtendBatch };
+module.exports = { DEFAULT_BATCH_HEADER, sendOrExtendBatch, MAX_BATCH_ENTRIES_PER_MESSAGE };

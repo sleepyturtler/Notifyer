@@ -1,7 +1,7 @@
 // pollAll (fast/slow loops + /social check), per-cycle fetch caching, Nitter outage tracking.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
-const { NITTER_INSTANCES, SEEN_HISTORY_SIZE } = require('./config.js');
+const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE } = require('./config.js');
 const { client } = require('./client.js');
 const { getAllWatches, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
@@ -78,6 +78,12 @@ async function pollAll(platforms = null, onlyGuildId = null) {
         const perCyclePostsCache = new Map(); // key -> Promise<posts[] | null>; key is social_link_id (Instagram/TikTok) or `${platform}:${handle}` (Twitch/Kick)
         for (const w of watches) {
             if (!w.active) continue;
+            // Platform's credentials were removed after this watch was created (or
+            // it's an outage-flagged platform like Twitter during a Nitter mirror
+            // failure) — skip cleanly instead of logging a fetch error every cycle
+            // for a watch that can never succeed right now. It'll resume on its own
+            // once the platform becomes available again, no action needed here.
+            if (PLATFORMS[w.platform]?.unavailable) continue;
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
             if (minInterval && w.last_checked && (Date.now() - w.last_checked) < minInterval) continue;
             try {

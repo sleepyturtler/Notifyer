@@ -4,6 +4,7 @@
 const { URL } = require('url');
 const { MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
+const { reportDeliveryFailure } = require('./announcements.js');
 const { profileUrl } = require('./helpers.js');
 const { fetchJson } = require('./net.js');
 const { client } = require('./client.js');
@@ -194,16 +195,16 @@ const pingRoles = w => ({ roles: w.role_id ? [w.role_id] : [] });
 
 async function sendNotification(w, post) {
     const { guild, channel } = resolveWatchChannel(w);
-    if (!channel) return null;
+    if (!channel) { reportDeliveryFailure(w, 'missing_channel'); return null; }
     const payload = buildNotificationPayload(w, post);
     if (payload.wantsNativeVideo) {
-        const sent = await channel.send({ content: payload.content, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+        const sent = await channel.send({ content: payload.content, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
         // Discord's crawler occasionally fails to unfurl TikTok links even via the mirror
         // domain — check back shortly and backfill a manual embed if nothing showed up.
         if (sent && w.platform === 'tiktok') ensureVideoEmbedFallback(channel, sent.id, post);
         return sent;
     }
-    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
 }
 
 // Edits a previously-sent "went live" message to show the stream has ended, once a

@@ -4,6 +4,7 @@
 const { TextDisplayBuilder, ContainerBuilder, MessageFlags, SeparatorBuilder, SeparatorSpacingSize, SectionBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS } = require('./config.js');
 const { buttonLabelFor, resolveWatchChannel, sendNotification } = require('./notify.js');
+const { reportDeliveryFailure } = require('./announcements.js');
 const { getConfig } = require('./db.js');
 
 // Per-guild batching preferences, stored on the same JSONB config blob as
@@ -119,8 +120,8 @@ function buildBatchPayload(entries) {
 async function sendBatchNotification(entries) {
     const w0 = entries[0].w;
     const { guild, channel } = resolveWatchChannel(w0);
-    if (!channel) return null;
-    return channel.send(buildBatchPayload(entries)).catch(e => { console.error(`send batch notification (${guild.name}/#${channel.name}, ${entries.length} posts):`, e.message); return null; });
+    if (!channel) { reportDeliveryFailure(w0, 'missing_channel'); return null; }
+    return channel.send(buildBatchPayload(entries)).catch(e => { console.error(`send batch notification (${guild.name}/#${channel.name}, ${entries.length} posts):`, e.message); reportDeliveryFailure(w0, e); return null; });
 }
 
 // Rolling per-channel+platform batch window — see the comment block above.
@@ -194,7 +195,7 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
         // watches share one key; without it, entries[0].w.channel_id always equals
         // w.channel_id anyway, so this is a no-op for the default, same-channel case.
         const { channel } = resolveWatchChannel(state.entries[0].w);
-        if (!channel) { recentBatchState.delete(key); return null; }
+        if (!channel) { recentBatchState.delete(key); reportDeliveryFailure(state.entries[0].w, 'missing_channel'); return null; }
 
         if (state.isBatch) {
             // Already converted on an earlier post — normal edit-extend.

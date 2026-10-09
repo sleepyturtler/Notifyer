@@ -3,6 +3,9 @@
 
 const { Client, GatewayIntentBits } = require('discord.js');
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// Default: nothing in a message can ping anyone. Titles, usernames and captions come from third
+// parties (a video titled "@everyone" would otherwise ping the whole server), so the only pings
+// that are ever allowed are the watch's own role, passed explicitly on each send.
+const client = new Client({ intents: [GatewayIntentBits.Guilds], allowedMentions: { parse: [] } });
 
 module.exports = { client };

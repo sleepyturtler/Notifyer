@@ -87,7 +87,9 @@ async function main() {
     for (const [key, value] of Object.entries(env)) {
         if (value) lines.push(`${key}=${value}`);
     }
-    fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n');
+    // 0600: this file holds the bot token and OAuth secrets, so keep it private to the owner.
+    fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n', { mode: 0o600 });
+    try { fs.chmodSync(ENV_PATH, 0o600); } catch { /* already-existing file on a filesystem without modes (e.g. Windows) */ }
     console.log(`\nWrote ${ENV_PATH}`);
 
     // A standard Discord bot token's first '.'-separated segment is the bot's

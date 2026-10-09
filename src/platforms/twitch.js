@@ -1,17 +1,23 @@
 // Twitch Helix: token, user info, live + VOD fetch.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
-const https = require('https');
-const { fetchText } = require('../net.js');
+const { fetchText, postForm } = require('../net.js');
 
 async function fetchTwitch(path) {
     const clientId = process.env.TWITCH_CLIENT_ID;
     if (!clientId) throw new Error('TWITCH_CLIENT_ID env var not set');
     const token = await getTwitchToken();
-    const raw = await fetchText(`https://api.twitch.tv/helix/${path}`, {
-        'Client-Id': clientId,
-        'Authorization': `Bearer ${token}`,
-    });
+    let raw;
+    try {
+        raw = await fetchText(`https://api.twitch.tv/helix/${path}`, {
+            'Client-Id': clientId,
+            'Authorization': `Bearer ${token}`,
+        });
+    } catch (e) {
+        // A revoked/rotated token would otherwise keep failing until its cached expiry.
+        if (/HTTP 401/.test(e.message)) twitchToken = null;
+        throw e;
+    }
     return JSON.parse(raw);
 }
 
@@ -23,15 +29,10 @@ async function getTwitchToken() {
     const clientId = process.env.TWITCH_CLIENT_ID, clientSecret = process.env.TWITCH_CLIENT_SECRET;
     if (!clientId || !clientSecret) throw new Error('TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET env vars not set');
 
-    // Twitch's token endpoint requires POST, so we can't use fetchText (GET-only) here.
-    const res = await new Promise((resolve, reject) => {
-        const body = `client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`;
-        const req = https.request('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, res => {
-            const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
-        });
-        req.on('error', reject); req.write(body); req.end();
+    const { status, json: res } = await postForm('https://id.twitch.tv/oauth2/token', {
+        client_id: clientId, client_secret: clientSecret, grant_type: 'client_credentials',
     });
-    if (!res.access_token) throw new Error(`Twitch token error: ${JSON.stringify(res)}`);
+    if (!res?.access_token) throw new Error(`Twitch token error (HTTP ${status}): ${res?.message || 'no access_token in response'}`);
     twitchToken = res.access_token;
     twitchTokenExpiry = Date.now() + (res.expires_in * 1000);
     return twitchToken;
@@ -39,10 +40,6 @@ async function getTwitchToken() {
 
 // Cache login→id mappings to avoid repeated lookups
 const twitchUserIdCache = new Map();
-
-async function getTwitchUserId(login) {
-    return (await getTwitchUserInfo(login)).id;
-}
 
 // Cache both the numeric ID and profile picture — the latter is used as a fallback
 // thumbnail when a specific stream/VOD doesn't have its own preview image yet

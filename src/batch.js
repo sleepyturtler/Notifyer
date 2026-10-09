@@ -49,11 +49,11 @@ const DEFAULT_BATCH_HEADER = '**{author}** posted {count} times!';
 function renderBatchHeader(w, count, allHandles = [w.handle]) {
     const tmpl = w.batch_header_template || DEFAULT_BATCH_HEADER;
     return tmpl
-        .replace(/\{author\}/g, w.handle)
-        .replace(/\{handle\}/g, w.handle)
-        .replace(/\{creators\}/g, formatCreatorList(allHandles))
-        .replace(/\{platform\}/g, PLATFORMS[w.platform]?.label || w.platform)
-        .replace(/\{count\}/g, String(count));
+        .replace(/\{author\}/g, () => w.handle)
+        .replace(/\{handle\}/g, () => w.handle)
+        .replace(/\{creators\}/g, () => formatCreatorList(allHandles))
+        .replace(/\{platform\}/g, () => PLATFORMS[w.platform]?.label || w.platform)
+        .replace(/\{count\}/g, () => String(count));
 }
 
 function formatCreatorList(handles) {
@@ -113,7 +113,7 @@ function buildBatchPayload(entries) {
                 .setButtonAccessory(new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(url).setEmoji(p.emojiButton))
         );
     });
-    return { components: [header, container], flags: MessageFlags.IsComponentsV2 };
+    return { components: [header, container], flags: MessageFlags.IsComponentsV2, allowedMentions: { roles: roleIds } };
 }
 
 async function sendBatchNotification(entries) {

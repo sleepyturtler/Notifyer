@@ -1,11 +1,10 @@
-// One-off / recurring admin announcements (support server, Twitter restored, legacy-format migration).
+// One-off / recurring admin announcements (support server, Twitter restored).
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
-const { PermissionFlagsBits, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { LEGACY_MIGRATION_TS, SUPPORT_SERVER_URL } = require('./config.js');
+const { PermissionFlagsBits, ChannelType, EmbedBuilder } = require('discord.js');
+const { SUPPORT_SERVER_URL } = require('./config.js');
 const { getAllWatches, getConfig, saveConfig } = require('./db.js');
 const { client } = require('./client.js');
-const { isLegacyMessageFormat } = require('./helpers.js');
 
 // Finds a channel to post admin/mod updates in. Prefers a channel hidden from
 // @everyone where every role that can view it has an elevated permission
@@ -55,16 +54,19 @@ function findAnnouncementChannel(guild) {
     return named || textChannels.first();
 }
 
+// Returns true only if the message was actually sent, so callers can avoid marking it as done otherwise.
 async function announceSupportServer(guild) {
     try {
         const channel = findAnnouncementChannel(guild);
-        if (!channel) return;
+        if (!channel) return false;
         const embed = new EmbedBuilder().setColor('#5865F2').setTitle('👋 Thanks for using Notifyer!')
             .setDescription(`Run **/setup** to get a quick walkthrough of what this bot does and set up your first tracked account.\n\nJoin the support server for help, updates, and to report issues:\n${SUPPORT_SERVER_URL}`);
         await channel.send({ embeds: [embed] });
         console.log(`📨 Sent support server announcement to ${guild.name} (#${channel.name})`);
+        return true;
     } catch (e) {
         console.error(`announceSupportServer (${guild.id}):`, e.message);
+        return false;
     }
 }
 
@@ -82,7 +84,7 @@ async function announceTwitterRestoredForGuild(guildId) {
             .setDescription(
                 'This server has one or more Twitter/X watches. The Nitter mirrors this bot reads through have held up reliably, so Twitter/X tracking is fully re-enabled — no action needed, existing watches resume automatically.'
             );
-        await channel.send({ embeds: [embed] }).catch(e => console.error(`twitter restored update send (${guildId}):`, e.message));
+        await channel.send({ embeds: [embed] }); // a failed send throws to the catch below, so the flag below is not set and it retries next boot
         saveConfig(guildId, { ...cfg, twitterRestoredAnnounced: true });
         console.log(`✅ Sent Twitter restored update to ${guild.name} (#${channel.name})`);
     } catch (e) {
@@ -91,44 +93,9 @@ async function announceTwitterRestoredForGuild(guildId) {
 }
 
 async function announceTwitterRestoredGuilds() {
-    const watches = await getAllWatches();
-    const guildIdsWithTwitter = [...new Set(watches.filter(w => w.platform === 'twitter').map(w => w.guild_id))];
+    const watches = await getAllWatches(['twitter']);
+    const guildIdsWithTwitter = [...new Set(watches.map(w => w.guild_id))];
     for (const guildId of guildIdsWithTwitter) await announceTwitterRestoredForGuild(guildId);
 }
 
-// One-time heads-up about the legacy format's retirement. Discord's <t:...:R>
-// timestamp gives a live countdown client-side, no bot-side editing needed.
-async function announceLegacyMigrationForGuild(guildId) {
-    try {
-        const cfg = await getConfig(guildId);
-        if (cfg.legacyMigrationAnnounced) return;
-        const guild = client.guilds.cache.get(guildId);
-        if (!guild) return;
-        const channel = findAnnouncementChannel(guild);
-        if (!channel) return;
-        const embed = new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Legacy message system: permanent migration')
-            .setDescription(
-                'This server has one or more watches still using the old single-message format.\n\n' +
-                `In October, we're **permanently** migrating everyone to the new per-type message system. ` +
-                `**After the migration, the old system will not work** — watches still on the legacy format ` +
-                'should be reviewed and re-saved before then.\n\n' +
-                `**Migration date:** <t:${LEGACY_MIGRATION_TS}:F> (<t:${LEGACY_MIGRATION_TS}:R>)`
-            );
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('legacymigration_viewwatches').setLabel('📋 View My Watches').setStyle(ButtonStyle.Primary)
-        );
-        await channel.send({ embeds: [embed], components: [row] }).catch(e => console.error(`legacy migration announce send (${guildId}):`, e.message));
-        saveConfig(guildId, { ...cfg, legacyMigrationAnnounced: true });
-        console.log(`⚠️ Sent legacy migration notice to ${guild.name} (#${channel.name})`);
-    } catch (e) {
-        console.error(`announceLegacyMigrationForGuild (${guildId}):`, e.message);
-    }
-}
-
-async function announceLegacyMigrationGuilds() {
-    const watches = await getAllWatches();
-    const guildIdsWithLegacy = [...new Set(watches.filter(w => isLegacyMessageFormat(w)).map(w => w.guild_id))];
-    for (const guildId of guildIdsWithLegacy) await announceLegacyMigrationForGuild(guildId);
-}
-
-module.exports = { announceLegacyMigrationGuilds, announceSupportServer, announceTwitterRestoredGuilds };
+module.exports = { announceSupportServer, announceTwitterRestoredGuilds };

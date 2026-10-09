@@ -6,7 +6,7 @@ const { getSocialLinks, getWatches } = require('./db.js');
 const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { DEFAULT_TEMPLATE, PLACEHOLDER_HELP } = require('./notify.js');
-const { canWatchBatch, isLegacyMessageFormat } = require('./helpers.js');
+const { canWatchBatch } = require('./helpers.js');
 const fs = require('fs');
 const path = require('path');
 // Beta-only "Admin" help category (see debugTools.js) — only added if that file is
@@ -139,7 +139,7 @@ function buildPerTypeMessageModal(w, isNewFlow = false) {
     return modal;
 }
 
-// Shared by the manage view's "📦 Batch Header" button and the guided add-flow's
+// Shared by the manage view's "Batch Header" button and the guided add-flow's
 // optional batch-header step below, so both stay in sync.
 function buildBatchHeaderModal(w) {
     return new ModalBuilder().setCustomId(`socialbatchheader_modal_${w.id}`).setTitle('Edit Batch Header')
@@ -171,9 +171,6 @@ function buildManageView(w) {
     if (p.unavailable) {
         embed.addFields({ name: '⚠️ Currently unavailable', value: `${p.label} isn't working right now — see \`/help\` → Info for why. Notifications won't fire until this is resolved, but everything here stays saved.` });
     }
-    if (isLegacyMessageFormat(w)) {
-        embed.addFields({ name: '⚠️ Outdated message', value: 'This message was auto-migrated from the old single-message format and hasn\'t been reviewed. It was written as one generic message and may not read well for every post type — check each type with **Edit Messages** and edit as needed.' });
-    }
     // A watch can only ever contribute to a batch if at least one of its active
     // notify types isn't "live" — live events always send individually (see
     // pollAll), so a Kick watch (live-only) or a YouTube watch restricted to
@@ -189,8 +186,8 @@ function buildManageView(w) {
     // Batch Settings is server-wide (min posts / cross-channel), so it is offered on every
     // watch; Batch Header is per-watch and only matters when this watch can batch at all.
     const row1b = [new ActionRowBuilder().addComponents(
-        ...(canBatch ? [new ButtonBuilder().setCustomId(`socialmanage_batchheader_${w.id}`).setLabel('📦 Batch Header').setStyle(ButtonStyle.Secondary)] : []),
-        new ButtonBuilder().setCustomId(`socialmanage_batchsettings_${w.id}`).setLabel('⚙️ Batch Settings').setStyle(ButtonStyle.Secondary),
+        ...(canBatch ? [new ButtonBuilder().setCustomId(`socialmanage_batchheader_${w.id}`).setLabel('Batch Header').setStyle(ButtonStyle.Secondary)] : []),
+        new ButtonBuilder().setCustomId(`socialmanage_batchsettings_${w.id}`).setLabel('Batch Settings').setStyle(ButtonStyle.Secondary),
     )];
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
@@ -205,7 +202,7 @@ function buildManageView(w) {
 function buildBatchSettingsView(w, cfg) {
     const minPosts = cfg.batchMinThreshold || 2;
     const cross = !!cfg.batchCrossChannel;
-    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('\u2699\ufe0f Batch Settings')
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Batch Settings')
         .setDescription('These apply to **every** watch in this server, not just this one.')
         .addFields(
             { name: 'Posts needed to combine', value: `\`${minPosts}\`: posts send individually until this many land within 10 minutes, then merge into one message.` },
@@ -245,7 +242,7 @@ const HELP_CATEGORIES = [
                 { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
                 { name: '/social preview', value: 'See exactly what a notification will look like for a tracked account, one preview per notify type, without waiting for a real post.' },
                 { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
-                { name: '📦 Batched notifications', value: 'If a second new post lands in the same channel for the same platform within 10 minutes of the last one — whether from one account or several tracked accounts — the earlier message is turned into a combined one instead of pinging again: a header line, then a compact title+button per post. Each further post within 10 minutes of the last keeps extending the same message. Customize the header from a watch\'s manage view ("📦 Batch Header"; "⚙️ Batch Settings" there sets how many posts are needed and whether it merges across channels) — use `{creators}` instead of `{author}` if you want it to also read well with multiple accounts (e.g. "X and Y posted 5 times!"); otherwise a batch with more than one account falls back to that generic form automatically. "Went live" notifications are never batched.' },
+                { name: '📦 Batched notifications', value: 'If a second new post lands in the same channel for the same platform within 10 minutes of the last one — whether from one account or several tracked accounts — the earlier message is turned into a combined one instead of pinging again: a header line, then a compact title+button per post. Each further post within 10 minutes of the last keeps extending the same message. Customize the header from a watch\'s manage view ("Batch Header"; "Batch Settings" there sets how many posts are needed and whether it merges across channels) — use `{creators}` instead of `{author}` if you want it to also read well with multiple accounts (e.g. "X and Y posted 5 times!"); otherwise a batch with more than one account falls back to that generic form automatically. "Went live" notifications are never batched.' },
             ),
     },
     {

@@ -7,8 +7,7 @@
 //
 // This only writes .env; it doesn't install dependencies, create your
 // Discord application, or start the bot. Run `npm install` and
-// `node index.js` (or `npm start`) on whichever branch you checked out
-// yourself afterward.
+// `node index.js` (or `npm start`) yourself afterward.
 
 const fs = require('fs');
 const path = require('path');
@@ -69,15 +68,15 @@ async function main() {
         env.KICK_CLIENT_ID = await ask('  Kick client ID', { required: true });
         env.KICK_CLIENT_SECRET = await ask('  Kick client secret', { required: true });
     }
-    if (await askYesNo('Enable YouTube tracking? (beta build only)')) {
+    if (await askYesNo('Enable YouTube tracking?')) {
         env.YOUTUBE_API_KEY = await ask('  YouTube Data API v3 key', { required: true });
     }
-    if (await askYesNo('Enable Instagram OAuth linking? (beta build only, requires your own Meta app review)')) {
+    if (await askYesNo('Enable Instagram OAuth linking? (requires your own Meta app review)')) {
         env.INSTAGRAM_APP_ID = await ask('  Instagram/Meta app ID', { required: true });
         env.INSTAGRAM_APP_SECRET = await ask('  Instagram/Meta app secret', { required: true });
         if (!env.PUBLIC_BASE_URL) console.log('  Note: Instagram OAuth needs PUBLIC_BASE_URL set above to actually work.');
     }
-    if (await askYesNo('Enable TikTok OAuth linking? (beta build only, requires your own TikTok app review)')) {
+    if (await askYesNo('Enable TikTok OAuth linking? (requires your own TikTok app review)')) {
         env.TIKTOK_CLIENT_KEY = await ask('  TikTok client key', { required: true });
         env.TIKTOK_CLIENT_SECRET = await ask('  TikTok client secret', { required: true });
         if (!env.PUBLIC_BASE_URL) console.log('  Note: TikTok OAuth needs PUBLIC_BASE_URL set above to actually work.');
@@ -106,8 +105,7 @@ async function main() {
     console.log('\n[Next steps]');
     console.log('  1. npm install');
     console.log('  2. node index.js   (or npm start)');
-    console.log('     On the main branch this is the release build (YouTube, Twitch, Kick, Twitter/X);');
-    console.log('     on the Beta branch it also adds Instagram/TikTok.');
+    console.log('     Any platform whose credentials you skipped stays switched off; the startup log lists what is active.');
     if (clientId) {
         const permissions = 1024 /* View Channel */ + 2048 /* Send Messages */ + 16384 /* Embed Links */ + 262144 /* Use External Emojis */;
         console.log(`  3. Invite the bot to a server:\n     https://discord.com/api/oauth2/authorize?client_id=${clientId}&permissions=${permissions}&scope=bot%20applications.commands`);

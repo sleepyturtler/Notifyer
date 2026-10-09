@@ -12,6 +12,9 @@ const path = require('path');
 // Beta-only "Admin" help category (see debugTools.js) — only added if that file is
 // present in this build's src/.
 const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
+// Help embed title: "Notifyer Beta" on a build that has debugTools.js, plain "Notifyer" without it,
+// so removing that one file is all it takes to turn a beta build into a release build.
+const BUILD_NAME = debugTools ? 'Notifyer Beta' : 'Notifyer';
 
 // ── Embeds / UI builders ──────────────────────────────────────────────────
 const refreshBtn = (id) => new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
@@ -226,7 +229,7 @@ function buildBatchSettingsView(w, cfg) {
 const HELP_CATEGORIES = [
     {
         id: 'general', emoji: '🏠', label: 'General',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — General')
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — General`)
             .setDescription('Get notified in a channel whenever a tracked account posts new content or goes live.')
             .addFields(
                 { name: '/setup', value: 'New here? A quick walkthrough of what this bot does, with a guided flow to add your first tracked account.' },
@@ -236,7 +239,7 @@ const HELP_CATEGORIES = [
     },
     {
         id: 'tracking', emoji: '📡', label: 'Tracking',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Tracking')
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Tracking`)
             .addFields(
                 { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message. Instagram/TikTok accounts must be linked first (see the Linking tab).' },
                 { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
@@ -247,7 +250,7 @@ const HELP_CATEGORIES = [
     },
     {
         id: 'linking', emoji: '🔗', label: 'Linking',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Linking')
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Linking`)
             .setDescription('Instagram and TikTok only expose their APIs through per-account OAuth consent — an account has to explicitly authorize this bot before it can be tracked.')
             .addFields(
                 { name: '/social link', value: 'Connect an Instagram or TikTok account via OAuth so it can be tracked. Sends a link the account owner clicks and logs in with.' },
@@ -256,14 +259,14 @@ const HELP_CATEGORIES = [
     },
     {
         id: 'settings', emoji: '⚙️', label: 'Settings',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Settings')
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Settings`)
             .addFields(
                 { name: '/social access', value: 'Set which role (besides admins) can manage social notifications in this server.' },
             ),
     },
     {
         id: 'info', emoji: 'ℹ️', label: 'Info',
-        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Info')
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Info`)
             .addFields(
                 { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
                 { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`. For Live messages specifically, `{is/was}` renders as "is" when the stream starts and "was" once it ends — so one message works for both.' },

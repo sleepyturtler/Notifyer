@@ -11,7 +11,11 @@ async function fetchKick(path) {
     const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
     if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
     const token = await getKickAppToken();
-    const { json } = await fetchJson(`https://api.kick.com/public/v1/${path}`, { Authorization: `Bearer ${token}` });
+    const { status, json } = await fetchJson(`https://api.kick.com/public/v1/${path}`, { Authorization: `Bearer ${token}` });
+    // A non-200 (429, 5xx, expired token) must surface as an error: returning the error body
+    // would read as "no livestream" and make the poller mark a live stream as ended.
+    if (status === 401) kickToken = null;
+    if (status !== 200) throw new Error(`HTTP ${status}`);
     return json;
 }
 
@@ -37,7 +41,7 @@ const kickBroadcasterIdCache = new Map();
 
 async function getKickChannelInfo(slug) {
     if (kickBroadcasterIdCache.has(slug)) return kickBroadcasterIdCache.get(slug);
-    const data = await fetchKick(`channels?slug=${encodeURIComponent(slug)}`);
+    const data = await fetchKick(`channels?slug=${encodeURIComponent(slug)}`).catch(e => { if (/HTTP 404/.test(e.message)) return null; throw e; });
     const channel = data?.data?.[0];
     if (!channel) throw new Error(`Kick channel "${slug}" not found`);
     const info = {
@@ -46,10 +50,6 @@ async function getKickChannelInfo(slug) {
     };
     kickBroadcasterIdCache.set(slug, info);
     return info;
-}
-
-async function getKickBroadcasterId(slug) {
-    return (await getKickChannelInfo(slug)).id;
 }
 
 // Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType, isLive}]

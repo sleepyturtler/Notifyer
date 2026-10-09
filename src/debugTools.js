@@ -59,6 +59,12 @@ function getExtraHelpCategory() {
 // false to let the normal chain continue (e.g. for subcommands this file doesn't own).
 async function handleSocialSubcommand(sub, { interaction, reply }) {
     if (sub === 'debug') {
+        // The Admin help text promises this is owner-only; it also makes live API calls, so enforce it.
+        const ownerId = process.env.BOT_OWNER_ID;
+        if (!ownerId || interaction.user.id !== ownerId) {
+            await reply('❌ This command is owner-only.');
+            return true;
+        }
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const id = interaction.options.getInteger('id');
         const guildId = interaction.guildId;

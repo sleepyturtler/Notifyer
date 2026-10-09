@@ -35,6 +35,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
 
     let post = null;
     let baselineSeenIds = [];
+    let fetchedOk = false; // a fetch really succeeded (even if it found nothing yet)
     let socialLinkId = null;
     if (PLATFORMS[platform].oauth) {
         // Instagram/TikTok can only be watched for accounts that have gone through
@@ -52,6 +53,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
             // newest — otherwise the next poll (or /social check) treats the older
             // ones as "unseen" and fires notifications for pre-existing content.
             baselineSeenIds = posts.map(p => p.id);
+            fetchedOk = true;
         } catch (e) {
             return { ok: false, message: `❌ Couldn't fetch that account: ${e.message}` };
         }
@@ -74,6 +76,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
                 post = await fetchLatestPost(platform, handle);
                 baselineSeenIds = post?.id ? [post.id] : [];
             }
+            fetchedOk = platform !== 'youtube'; // YouTube's fetch happens after addWatch(), below
         } catch (e) {
             if (/HTTP 429/.test(e.message)) {
                 // Rate-limited on verify — account likely exists, proceed anyway
@@ -92,6 +95,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
             const posts = await fetchLatestYouTubeEntries(watch);
             post = posts[0] || null;
             baselineSeenIds = posts.map(p => p.id);
+            fetchedOk = true;
         } catch (e) {
             // Same "proceed anyway" leniency as the 429 case above for other
             // platforms — don't fail watch creation over this. Baseline will
@@ -103,7 +107,10 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
 
     // Seed last_post_id AND seen_post_ids so the first poll doesn't fire
     // notifications for content that already existed before tracking started.
-    await updateLastPost(watch.id, post?.id || null, baselineSeenIds);
+    // If the fetch worked but found nothing (e.g. a streamer who is offline and has no VODs), store a
+    // sentinel instead of null: null means "no baseline yet", which makes the poller treat the FIRST
+    // thing it ever sees as baseline, so the first stream after adding the watch would never notify.
+    await updateLastPost(watch.id, post?.id || (fetchedOk ? 'baseline' : null), baselineSeenIds);
     return { ok: true, watch, post, handle };
 }
 

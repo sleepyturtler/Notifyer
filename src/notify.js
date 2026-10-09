@@ -33,13 +33,15 @@ function resolveTemplate(w, post) {
 // to say the stream ended, false (default) for the original live/normal notification.
 function renderTemplate(template, post, platform, handle, ended = false) {
     const tmpl = template || (post.postType === 'live' ? LIVE_DEFAULT_TEMPLATE : DEFAULT_TEMPLATE);
+    // Function replacers: a plain replacement string would interpret "$&", "$'" and "$$"
+    // inside titles/names (e.g. "Make $$ fast" would lose a dollar sign).
     return tmpl
-        .replace(/\{is\/was\}/g, ended ? 'was' : 'is')
-        .replace(/\{author\}/g, post.author || handle)
-        .replace(/\{handle\}/g, handle)
-        .replace(/\{platform\}/g, PLATFORMS[platform].label)
-        .replace(/\{title\}/g, post.title || '')
-        .replace(/\{url\}/g, post.url || '');
+        .replace(/\{is\/was\}/g, () => (ended ? 'was' : 'is'))
+        .replace(/\{author\}/g, () => post.author || handle)
+        .replace(/\{handle\}/g, () => handle)
+        .replace(/\{platform\}/g, () => PLATFORMS[platform].label)
+        .replace(/\{title\}/g, () => post.title || '')
+        .replace(/\{url\}/g, () => post.url || '');
 }
 
 function shouldNotify(w, post) {
@@ -187,18 +189,21 @@ function resolveWatchChannel(w) {
     return { guild, channel: guild?.channels.cache.get(w.channel_id) };
 }
 
+// Only the watch's own ping role may notify; see the allowedMentions default in client.js.
+const pingRoles = w => ({ roles: w.role_id ? [w.role_id] : [] });
+
 async function sendNotification(w, post) {
     const { guild, channel } = resolveWatchChannel(w);
     if (!channel) return null;
     const payload = buildNotificationPayload(w, post);
     if (payload.wantsNativeVideo) {
-        const sent = await channel.send({ content: payload.content, components: payload.components }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+        const sent = await channel.send({ content: payload.content, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
         // Discord's crawler occasionally fails to unfurl TikTok links even via the mirror
         // domain — check back shortly and backfill a manual embed if nothing showed up.
         if (sent && w.platform === 'tiktok') ensureVideoEmbedFallback(channel, sent.id, post);
         return sent;
     }
-    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
 }
 
 // Edits a previously-sent "went live" message to show the stream has ended, once a

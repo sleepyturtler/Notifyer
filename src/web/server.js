@@ -3,9 +3,9 @@
 
 const { URL } = require('url');
 const http = require('http');
-const https = require('https');
-const { SEEN_HISTORY_SIZE, WEBSUB_VERIFY_TOKEN } = require('../config.js');
-const { xmlParser } = require('../net.js');
+const crypto = require('crypto');
+const { SEEN_HISTORY_SIZE, WEBSUB_VERIFY_TOKEN, websubSecretFor } = require('../config.js');
+const { fetchText, xmlParser } = require('../net.js');
 const { getWatchesByYouTubeChannel, setWatchLiveMessage, setWatchYouTubeLiveVideo, updateLastPost, upsertSocialLink } = require('../db.js');
 const { classifyYouTubeVideos } = require('../platforms/youtube.js');
 const { sendNotification, shouldNotify } = require('../notify.js');
@@ -49,20 +49,51 @@ function handleYouTubeWebSubVerify(req, res) {
 // triggers this the moment it starts). We still share the same seen_post_ids
 // dedup as routine polling, so if a poll and a push both catch the same video,
 // only the first one to arrive actually sends anything.
+const YT_CHANNEL_ID_RE = /^UC[\w-]{22}$/;
+const YT_VIDEO_ID_RE = /^[\w-]{11}$/;
+
+// WebSub pushes are only trusted if their X-Hub-Signature HMAC (keyed with the per-channel secret
+// we gave the hub at subscribe time) matches the raw body. Without this anyone who knows a
+// channel ID could POST a fake feed and make the bot announce arbitrary titles/links.
+function verifyWebSubSignature(rawBody, header, channelId) {
+    const m = /^(sha1|sha256|sha512)=([0-9a-f]+)$/i.exec(String(header || ''));
+    if (!m) return false;
+    const expected = crypto.createHmac(m[1].toLowerCase(), websubSecretFor(channelId)).update(rawBody).digest();
+    const got = Buffer.from(m[2], 'hex');
+    return got.length === expected.length && crypto.timingSafeEqual(got, expected);
+}
+
+// Async route handlers run outside the router's try/catch (it returns the promise without
+// awaiting it), so a rejection would otherwise leave the request hanging with no response.
+function guardAsync(promise, res) {
+    return Promise.resolve(promise).catch(e => {
+        console.error('HTTP request handling:', e.message);
+        if (!res.headersSent) { res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end('Internal error'); }
+    });
+}
+
 async function handleYouTubeWebSubPush(req, res) {
-    let body = '';
+    const chunks = []; let size = 0;
     // Without this, a client that aborts mid-upload emits an unhandled 'error' on
     // req — which (unlike a rejected promise) isn't caught anywhere and crashes
     // the whole process, the same class of issue as the top-level HTTP try/catch.
     req.on('error', e => console.error('YouTube WebSub push request:', e.message));
-    req.on('data', chunk => { body += chunk; if (body.length > 1_000_000) req.destroy(); });
+    req.on('data', chunk => { size += chunk.length; if (size > 1_000_000) return req.destroy(); chunks.push(chunk); });
     req.on('end', async () => {
         res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('OK'); // ack immediately, hub expects a quick 2xx
         try {
-            const data = xmlParser.parse(body);
+            const rawBody = Buffer.concat(chunks);
+            const data = xmlParser.parse(rawBody.toString('utf8'));
             const rawEntries = data?.feed?.entry;
             if (!rawEntries) return;
             const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries];
+            // One push is always for a single channel's topic: take the channel from the body, then
+            // require the signature to match that channel's secret and every entry to agree with it.
+            const pushChannelId = entries[0]?.['yt:channelId'];
+            if (!YT_CHANNEL_ID_RE.test(pushChannelId || '') || !verifyWebSubSignature(rawBody, req.headers['x-hub-signature'], pushChannelId)) {
+                console.warn('⚠️ Ignored a YouTube WebSub push with a missing/invalid signature.');
+                return;
+            }
             // Non-live entries go through the same rolling batch window as routine
             // polling (see sendOrExtendBatch) — a single push can carry several
             // <entry> elements at once (e.g. a channel bulk-uploading), and this
@@ -70,7 +101,7 @@ async function handleYouTubeWebSubPush(req, res) {
             for (const entry of entries) {
                 const videoId = entry['yt:videoId'];
                 const channelId = entry['yt:channelId'];
-                if (!videoId || !channelId) continue;
+                if (!YT_VIDEO_ID_RE.test(videoId || '') || channelId !== pushChannelId) continue;
                 const watches = await getWatchesByYouTubeChannel(channelId);
                 // Classify once per video, not once per watch — several servers can
                 // track the same channel, and classifyYouTubeVideos is a real,
@@ -85,6 +116,7 @@ async function handleYouTubeWebSubPush(req, res) {
                     if (w.last_post_id === null || seenIds.includes(videoId)) continue; // baseline not seeded yet, or already handled
                     if (!classified) classified = await classifyYouTubeVideos([videoId]);
                     const c = classified[videoId];
+                    if (c?.isUpcoming) continue; // scheduled, not live yet: leave it unseen so it notifies when it starts
                     const post = {
                         id: videoId,
                         url: c?.postType === 'shorts' ? `https://www.youtube.com/shorts/${videoId}` : `https://www.youtube.com/watch?v=${videoId}`,
@@ -165,11 +197,11 @@ http.createServer((req, res) => {
         if (path === `/${TIKTOK_VERIFY_FILENAME}`) {
             res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(TIKTOK_VERIFY_CONTENT);
         }
-        if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
-        if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
+        if (path === '/oauth/instagram/callback') return guardAsync(handleOAuthCallback('instagram', req, res), res);
+        if (path === '/oauth/tiktok/callback') return guardAsync(handleOAuthCallback('tiktok', req, res), res);
         if (path === '/youtube/websub') {
             if (req.method === 'GET') return handleYouTubeWebSubVerify(req, res);
-            if (req.method === 'POST') return handleYouTubeWebSubPush(req, res);
+            if (req.method === 'POST') return guardAsync(handleYouTubeWebSubPush(req, res), res);
         }
         res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
     } catch (e) {
@@ -183,8 +215,10 @@ const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE
 
 if (KEEP_ALIVE_URL) {
     setInterval(() => {
-        https.get(`${KEEP_ALIVE_URL.replace(/\/$/, '')}/health`, res => res.resume())
-            .on('error', e => console.error('⚠️ Keep-alive ping failed:', e.message));
+        // fetchText handles http:// and https:// (a self-hosted KEEP_ALIVE_URL may be plain http)
+        // and never throws synchronously, unlike https.get on a non-https URL.
+        fetchText(`${KEEP_ALIVE_URL.replace(/\/$/, '')}/health`)
+            .catch(e => console.error('⚠️ Keep-alive ping failed:', e.message));
     }, 10 * 60 * 1000); // every 10 minutes
 } else {
     console.log('ℹ️ KEEP_ALIVE_URL/RENDER_EXTERNAL_URL not set — self-ping disabled.');

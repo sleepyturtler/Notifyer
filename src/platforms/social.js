@@ -114,7 +114,7 @@ async function exchangeInstagramCode(code) {
 
     // 2. Exchange for a long-lived token (~60 days).
     const { json: longRes } = await fetchJson(
-        `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${cfg.clientSecret}&access_token=${encodeURIComponent(tokenRes.access_token)}`
+        `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${encodeURIComponent(cfg.clientSecret)}&access_token=${encodeURIComponent(tokenRes.access_token)}`
     );
     const accessToken = longRes?.access_token || tokenRes.access_token;
     const expiresIn = longRes?.expires_in || 60 * 24 * 60 * 60;

@@ -33,18 +33,14 @@ function consumeOAuthState(state) {
     return entry;
 }
 
+// Both maps only get cleaned up when an entry is read back, but flows abandoned partway (a
+// link that's never authorized, a /setup wizard where the user closes Discord) are never read
+// back at all, so sweep expired entries periodically or they'd sit in memory forever.
 setInterval(() => {
     const now = Date.now();
-    for (const [k, v] of pendingOAuthStates) if (v.expires < now) pendingOAuthStates.delete(k);
-}, 5 * 60 * 1000);
-
-// pendingSetupPicks has the same "entries only get cleaned up when read back"
-// shape, but /setup flows that get abandoned partway (user closes Discord,
-// never finishes the modal/channel-select) never get read back at all — without
-// this, those entries would sit in memory forever on a long-running process.
-setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of pendingSetupPicks) if (v.expires < now) pendingSetupPicks.delete(k);
+    for (const map of [pendingOAuthStates, pendingSetupPicks]) {
+        for (const [k, v] of map) if (v.expires < now) map.delete(k);
+    }
 }, 5 * 60 * 1000);
 
 module.exports = { SETUP_PICK_TTL_MS, consumeOAuthState, createOAuthState, pendingSetupPicks };

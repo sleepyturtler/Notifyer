@@ -34,12 +34,15 @@ const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 // meant to be a long-lived secret.
 const WEBSUB_VERIFY_TOKEN = crypto.randomBytes(16).toString('hex');
 
+// Per-channel secret for signing/verifying WebSub pushes (HMAC of the channel ID). Derived
+// from a server-side secret instead of random-per-boot because subscriptions outlive restarts
+// (the hub signs pushes with the secret given at subscribe time). Set WEBSUB_SECRET to use a
+// dedicated value; otherwise it falls back to DISCORD_TOKEN, which is never sent anywhere.
+const websubSecretFor = channelId => crypto
+    .createHmac('sha256', process.env.WEBSUB_SECRET || process.env.DISCORD_TOKEN || 'notifyer-websub')
+    .update(`websub:${channelId}`).digest('hex');
+
 const WEBSUB_HUB_URL = 'https://pubsubhubbub.appspot.com/subscribe';
-
-// Cutoff for permanently retiring the old single-message-template system.
-const LEGACY_MIGRATION_DATE = new Date('2026-10-01T00:00:00Z');
-
-const LEGACY_MIGRATION_TS = Math.floor(LEGACY_MIGRATION_DATE.getTime() / 1000);
 
 const OAUTH_CONFIG = {
     instagram: {
@@ -184,4 +187,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGACY_MIGRATION_TS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, YOUTUBE_API_KEY, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, isOwner, logStartupConfigSummary };

@@ -1,4 +1,4 @@
-// Small pure helpers: embed builder E, handle normalization, profile URLs, legacy-format and can-batch checks.
+// Small pure helpers: embed builder E, handle normalization, profile URLs and the can-batch check.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { EmbedBuilder } = require('discord.js');
@@ -13,7 +13,7 @@ function normalizeHandle(platform, raw) {
     h = h.replace(/^https?:\/\/(www\.)?/i, '');
     if (platform === 'youtube') {
         h = h.replace(/^(youtube\.com|m\.youtube\.com|youtu\.be)\//i, '');
-        h = h.replace(/^@/, '@'); // keep @handle form if present
+        h = h.replace(/[?#].*$/, '').replace(/^channel\//i, ''); // /channel/UC... URLs and ?si=... tracking params
         h = h.replace(/\/(videos|featured|streams|shorts).*$/i, '');
         h = h.replace(/\/$/, '');
     } else if (platform === 'twitter') {
@@ -51,11 +51,6 @@ function profileUrl(platform, handle) {
     }
 }
 
-// single message_template and haven't been reviewed/edited since.
-function isLegacyMessageFormat(w) {
-    return !!w.legacy_migrated;
-}
-
 // A watch can only ever contribute to a batch if at least one of its active
 // notify types isn't "live" — live events always send individually (see
 // pollAll), so a Kick watch (live-only) or a YouTube watch restricted to just
@@ -68,4 +63,4 @@ function canWatchBatch(w) {
     return nonLiveTypes.length > 0 && activeTypeIds.some(id => id !== 'live');
 }
 
-module.exports = { E, canWatchBatch, isLegacyMessageFormat, normalizeHandle, profileUrl };
+module.exports = { E, canWatchBatch, normalizeHandle, profileUrl };

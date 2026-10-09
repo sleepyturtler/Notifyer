@@ -6,7 +6,7 @@ const { client } = require('./client.js');
 const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, isOwner } = require('./config.js');
 const { E, canWatchBatch } = require('./helpers.js');
 const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupIntroEmbed, buildSetupIntroRow, buildSetupReturningEmbed, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
-const { deleteSocialLink, getConfig, getSocialLinkById, getWatch, getWatches, removeWatch, saveConfig, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchTemplate } = require('./db.js');
+const { deleteSocialLink, getConfig, getSocialLinkById, getWatch, getWatches, removeWatch, saveConfig, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
 const { hasCommandPermission } = require('./permissions.js');
 const { buildAddWatchSuccessResponse, createWatchFlow } = require('./watchFlow.js');
 const { pollAll } = require('./poller.js');
@@ -22,7 +22,6 @@ const path = require('path');
 const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
 
 // ── Interaction handling ────────────────────────────────────────────────────
-const pendingMessageEdits = new Map(); // userId_watchId -> { guildId }
 
 client.on('interactionCreate', async interaction => {
   try {
@@ -187,14 +186,6 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const { embeds, components } = await buildWatchListEmbed(guildId);
         return interaction.update({ embeds, components });
-    }
-
-    // ── Button: "View My Watches" from the legacy-migration announcement — same
-    // output as running /social list, replied ephemerally to whoever clicked it. ──
-    if (interaction.isButton() && interaction.customId === 'legacymigration_viewwatches') {
-        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const { embeds, components } = await buildWatchListEmbed(guildId);
-        return interaction.reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
     }
 
     // ── Buttons: refresh linked-accounts list ───────────────────────────────
@@ -400,6 +391,7 @@ client.on('interactionCreate', async interaction => {
     // ── Select/skip: notification types from the guided /social add flow —
     // chains straight into the per-type message modal instead of just confirming.
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtypeadd_select_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.customId.slice(21), 10);
         const w = await getWatch(guildId, id);
         if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
@@ -408,6 +400,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(buildPerTypeMessageModal(updated, true));
     }
     if (interaction.isButton() && interaction.customId.startsWith('socialtypeadd_skip_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.customId.slice(19), 10);
         const w = await getWatch(guildId, id);
         if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
@@ -418,6 +411,7 @@ client.on('interactionCreate', async interaction => {
 
     // ── Select: notification types (post-add and manage flows) ──────────────
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtype_select_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.customId.slice(18), 10);
         const w = await getWatch(guildId, id);
         if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
@@ -430,6 +424,7 @@ client.on('interactionCreate', async interaction => {
 
     // ── Button: skip type selector (all types) ───────────────────────────────
     if (interaction.isButton() && interaction.customId.startsWith('socialtype_skip_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.customId.slice(16), 10);
         const w = await getWatch(guildId, id);
         if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
@@ -503,6 +498,7 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.customId.slice(21), 10);
         const channelId = interaction.values[0];
+        if (!await getWatch(guildId, id)) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
         await updateWatchChannel(guildId, id, channelId);
         const w = await getWatch(guildId, id);
         const { embeds, components } = buildManageView(w);
@@ -514,6 +510,7 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.customId.slice(18), 10);
         const roleId = interaction.values[0];
+        if (!await getWatch(guildId, id)) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
         await updateWatchRole(guildId, id, roleId);
         const w = await getWatch(guildId, id);
         const { embeds, components } = buildManageView(w);
@@ -524,6 +521,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isButton() && interaction.customId.startsWith('socialrole_clear_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.customId.slice(17), 10);
+        if (!await getWatch(guildId, id)) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
         await updateWatchRole(guildId, id, null);
         const w = await getWatch(guildId, id);
         const { embeds, components } = buildManageView(w);

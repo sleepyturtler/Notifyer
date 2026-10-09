@@ -1,3 +1,4 @@
+
 // The interactionCreate handler: every slash command, button, select menu and modal.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
@@ -246,6 +247,14 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ── Select: open manage view for a watch ────────────────────────────────
+    // "Manage <handle>" button on a delivery-failure report: opens that watch's manage view privately
+    // (ephemeral), so the admin can change the channel without the report message being replaced.
+    if (interaction.isButton() && interaction.customId.startsWith('deliveryfail_manage_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const w = await getWatch(guildId, parseInt(interaction.customId.slice(20), 10));
+        if (!w) return interaction.reply({ content: '❌ Watch not found (it may have been removed).', flags: [MessageFlags.Ephemeral] });
+        return interaction.reply({ ...buildManageView(w), flags: [MessageFlags.Ephemeral] });
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallist_manage_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.values[0], 10);

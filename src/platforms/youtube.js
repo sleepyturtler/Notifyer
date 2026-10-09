@@ -113,3 +113,5 @@ async function classifyYouTubeVideos(videoIds) {
     }
     return result;
 }
+
+module.exports = { classifyYouTubeVideos, fetchLatestYouTubeEntries };

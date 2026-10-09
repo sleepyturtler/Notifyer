@@ -1,11 +1,11 @@
 // Discord client ready + guildCreate handlers (command registration, poll loops start).
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
-const { ActivityType, SlashCommandBuilder, ChannelType } = require('discord.js');
+const { ActivityType, ChannelType, Events, SlashCommandBuilder } = require('discord.js');
 const { client } = require('./client.js');
 const { pollAll } = require('./poller.js');
 const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS } = require('./config.js');
-const { announceLegacyMigrationGuilds, announceSupportServer, announceTwitterRestoredGuilds } = require('./announcements.js');
+const { announceSupportServer, announceTwitterRestoredGuilds } = require('./announcements.js');
 const { getConfig, saveConfig } = require('./db.js');
 const fs = require('fs');
 const path = require('path');
@@ -15,7 +15,9 @@ const path = require('path');
 const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
-client.once('clientReady', async () => {
+// Events.ClientReady is 'ready' on older discord.js 14.x and 'clientReady' on newer ones; using the
+// enum means the handler fires on either (a hardcoded name never fires on the other).
+client.once(Events.ClientReady, async () => {
     console.log(`✅ Social notify bot online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Refreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
     const socialCommand = new SlashCommandBuilder().setName('social').setDescription('Manage social media notifications')
@@ -53,9 +55,10 @@ client.once('clientReady', async () => {
         try {
             const cfg = await getConfig(guild.id);
             if (cfg.supportAnnounced) continue;
-            await announceSupportServer(guild);
-            cfg.supportAnnounced = true;
-            saveConfig(guild.id, cfg);
+            if (await announceSupportServer(guild)) { // only mark it done if it was actually sent
+                cfg.supportAnnounced = true;
+                saveConfig(guild.id, cfg);
+            }
         } catch (e) {
             console.error(`support announce (${guild.id}):`, e.message);
         }
@@ -64,17 +67,16 @@ client.once('clientReady', async () => {
 
     // One-time update to servers with Twitter watches that it's fully back.
     await announceTwitterRestoredGuilds();
-    // One-time heads-up to servers still on the legacy message format about the October migration.
-    await announceLegacyMigrationGuilds();
 });
 
 client.on('guildCreate', async (guild) => {
     try {
         const cfg = await getConfig(guild.id);
         if (cfg.supportAnnounced) return;
-        await announceSupportServer(guild);
-        cfg.supportAnnounced = true;
-        saveConfig(guild.id, cfg);
+        if (await announceSupportServer(guild)) {
+            cfg.supportAnnounced = true;
+            saveConfig(guild.id, cfg);
+        }
     } catch (e) {
         console.error(`guildCreate announce (${guild.id}):`, e.message);
     }

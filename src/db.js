@@ -4,11 +4,16 @@
 const { Pool } = require('pg');
 const { URL } = require('url');
 const dns = require('dns');
-const { PLATFORM_NOTIFY_TYPES, SEEN_HISTORY_SIZE } = require('./config.js');
+const { SEEN_HISTORY_SIZE } = require('./config.js');
 
 let pool; // created in initDB() after resolving the DB host to IPv4
 
-pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+// TLS to Postgres is encrypted but, by default, the server certificate is NOT verified
+// (many managed databases, Render's included, present certificates a default CA bundle can't
+// validate). Set DATABASE_SSL_VERIFY=true to enforce verification when your provider supports it.
+const dbSsl = (extra = {}) => ({ rejectUnauthorized: process.env.DATABASE_SSL_VERIFY === 'true', ...extra });
+
+pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: dbSsl() });
 
 pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
 
@@ -29,7 +34,7 @@ async function ensureIPv4Pool() {
             await pool.end().catch(() => {});
             pool = new Pool({
                 connectionString: url.toString(),
-                ssl: { rejectUnauthorized: false, servername: original }, // keep SNI/cert check against original hostname
+                ssl: dbSsl({ servername: original }), // keep SNI (and the cert check, when enabled) against the original hostname
             });
             pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
             console.log(`🔧 Using IPv4 address ${address} for Postgres host ${original}`);
@@ -63,7 +68,6 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS notify_types JSONB;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS message_templates JSONB;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS social_link_id INTEGER;
-        ALTER TABLE watches ADD COLUMN IF NOT EXISTS legacy_migrated BOOLEAN NOT NULL DEFAULT FALSE;
         -- Tracks the Discord message ID of an active "went live" notification, so it can be
         -- edited to "was live" once the stream ends. NULL when nothing is currently live.
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS live_message_id TEXT;
@@ -88,6 +92,7 @@ async function initDB() {
             channel_id TEXT PRIMARY KEY,
             expires_at BIGINT NOT NULL
         );
+        ALTER TABLE youtube_subscriptions ADD COLUMN IF NOT EXISTS signed BOOLEAN NOT NULL DEFAULT FALSE;
         CREATE TABLE IF NOT EXISTS social_links (
             id SERIAL PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -109,31 +114,6 @@ async function initDB() {
         SET seen_post_ids = jsonb_build_array(last_post_id)
         WHERE last_post_id IS NOT NULL AND seen_post_ids = '[]'::jsonb
     `);
-    await migrateLegacyMessages();
-}
-
-// One-time (idempotent) migration: any watch still using the old single
-// message_template (from the removed /social add "message" option) gets that
-// same text copied into every post type under message_templates, so nothing
-// silently stops sending a message once the old field is phased out. Flagged
-// as legacy_migrated so the manage view can warn it hasn't been reviewed —
-// the wording was written for one generic message and may not fit every type.
-async function migrateLegacyMessages() {
-    const res = await pool.query(`
-        SELECT * FROM watches
-        WHERE message_template IS NOT NULL
-        AND (message_templates IS NULL OR message_templates = '{}'::jsonb)
-    `);
-    let migrated = 0;
-    for (const w of res.rows) {
-        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-        if (types.length <= 1) continue; // single-type platforms have nothing meaningful to split into
-        const templates = {};
-        for (const t of types) templates[t.id] = w.message_template;
-        await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = TRUE WHERE id = $2', [JSON.stringify(templates), w.id]);
-        migrated++;
-    }
-    if (migrated) console.log(`🔄 Auto-migrated ${migrated} legacy single-message watch(es) to per-type messages.`);
 }
 
 const configCache = new Map();
@@ -185,10 +165,6 @@ async function removeWatch(guildId, id) {
     return res.rowCount > 0;
 }
 
-async function updateWatchTemplate(guildId, id, template) {
-    await pool.query('UPDATE watches SET message_template = $1 WHERE guild_id = $2 AND id = $3', [template, guildId, id]);
-}
-
 async function updateWatchBatchHeader(guildId, id, template) {
     await pool.query('UPDATE watches SET batch_header_template = $1 WHERE guild_id = $2 AND id = $3', [template, guildId, id]);
 }
@@ -210,8 +186,7 @@ async function updateWatchNotifyTypes(guildId, id, types) {
 }
 
 async function updateWatchMessageTemplates(guildId, id, templatesObj) {
-    // Saving explicitly counts as "reviewed" — clear the outdated/legacy warning.
-    await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = FALSE WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
+    await pool.query('UPDATE watches SET message_templates = $1 WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
 }
 
 async function setWatchLiveMessage(id, messageId) {
@@ -238,7 +213,9 @@ async function getYouTubeSubscription(channelId) {
 
 async function upsertYouTubeSubscription(channelId, expiresAt) {
     await pool.query(
-        'INSERT INTO youtube_subscriptions (channel_id, expires_at) VALUES ($1, $2) ON CONFLICT (channel_id) DO UPDATE SET expires_at = $2',
+        // signed = subscribed with a hub.secret, so pushes can be HMAC-verified. Rows from before
+        // that default to FALSE and get re-subscribed (with a secret) on the next poll.
+        'INSERT INTO youtube_subscriptions (channel_id, expires_at, signed) VALUES ($1, $2, TRUE) ON CONFLICT (channel_id) DO UPDATE SET expires_at = $2, signed = TRUE',
         [channelId, expiresAt]
     );
 }
@@ -309,4 +286,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchTemplate, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

@@ -16,9 +16,12 @@ const { fetchLatestPost } = require('./platforms/index.js');
 const PLATFORM_MIN_INTERVAL_MS = {};
 
 // pollInProgress is keyed per call-site (fast loop / slow loop / manual /social
-// check) so the two cadences never block on each other — they touch disjoint
-// platform sets anyway, so there's no risk of double-processing the same watch.
+// check) so the two cadences never block on each other. The fast and slow loops touch
+// disjoint platform sets, but a manual /social check covers every platform, so it can
+// overlap either loop: watchesInFlight makes sure one watch is never processed by two
+// passes at once (both would read the same "seen" list and send the same post twice).
 const pollInProgress = {};
+const watchesInFlight = new Set();
 
 // ── Nitter mirror health tracking ───────────────────────────────────────────
 // Twitter/X has no official free API, so tracking depends entirely on public
@@ -86,6 +89,8 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             if (PLATFORMS[w.platform]?.unavailable) continue;
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
             if (minInterval && w.last_checked && (Date.now() - w.last_checked) < minInterval) continue;
+            if (watchesInFlight.has(w.id)) continue; // another pass is already handling this watch
+            watchesInFlight.add(w.id);
             try {
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
@@ -120,9 +125,18 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         }
                     }
 
-                    if (newEntries.length) {
+                    // Scheduled streams/premieres aren't live yet: leave them unseen so they're picked
+                    // up again (and notify) once they actually start, instead of announcing a
+                    // "new video" now and then never announcing the live start.
+                    const ready = newEntries.filter(e => !classified[e.id]?.isUpcoming);
+                    if (ready.length) {
+                        // Record what's about to be sent BEFORE sending (same order as the WebSub and
+                        // Twitter paths): if a send throws mid-loop, already-sent entries are not re-sent
+                        // on every following poll.
+                        const mergedSeen = [...new Set([...ready.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
+                        await updateLastPost(w.id, entries[0].id, mergedSeen, true);
                         // Chronological (oldest-first) so a batch reads/sends in upload order
-                        const chronological = [...newEntries].reverse();
+                        const chronological = [...ready].reverse();
                         for (const entry of chronological) {
                             const c = classified[entry.id];
                             entry.postType = c?.postType || 'videos';
@@ -138,8 +152,6 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                             if (sent) { await setWatchLiveMessage(w.id, sent.id); await setWatchYouTubeLiveVideo(w.id, entry.id); }
                         }
                         for (const entry of toNotify.filter(e => !e.isLive)) await sendOrExtendBatch(w, entry);
-                        const mergedSeen = [...new Set([...newEntries.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-                        await updateLastPost(w.id, entries[0].id, mergedSeen, true);
                     } else {
                         await touchLastChecked(w.id);
                     }
@@ -181,10 +193,13 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     for (const post of posts) {
                         if (w.last_post_id === null) continue; // first check — skip all
                         if (newSeenIds.includes(post.id)) continue;
-                        newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, 20);
+                        newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, SEEN_HISTORY_SIZE);
                         updated = true;
                         if (shouldNotify(w, post)) toNotify.push(post);
                     }
+                    // Record the new IDs before sending, so a throw mid-send can't cause the
+                    // already-sent ones to be re-sent every following cycle.
+                    if (w.last_post_id !== null && updated) await updateLastPost(w.id, newSeenIds[0], newSeenIds, true);
                     // Live posts keep their own message-edit tracking (see markStreamOffline
                     // below) and always send individually — batching only applies to regular
                     // posts/VODs, never to "went live" events.
@@ -201,9 +216,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     if (w.last_post_id === null && posts.length) {
                         // Seed baseline from first check
                         await updateLastPost(w.id, posts[0].id, posts.map(p => p.id));
-                    } else if (updated) {
-                        await updateLastPost(w.id, newSeenIds[0], newSeenIds, true);
-                    } else {
+                    } else if (!updated) {
                         await touchLastChecked(w.id);
                     }
                 } else {
@@ -229,6 +242,8 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     await handleAllNittersDown(e.message).catch(() => {});
                 }
                 await touchLastChecked(w.id, e.message).catch(() => {});
+            } finally {
+                watchesInFlight.delete(w.id);
             }
             // Stagger with jitter to avoid hammering platforms all at once
             const jitter = 1000 + Math.random() * 1000;

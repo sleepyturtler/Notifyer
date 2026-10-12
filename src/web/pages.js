@@ -26,7 +26,7 @@ function legalPage(title, bodyHtml) {
 </head><body><div class="brand"><img src="${NOTIFYER_LOGO_URI}" alt="Notifyer logo"><span>Notifyer</span></div>${bodyHtml}</body></html>`;
 }
 
-const LEGAL_LAST_UPDATED = 'August 29, 2026';
+const LEGAL_LAST_UPDATED = 'October 12, 2026';
 
 const LEGAL_CONTACT = process.env.LEGAL_CONTACT_EMAIL || process.env.BOT_OWNER_DISCORD_TAG || 'the bot owner via the support server';
 
@@ -37,6 +37,9 @@ const TERMS_HTML = legalPage('Terms of Service', `
 
 <h2>What the Bot does</h2>
 <p>The Bot watches accounts you configure on YouTube, Twitter/X, Twitch, Instagram, and TikTok, and posts a notification in a Discord channel you choose when those accounts publish new content. For Instagram and TikTok, this only works for accounts that have explicitly authorized the Bot via OAuth (<code>/social link</code>) — the Bot cannot and does not access those platforms' accounts without their consent.</p>
+
+<h2>YouTube API Services</h2>
+<p>The Bot uses YouTube API Services to detect new videos, Shorts, and live streams on the YouTube channels you choose to track. By using the Bot, you agree to be bound by the <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>.</p>
 
 <h2>Acceptable use</h2>
 <ul>
@@ -84,6 +87,14 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 
 <h2>Third-party services</h2>
 <p>The Bot communicates with Discord's API, and — where you've configured it — YouTube, Twitter/X, Twitch, Meta's Instagram Graph API, and TikTok's API. Each of those platforms has its own privacy policy governing data you share with them directly.</p>
+
+<h2>YouTube API Services</h2>
+<p>The Bot uses YouTube API Services to check the YouTube channels you choose to track for new videos, Shorts, and live streams. Use of YouTube API Services through the Bot is subject to the <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>, and Google's handling of data is described in the <a href="http://www.google.com/policies/privacy">Google Privacy Policy</a>.</p>
+<ul>
+<li><b>Only public data.</b> The Bot reads public YouTube information (channel identifiers, public upload listings, and public video details such as the title, thumbnail, and whether a video is live) using an API key. It does not request access to, and never receives, any Google or YouTube account data, login credentials, or private content.</li>
+<li><b>What is stored.</b> For each tracked channel the Bot stores the channel ID, the ID of the channel's public uploads list, the IDs of videos it has already announced, and the ID of any live stream it is currently tracking. Video titles, thumbnails, and descriptions are not stored by the Bot; they are used only to compose the notification, which is then posted to the Discord channel you chose, where Discord's own policies apply.</li>
+<li><b>Access and deletion.</b> Because the Bot never asks for access to a Google account, there is no Google account permission to revoke (you can review any application's access to your Google account at <a href="https://security.google.com/settings/security/permissions">security.google.com/settings/security/permissions</a>). To stop the Bot from processing a YouTube channel and delete the data described above, remove the watch with <code>/social list</code> → Remove, which deletes it immediately, or contact us to request deletion of everything tied to your server.</li>
+</ul>
 
 <h2>Security</h2>
 <p>OAuth tokens are stored in a private database and are not exposed through any Bot command or public endpoint. No storage method is 100% secure, but we take reasonable steps to protect stored data.</p>

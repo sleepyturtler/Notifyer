@@ -7,6 +7,7 @@ const { pollAll } = require('./poller.js');
 const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS } = require('./config.js');
 const { announceSupportServer, announceTwitterRestoredGuilds } = require('./announcements.js');
 const { getConfig, saveConfig } = require('./db.js');
+const { purgeGuild, purgeOrphanedGuilds } = require('./guildCleanup.js');
 const fs = require('fs');
 const path = require('path');
 // Beta-only owner/debug commands (see debugTools.js) — present only on builds that
@@ -44,6 +45,10 @@ client.once(Events.ClientReady, async () => {
     if (debugTools) debugTools.extendCommands(socialCommand, commands);
     await client.application.commands.set(commands).catch(e => console.error('command registration:', e));
 
+    // Drop data for servers the bot is no longer in (left while offline, or from before this existed)
+    // before polling starts, so they aren't polled for nothing. Guarded; see guildCleanup.js.
+    await purgeOrphanedGuilds().catch(e => console.error('orphan sweep:', e.message));
+
     // Start polling — two independent cadences, see FAST/SLOW_POLL_* above.
     pollAll(FAST_POLL_PLATFORMS).catch(e => console.error('initial fast poll:', e.message));
     pollAll(SLOW_POLL_PLATFORMS).catch(e => console.error('initial slow poll:', e.message));
@@ -67,6 +72,13 @@ client.once(Events.ClientReady, async () => {
 
     // One-time update to servers with Twitter watches that it's fully back.
     await announceTwitterRestoredGuilds();
+});
+
+// The bot was removed from a server (kicked, left, or the server was deleted): delete what we stored for
+// it. discord.js reports a temporary outage as a separate event, but guard against an unavailable guild anyway.
+client.on(Events.GuildDelete, guild => {
+    if (guild.available === false) return;
+    purgeGuild(guild.id, 'the bot was removed from the server');
 });
 
 client.on('guildCreate', async (guild) => {

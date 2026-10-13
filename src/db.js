@@ -268,6 +268,34 @@ async function deleteSocialLink(guildId, id) {
     return res.rowCount > 0;
 }
 
+// Every guild ID that has anything stored (watches, linked accounts or settings).
+async function getStoredGuildIds() {
+    const res = await pool.query('SELECT guild_id FROM watches UNION SELECT guild_id FROM social_links UNION SELECT guild_id FROM configs');
+    return res.rows.map(r => r.guild_id);
+}
+
+// Deletes everything stored for a guild in one transaction (all or nothing). The deleted linked
+// accounts are returned so the caller can revoke their tokens. YouTube push subscriptions for
+// channels nobody watches any more are dropped too.
+async function deleteGuildData(guildId) {
+    const conn = await pool.connect();
+    try {
+        await conn.query('BEGIN');
+        const links = (await conn.query('DELETE FROM social_links WHERE guild_id = $1 RETURNING *', [guildId])).rows;
+        const watches = (await conn.query('DELETE FROM watches WHERE guild_id = $1', [guildId])).rowCount;
+        await conn.query('DELETE FROM configs WHERE guild_id = $1', [guildId]);
+        await conn.query('DELETE FROM youtube_subscriptions WHERE channel_id NOT IN (SELECT youtube_channel_id FROM watches WHERE youtube_channel_id IS NOT NULL)');
+        await conn.query('COMMIT');
+        configCache.delete(guildId);
+        return { watches, links };
+    } catch (e) {
+        await conn.query('ROLLBACK').catch(() => {});
+        throw e;
+    } finally {
+        conn.release();
+    }
+}
+
 async function getWatch(guildId, id) {
     const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
     return res.rows[0] || null;
@@ -286,4 +314,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getStoredGuildIds, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

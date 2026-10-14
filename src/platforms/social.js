@@ -9,9 +9,27 @@ const { OAUTH_CONFIG } = require('../config.js');
 // Refreshes a stored social_links row's access token if it's near expiry.
 // Returns the (possibly updated) row, or throws if refresh fails — callers
 // should treat a throw as "the link is dead, tell the person to /social link again".
+// TikTok access tokens live exactly 24h, so the margin has to be much shorter than that: with a 24h
+// margin every token was always "about to expire" and was refreshed on EVERY poll (~720 times a day).
+// Refreshing in the last hour means about once a day. Instagram's tokens last ~60 days, so 24h is fine there.
+const REFRESH_MARGIN_MS = { instagram: 24 * 60 * 60 * 1000, tiktok: 60 * 60 * 1000 };
+
+// TikTok reports problems as { error, error_description } (sometimes { error: { code, message } }).
+// 429 and 5xx are TikTok's side and clear up by themselves; other 4xx mean the token was rejected, and
+// only then does re-linking help. The old code threw one generic "re-link" message for every failure.
+function tiktokRefreshError(status, json) {
+    const e = json?.error;
+    const code = typeof e === 'string' ? e : e?.code;
+    const desc = json?.error_description || (typeof e === 'object' ? e?.message : null);
+    const detail = [status ? `HTTP ${status}` : null, code, desc].filter(Boolean).join(' ').replace(/\s+/g, ' ').slice(0, 200);
+    if (status === 429 || status >= 500) return new Error(`TikTok is temporarily unavailable (${detail}); will retry.`);
+    if (status >= 400) return new Error(`TikTok rejected the token refresh (${detail}). Re-link with /social link.`);
+    return new Error(`TikTok sent an unexpected refresh response (${detail}). If this keeps happening, re-link with /social link.`);
+}
+
 async function ensureFreshToken(link) {
-    const REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000; // refresh if <24h left
-    if (!link.expires_at || link.expires_at - Date.now() > REFRESH_MARGIN_MS) return link;
+    const margin = REFRESH_MARGIN_MS[link.platform] ?? REFRESH_MARGIN_MS.instagram;
+    if (!link.expires_at || link.expires_at - Date.now() > margin) return link;
 
     if (link.platform === 'instagram') {
         // Instagram User tokens (Instagram Login flow) refresh via graph.instagram.com directly —
@@ -28,11 +46,17 @@ async function ensureFreshToken(link) {
     if (link.platform === 'tiktok') {
         const cfg = OAUTH_CONFIG.tiktok;
         if (!link.refresh_token) throw new Error('TikTok refresh token missing — re-link with /social link.');
-        const { json } = await postForm('https://open.tiktokapis.com/v2/oauth/token/', {
-            client_key: cfg.clientId, client_secret: cfg.clientSecret,
-            grant_type: 'refresh_token', refresh_token: link.refresh_token,
-        });
-        if (!json?.access_token) throw new Error('TikTok token refresh failed — re-link with /social link.');
+        let res;
+        try {
+            res = await postForm('https://open.tiktokapis.com/v2/oauth/token/', {
+                client_key: cfg.clientId, client_secret: cfg.clientSecret,
+                grant_type: 'refresh_token', refresh_token: link.refresh_token,
+            });
+        } catch (e) {
+            throw new Error(`TikTok is temporarily unreachable (${e.message}); will retry.`); // network error/timeout: not the token's fault
+        }
+        const { status, json } = res;
+        if (!json?.access_token) throw tiktokRefreshError(status, json);
         const expiresAt = Date.now() + (json.expires_in ? json.expires_in * 1000 : 24 * 60 * 60 * 1000);
         await updateSocialLinkTokens(link.id, json.access_token, json.refresh_token || link.refresh_token, expiresAt);
         return { ...link, access_token: json.access_token, refresh_token: json.refresh_token || link.refresh_token, expires_at: expiresAt };

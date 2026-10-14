@@ -1,4 +1,3 @@
-
 // The interactionCreate handler: every slash command, button, select menu and modal.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
@@ -6,8 +5,8 @@ const { MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFl
 const { client } = require('./client.js');
 const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, isOwner } = require('./config.js');
 const { E, canWatchBatch } = require('./helpers.js');
-const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupIntroEmbed, buildSetupIntroRow, buildSetupReturningEmbed, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
-const { deleteSocialLink, getConfig, getSocialLinkById, getWatch, getWatches, removeWatch, saveConfig, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
+const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
+const { deleteSocialLink, getConfig, getSocialLinkById, getWatch, getWatches, removeWatch, saveConfig, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
 const { hasCommandPermission } = require('./permissions.js');
 const { buildAddWatchSuccessResponse, createWatchFlow } = require('./watchFlow.js');
 const { pollAll } = require('./poller.js');
@@ -63,8 +62,7 @@ client.on('interactionCreate', async interaction => {
 
         if (commandName === 'setup') {
             const watches = await getWatches(guildId);
-            const embed = watches.length ? buildSetupReturningEmbed(watches.length) : buildSetupIntroEmbed();
-            return reply({ embeds: [embed], components: [buildSetupIntroRow()], flags: [MessageFlags.Ephemeral] });
+            return reply({ ...buildSetupView(watches.length ? 'track' : 'welcome', watches.length), flags: [MessageFlags.Ephemeral] });
         }
 
         if (commandName === 'social') {
@@ -312,6 +310,12 @@ client.on('interactionCreate', async interaction => {
             return interaction.showModal(buildBatchHeaderModal(w));
         }
 
+        if (action === 'togglebatch') {
+            await updateWatchBatchDisabled(guildId, id, !w.batch_disabled);
+            const { embeds, components } = buildManageView(await getWatch(guildId, id));
+            return interaction.update({ embeds, components });
+        }
+
         if (action === 'channel') {
             return interaction.update({
                 embeds: [E('#5865F2', `Change Channel — ${w.handle}`).setDescription('Select the new channel for this watch\'s notifications.')],
@@ -445,6 +449,17 @@ client.on('interactionCreate', async interaction => {
 
     // ── Select: change channel ───────────────────────────────────────────────
     // ── /setup wizard ─────────────────────────────────────────────────────
+    // /setup tour: tab navigation (informational, so no permission check; the add button checks its own)
+    if (interaction.isButton() && interaction.customId.startsWith('setup_tab_')) {
+        const watches = await getWatches(guildId);
+        return interaction.update(buildSetupView(interaction.customId.slice(10), watches.length));
+    }
+    // "Show me a sample": renders a fake notification with the real builder. Nothing is posted or saved.
+    if (interaction.isButton() && interaction.customId === 'setup_sample') {
+        const demo = { id: 0, guild_id: guildId, platform: 'youtube', handle: '@yourfavoritecreator', channel_id: '0', role_id: null, message_template: null, message_templates: {}, notify_types: null };
+        const payload = buildNotificationPayload(demo, buildSamplePost(demo, 'videos'));
+        return interaction.reply({ content: `Sample notification (nothing was posted):\n${payload.content || ''}`.slice(0, 2000), embeds: payload.embeds, components: payload.components, flags: [MessageFlags.Ephemeral] });
+    }
     if (interaction.isButton() && interaction.customId === 'setup_start') {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const ownerHere = isOwner(interaction.user.id);

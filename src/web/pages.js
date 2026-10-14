@@ -135,7 +135,7 @@ ${statusLine}
 <h2>Get started</h2>
 <p>
 <a href="https://top.gg/bot/1515779889737896006">Add Notifyer to your server</a> &nbsp;·&nbsp;
-<a href="https://github.com/DaniBottoni/Notifyer/tree/main">Source on GitHub</a>
+<a href="https://github.com/sleepyturtler/Notifyer">Source on GitHub</a>
 </p>
 
 <h2>Legal</h2>

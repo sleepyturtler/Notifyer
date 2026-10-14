@@ -174,6 +174,8 @@ setInterval(() => {
 const MAX_BATCH_ENTRIES_PER_MESSAGE = 8;
 
 async function sendOrExtendBatch(w, post) {
+    // Batching switched off for this watch: always its own message, and it neither starts nor joins a window.
+    if (w.batch_disabled) return sendNotification(w, post);
     const cfg = await getConfig(w.guild_id);
     // Cross-channel mode keys purely by guild+platform instead of channel+platform,
     // so watches in different channels can share one batch. Same-channel (default)
@@ -236,8 +238,11 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
             // default threshold of 2 there's nothing to delete — this edits the first
             // message in place exactly like before thresholds existed.
             for (let i = 1; i < state.entries.length - 1; i++) {
-                const id = state.entries[i].standaloneMessageId;
-                if (id) await channel.messages.delete(id).catch(() => {});
+                const e = state.entries[i];
+                if (!e.standaloneMessageId) continue;
+                // Each standalone message lives in ITS OWN watch's channel (they differ in cross-channel mode).
+                const { channel: own } = resolveWatchChannel(e.w);
+                if (own) await own.messages.delete(e.standaloneMessageId).catch(() => {});
             }
             try {
                 const msg = await channel.messages.fetch(state.entries[0].standaloneMessageId);

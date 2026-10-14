@@ -1,11 +1,12 @@
 {
   "name": "Notifyer",
-  "version": "1.5.1",
+  "version": "2.0",
   "license": "MIT",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "setup": "node setup.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",

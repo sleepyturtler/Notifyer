@@ -1,0 +1,53 @@
+// Deleting a server's data when the bot is no longer in it.
+//
+// Two triggers: the bot being removed (guildDelete), and a startup sweep for servers the bot left
+// while it was offline (and for any data left behind before this existed). Both end up in
+// purgeGuild(). The sweep has safeguards because deleting is not reversible: it only runs when the
+// guild list looks complete, and it refuses to bulk-delete if a large share of stored servers
+// appear to be missing, which points to a Discord/connection problem rather than real removals.
+
+const { client } = require('./client.js');
+const { deleteGuildData, getStoredGuildIds } = require('./db.js');
+const { revokeTikTokToken } = require('./platforms/social.js');
+
+// Never throws. Returns what was removed, or null if the deletion itself failed.
+async function purgeGuild(guildId, why) {
+    let result;
+    try {
+        result = await deleteGuildData(guildId);
+    } catch (e) {
+        console.error(`purgeGuild (${guildId}): deletion failed, nothing was removed:`, e.message);
+        return null;
+    }
+    // Best effort: tell TikTok to drop the tokens so the bot disappears from the owner's "Manage app
+    // permissions" page. (Meta has no app-side revoke for Instagram; the account owner removes it there.)
+    let revoked = 0;
+    for (const link of result.links) {
+        if (link.platform !== 'tiktok') continue;
+        const r = await revokeTikTokToken(link).catch(e => ({ ok: false, reason: e.message }));
+        if (r.ok) revoked++;
+    }
+    console.log(`🧹 Removed all stored data for guild ${guildId} (${why}): ${result.watches} watch(es), ${result.links.length} linked account(s), ${revoked} TikTok token(s) revoked`);
+    return result;
+}
+
+// Removes data for servers that are stored but no longer in the bot's guild list.
+async function purgeOrphanedGuilds() {
+    const guilds = client.guilds.cache;
+    if (guilds.size === 0) { console.log('🧹 Orphan sweep skipped: the bot reports no servers (not trusting an empty guild list).'); return; }
+    if ([...guilds.values()].some(g => g.available === false)) { console.log('🧹 Orphan sweep skipped: some servers are unavailable (Discord outage?). It will run on a later start.'); return; }
+
+    const stored = await getStoredGuildIds();
+    const orphans = stored.filter(id => !guilds.has(id));
+    if (!orphans.length) return;
+
+    const limit = Math.max(5, Math.floor(stored.length * 0.25));
+    if (orphans.length > limit && process.env.ALLOW_BULK_ORPHAN_PURGE !== 'true') {
+        console.warn(`⚠️ Orphan sweep REFUSED: ${orphans.length} of ${stored.length} stored servers are not in the bot's server list, more than the safe limit of ${limit}. `
+            + 'That looks like a connection/Discord problem, not real removals, so nothing was deleted. If these really are servers the bot left, set ALLOW_BULK_ORPHAN_PURGE=true and restart once.');
+        return;
+    }
+    for (const id of orphans) await purgeGuild(id, 'the bot is no longer in this server');
+}
+
+module.exports = { purgeGuild, purgeOrphanedGuilds };

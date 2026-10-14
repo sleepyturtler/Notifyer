@@ -1,4 +1,4 @@
-Get fast and free notifications from your favourite creators across YouTube, Twitch and Kick with Notifyer.
+Get fast and free notifications from you favourite creators across YouTube, Twitter/X, Twitch and Kick with Notifyer.
 
 # Commands
 ## Social:
@@ -13,4 +13,4 @@ Get fast and free notifications from your favourite creators across YouTube, Twi
 ## Other:
 - **/help:** Shows all commands and other useful info.
 - **/invite:** Creates an invite with all the right permissions.
-- **/setup:** Onboarding command to learn about the bot.
+- **/setup:** Introduces you to the bot and helps you set up your first watch.

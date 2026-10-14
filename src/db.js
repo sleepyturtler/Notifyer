@@ -74,6 +74,7 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_post_at BIGINT;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS last_error TEXT;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS batch_header_template TEXT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS batch_disabled BOOLEAN NOT NULL DEFAULT FALSE;
         -- YouTube Data API migration: cache the resolved channel + uploads-playlist ID
         -- per watch so a handle is only ever resolved once (saves API quota and avoids
         -- re-doing the one fragile lookup step on every poll).
@@ -163,6 +164,11 @@ async function addWatch({ guildId, platform, handle, channelId, messageTemplate,
 async function removeWatch(guildId, id) {
     const res = await pool.query('DELETE FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
     return res.rowCount > 0;
+}
+
+// Per-watch switch: when true, this watch's posts always send on their own and never join a batch.
+async function updateWatchBatchDisabled(guildId, id, disabled) {
+    await pool.query('UPDATE watches SET batch_disabled = $1 WHERE guild_id = $2 AND id = $3', [!!disabled, guildId, id]);
 }
 
 async function updateWatchBatchHeader(guildId, id, template) {
@@ -314,4 +320,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getStoredGuildIds, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getStoredGuildIds, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

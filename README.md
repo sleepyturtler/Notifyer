@@ -1,13 +1,14 @@
-Get fast and free notifications from you favourite creators across YouTube, Tiktok, Twitter/X, Twitch and Kick with Notifyer.
+Get fast and free notifications from you favourite creators across YouTube, Twitter/X, Twitch and Kick with Notifyer.
 
 # Commands
-## Setup:
+## Social:
 - **/social access:** Set who can access the setup commands.
 - **/social add:** Track a new account,
 - **/social list:** Lists all tracked accounts.
 - **/social check:** Manually checks if new posts are available.
-- **/social link:** Link a TikTok account, so it can be tracked by the bot.
-- **/social links:** View all linked accounts.
+- **/social link:** Link your Tiktok/Instagram account, so you can track it's posts.
+- **/social links:** View all OAuth linked accounts.
+- **/social preview:** Preview your settings for a watch, using placeholder content.
 
 ## Other:
 - **/help:** Shows all commands and other useful info.

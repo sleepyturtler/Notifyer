@@ -5,7 +5,7 @@ const { ButtonBuilder, ButtonStyle, EmbedBuilder, ActionRowBuilder, StringSelect
 const { getSocialLinks, getWatches } = require('./db.js');
 const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
-const { DEFAULT_TEMPLATE, PLACEHOLDER_HELP } = require('./notify.js');
+const { PLACEHOLDER_HELP } = require('./notify.js');
 const { canWatchBatch } = require('./helpers.js');
 const fs = require('fs');
 const path = require('path');
@@ -156,34 +156,43 @@ function buildBatchHeaderModal(w) {
         );
 }
 
+// One line per active notify type: that type's own message, else the watch's old single message, else "default".
+function describeMessages(w) {
+    const all = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+    const active = (Array.isArray(w.notify_types) && w.notify_types.length) ? all.filter(t => w.notify_types.includes(t.id)) : all;
+    const templates = w.message_templates || {};
+    return active.map(t => {
+        const text = String(templates[t.id] || w.message_template || '').replace(/\s+/g, ' ').replace(/`/g, "'").trim();
+        return `**${t.label}:** ${text ? `\`${text.slice(0, 60)}${text.length > 60 ? '…' : ''}\`` : 'default'}`;
+    }).join('\n') || 'default';
+}
+
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
-    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-    const templates = w.message_templates || {};
-    const perTypeLines = types.filter(t => templates[t.id]).map(t => `**${t.label}:** \`${templates[t.id].slice(0, 80)}\``);
     const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${w.handle}`).setTimestamp()
         .addFields(
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
             { name: 'Ping role', value: w.role_id ? `<@&${w.role_id}>` : 'None', inline: true },
-            { name: 'Notify types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : 'All types', inline: true },
-            { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
+            { name: 'Types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : 'All types', inline: true },
         );
-    if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
+    embed.addFields({ name: 'Messages', value: describeMessages(w) });
     embed.addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
     if (p.unavailable) {
-        embed.addFields({ name: '⚠️ Currently unavailable', value: `${p.label} isn't working right now — see \`/help\` → Info for why. Notifications won't fire until this is resolved, but everything here stays saved.` });
+        embed.addFields({ name: '⚠️ Unavailable', value: `${p.label} isn't working right now (see /help, Info). Your settings are kept.` });
     }
     // A watch can only ever contribute to a batch if at least one of its active
     // notify types isn't "live" — live events always send individually (see
     // pollAll), so a Kick watch (live-only) or a YouTube watch restricted to
     // just Live can never actually batch, regardless of platform.
-    const canBatch = canWatchBatch(w);
-    if (canBatch) embed.addFields({ name: 'Batch header', value: `${w.batch_header_template ? `\`${w.batch_header_template}\`` : `Default: \`${DEFAULT_BATCH_HEADER}\``}\n\`{author}\`/\`{handle}\`/\`{platform}\`/\`{count}\` work as usual; use \`{creators}\` instead of \`{author}\` if you want this header to also read well when more than one tracked account contributes to the same batch (e.g. "X and Y posted 5 times!").` });
+    const batchPossible = canWatchBatch(w); // this watch has at least one non-live type
+    const canBatch = batchPossible && !w.batch_disabled;
+    if (batchPossible && w.batch_disabled) embed.addFields({ name: 'Batching', value: 'Off for this watch. Its posts always send on their own.' });
+    else if (canBatch) embed.addFields({ name: 'Batching', value: `Header: \`${w.batch_header_template || DEFAULT_BATCH_HEADER}\` (use \`{creators}\` to list accounts)` });
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialpertype_open_${w.id}`).setLabel('Edit Messages').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`socialmanage_role_${w.id}`).setLabel('Set/Clear Ping Role').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`socialmanage_role_${w.id}`).setLabel('Ping Role').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary),
     );
     // Batch Settings is server-wide (min posts / cross-channel), so it is offered on every
@@ -191,6 +200,7 @@ function buildManageView(w) {
     const row1b = [new ActionRowBuilder().addComponents(
         ...(canBatch ? [new ButtonBuilder().setCustomId(`socialmanage_batchheader_${w.id}`).setLabel('Batch Header').setStyle(ButtonStyle.Secondary)] : []),
         new ButtonBuilder().setCustomId(`socialmanage_batchsettings_${w.id}`).setLabel('Batch Settings').setStyle(ButtonStyle.Secondary),
+        ...(batchPossible ? [new ButtonBuilder().setCustomId(`socialmanage_togglebatch_${w.id}`).setLabel(w.batch_disabled ? 'Batching: Off' : 'Batching: On').setStyle(w.batch_disabled ? ButtonStyle.Secondary : ButtonStyle.Success)] : []),
     )];
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
@@ -206,10 +216,10 @@ function buildBatchSettingsView(w, cfg) {
     const minPosts = cfg.batchMinThreshold || 2;
     const cross = !!cfg.batchCrossChannel;
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Batch Settings')
-        .setDescription('These apply to **every** watch in this server, not just this one.')
+        .setDescription('Applies to every watch in this server.')
         .addFields(
-            { name: 'Posts needed to combine', value: `\`${minPosts}\`: posts send individually until this many land within 10 minutes, then merge into one message.` },
-            { name: 'Batch across channels', value: cross ? '\u2705 On: the same platform merges across every channel in this server' : '\u274c Off: only merges within the same channel' },
+            { name: 'Posts needed to combine', value: `\`${minPosts}\` posts within 10 minutes merge into one message.` },
+            { name: 'Batch across channels', value: cross ? '✅ On: one batch can span every channel' : '❌ Off: batches stay within one channel' },
         );
     const options = [];
     for (let n = 2; n <= MAX_BATCH_ENTRIES_PER_MESSAGE; n++) options.push({ label: `${n} posts`, value: String(n), default: n === minPosts });
@@ -230,49 +240,49 @@ const HELP_CATEGORIES = [
     {
         id: 'general', emoji: '🏠', label: 'General',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — General`)
-            .setDescription('Get notified in a channel whenever a tracked account posts new content or goes live.')
+            .setDescription('Get a notification when a tracked account posts or goes live.')
             .addFields(
-                { name: '/setup', value: 'New here? A quick walkthrough of what this bot does, with a guided flow to add your first tracked account.' },
-                { name: '/help', value: 'Shows this menu.' },
-                { name: '/invite', value: 'Get a link to invite this bot to another server.' },
+                { name: '/setup', value: 'A short guided tour, then add your first account.' },
+                { name: '/help', value: 'This menu.' },
+                { name: '/invite', value: 'Invite the bot to another server.' },
             ),
     },
     {
         id: 'tracking', emoji: '📡', label: 'Tracking',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Tracking`)
             .addFields(
-                { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message. Instagram/TikTok accounts must be linked first (see the Linking tab).' },
-                { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
-                { name: '/social preview', value: 'See exactly what a notification will look like for a tracked account, one preview per notify type, without waiting for a real post.' },
-                { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
-                { name: '📦 Batched notifications', value: 'If a second new post lands in the same channel for the same platform within 10 minutes of the last one — whether from one account or several tracked accounts — the earlier message is turned into a combined one instead of pinging again: a header line, then a compact title+button per post. Each further post within 10 minutes of the last keeps extending the same message. Customize the header from a watch\'s manage view ("Batch Header"; "Batch Settings" there sets how many posts are needed and whether it merges across channels) — use `{creators}` instead of `{author}` if you want it to also read well with multiple accounts (e.g. "X and Y posted 5 times!"); otherwise a batch with more than one account falls back to that generic form automatically. "Went live" notifications are never batched.' },
+                { name: '/social add', value: 'Track an account: pick a platform, enter the handle or URL, choose a channel.' },
+                { name: '/social list', value: 'See everything you track. Pick one to edit, pause or remove it.' },
+                { name: '/social preview', value: 'Preview a notification without waiting for a post.' },
+                { name: '/social check', value: 'Check all accounts now.' },
+                { name: 'Batching', value: '2 or more posts in the same channel within 10 minutes merge into one message. Tune it under Manage, Batch Settings.' },
             ),
     },
     {
         id: 'linking', emoji: '🔗', label: 'Linking',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Linking`)
-            .setDescription('Instagram and TikTok only expose their APIs through per-account OAuth consent — an account has to explicitly authorize this bot before it can be tracked.')
+            .setDescription("Instagram and TikTok need the account owner's consent.")
             .addFields(
-                { name: '/social link', value: 'Connect an Instagram or TikTok account via OAuth so it can be tracked. Sends a link the account owner clicks and logs in with.' },
-                { name: '/social links', value: 'View accounts linked via OAuth in this server. Pick one from the dropdown to unlink it — revokes the token with TikTok directly; for Instagram it removes our local copy (the account owner can also pull access from Instagram\'s own settings).' },
+                { name: '/social link', value: 'Link an Instagram or TikTok account. The owner opens the link and approves.' },
+                { name: '/social links', value: 'See linked accounts. Pick one to unlink it.' },
             ),
     },
     {
         id: 'settings', emoji: '⚙️', label: 'Settings',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Settings`)
             .addFields(
-                { name: '/social access', value: 'Set which role (besides admins) can manage social notifications in this server.' },
+                { name: '/social access', value: 'Choose a role (besides admins) that can manage notifications.' },
             ),
     },
     {
         id: 'info', emoji: 'ℹ️', label: 'Info',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Info`)
             .addFields(
-                { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
-                { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`. For Live messages specifically, `{is/was}` renders as "is" when the stream starts and "was" once it ends — so one message works for both.' },
-                { name: 'Notes', value: 'TikTok, Instagram, Twitch, and Kick are checked about every 20 seconds; YouTube and Twitter are checked every 2 minutes — YouTube to conserve API quota (new uploads/live starts still arrive near-instantly via push notifications), Twitter because it relies on unofficial scraping and needs a gentler pace. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
+                { name: 'Platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') + '\n⚠️ = unavailable right now' },
+                { name: 'Placeholders', value: '`{author}` `{handle}` `{platform}` `{title}` `{url}`, plus `{is/was}` for Live.' },
+                { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. YouTube and Twitter: every 2 minutes (YouTube also pushes new uploads and streams instantly).' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
-                { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
+                { name: 'Links', value: `[GitHub](https://github.com/sleepyturtler/Notifyer) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),
     },
 ];
@@ -281,32 +291,67 @@ const HELP_CATEGORIES = [
 if (debugTools) HELP_CATEGORIES.push(debugTools.getExtraHelpCategory());
 
 // ── /setup wizard ────────────────────────────────────────────────────────
-function buildSetupIntroEmbed() {
-    return new EmbedBuilder().setColor('#5865F2').setTitle('👋 Welcome to Notifyer!')
-        .setDescription(
-            'This bot posts in a channel here whenever a tracked account uploads, posts, or goes live.\n\n' +
-            '**Supported platforms:** YouTube, Twitter/X, Twitch, Kick, Instagram, TikTok.\n\n' +
-            '**Key commands, once you\'re set up:**\n' +
-            '`/social add` — track another account\n' +
-            '`/social list` — see everything you\'re tracking, with a manage menu for each\n' +
-            '`/social preview` — see what a notification will look like before it fires\n' +
-            '`/help` — full command reference and troubleshooting\n\n' +
-            'Ready to add your first tracked account?'
-        );
-}
+// Tabs of the /setup tour. Every tab keeps the "Add account" button, which starts the unchanged
+// first-watch flow (setup_start -> platform -> handle -> channel -> types/messages/batch header).
+const SETUP_TABS = [
+    { id: 'welcome', label: 'Welcome' },
+    { id: 'track', label: 'Track' },
+    { id: 'customize', label: 'Customize' },
+    { id: 'batching', label: 'Batching' },
+    { id: 'admin', label: 'Admin' },
+];
 
-function buildSetupReturningEmbed(count) {
-    return new EmbedBuilder().setColor('#5865F2').setTitle('👋 Notifyer setup')
-        .setDescription(
-            `This server is already tracking **${count}** account${count > 1 ? 's' : ''}. Use \`/social list\` to manage them, or add another below.\n\n` +
-            '`/social add` — track a new account\n`/social preview` — see what a notification will look like\n`/help` — full command reference'
-        );
-}
-
-function buildSetupIntroRow() {
-    return new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('setup_start').setLabel('🚀 Add a tracked account').setStyle(ButtonStyle.Primary)
+function buildSetupView(tabId, watchCount = 0) {
+    const tab = SETUP_TABS.find(t => t.id === tabId) || SETUP_TABS[0];
+    const oauthAvailable = ['instagram', 'tiktok'].some(k => PLATFORMS[k] && !PLATFORMS[k].unavailable);
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle(`Notifyer setup: ${tab.label}`);
+    const n = watchCount;
+    switch (tab.id) {
+        case 'welcome':
+            embed.setDescription(
+                'Notifyer posts in a channel when an account you track uploads, posts or goes live.\n\n' +
+                `**Platforms:** ${Object.values(PLATFORMS).map(p => p.label + (p.unavailable ? ' (unavailable)' : '')).join(', ')}\n\n` +
+                'Click through the tabs to see how it works, then add your first account.');
+            break;
+        case 'track':
+            embed.setDescription(
+                (n ? `You're tracking **${n}** account${n > 1 ? 's' : ''}.\n\n` : '') +
+                '`/social add` Track an account: pick a platform, enter a handle or URL, pick a channel.\n' +
+                '`/social list` See every tracked account. Pick one to manage it.\n' +
+                '`/social preview` See a sample notification for any account.\n' +
+                '`/social check` Check everything now instead of waiting.' +
+                (oauthAvailable ? '\n`/social link` Link an Instagram or TikTok account first. The owner approves it.' : ''));
+            break;
+        case 'customize':
+            embed.setDescription(
+                'In `/social list`, pick an account, then:\n' +
+                '**Edit Messages** Write your own text per post type. Placeholders: `{author}` `{title}` `{url}` `{platform}` `{handle}` (`{is/was}` for Live).\n' +
+                '**Ping Role** Mention a role with every post.\n' +
+                '**Edit Types** Choose which post types are announced.\n' +
+                '**Change Channel, Pause, Remove** do what they say.');
+            break;
+        case 'batching':
+            embed.setDescription(
+                'Two or more posts in the same channel within 10 minutes become **one** combined message, so busy accounts do not flood the channel.\n\n' +
+                '**Batch Settings** (in Manage) sets how many posts it takes and whether channels can share a batch. It applies to the whole server.\n' +
+                '**Batching: On/Off** (in Manage) turns it off for one account.\n' +
+                'Live streams always post on their own.');
+            break;
+        case 'admin':
+            embed.setDescription(
+                '`/social access` Let a role besides admins manage the bot.\n' +
+                'In every channel you post to, the bot needs **View Channel, Send Messages, Embed Links** and **Read Message History**.\n' +
+                "If a post can't be delivered, an admin channel gets a short report with a link to fix it.\n" +
+                '`/help` lists every command.');
+            break;
+    }
+    const tabs = new ActionRowBuilder().addComponents(SETUP_TABS.map(t =>
+        new ButtonBuilder().setCustomId(`setup_tab_${t.id}`).setLabel(t.label).setStyle(t.id === tab.id ? ButtonStyle.Primary : ButtonStyle.Secondary)));
+    const actions = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('setup_start').setLabel(n ? 'Add another account' : 'Add my first account').setStyle(ButtonStyle.Success),
+        ...(tab.id === 'customize' ? [new ButtonBuilder().setCustomId('setup_sample').setLabel('Show me a sample').setStyle(ButtonStyle.Secondary)] : []),
     );
+    return { embeds: [embed], components: [tabs, actions] };
 }
 
 function buildHelpView(activeId) {
@@ -322,4 +367,4 @@ function buildHelpView(activeId) {
     return { embeds: [active.build()], components: rows };
 }
 
-module.exports = { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupIntroEmbed, buildSetupIntroRow, buildSetupReturningEmbed, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed };
+module.exports = { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed };

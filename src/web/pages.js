@@ -106,7 +106,7 @@ function buildStatusHTML() {
     return legalPage('Notifyer', `
 <h1>Notifyer</h1>
 ${statusLine}
-<p style="font-size:1.1em;">Notifyer is a Discord bot that watches creators across YouTube, Twitter/X, Twitch and Kick, and posts directly in a channel you choose the moment they upload, post, or go live.</p>
+<p style="font-size:1.1em;">Notifyer is a Discord bot that watches creators across YouTube, Twitter/X, Twitch, TikTok and Kick and posts directly in a channel you choose the moment they upload, post, or go live.</p>
 
 <h2>What it does</h2>
 <ul>

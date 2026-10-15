@@ -24,7 +24,7 @@ const TERMS_HTML = legalPage('Terms of Service', `
 <p>These Terms govern your use of the Notifyer Discord bot ("the Bot"). By adding the Bot to a server or using its commands, you agree to these Terms.</p>
 
 <h2>What the Bot does</h2>
-<p>The Bot watches accounts you configure on YouTube, Twitter/X, Twitch, Instagram, and TikTok, and posts a notification in a Discord channel you choose when those accounts publish new content. For Instagram and TikTok, this only works for accounts that have explicitly authorized the Bot via OAuth (<code>/social link</code>) — the Bot cannot and does not access those platforms' accounts without their consent.</p>
+<p>The Bot watches accounts you configure on YouTube, Twitter/X, Twitch, Instagram and TikTOk, and posts a notification in a Discord channel you choose when those accounts publish new content. For Instagram and TikTok, this only works for accounts that have explicitly authorized the Bot via OAuth (<code>/social link</code>) - the Bot cannot and does not access those platforms' accounts without their consent.</p>
 
 <h2>YouTube API Services</h2>
 <p>The Bot uses YouTube API Services to detect new videos, Shorts, and live streams on the YouTube channels you choose to track. By using the Bot, you agree to be bound by the <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>.</p>
@@ -35,6 +35,7 @@ const TERMS_HTML = legalPage('Terms of Service', `
 <li>You must have the right to link any Instagram or TikTok account you connect via <code>/social link</code> — only link accounts you own or are authorized to manage.</li>
 <li>Don't use the Bot to spam, harass, or send notifications to channels/servers without appropriate permission.</li>
 <li>Don't attempt to abuse, overload, or reverse-engineer the Bot's infrastructure.</li>
+<li>Since the bot is open-source, you are welcome to fork, self-host or look through the code.</li>
 </ul>
 
 <h2>No warranty</h2>
@@ -74,7 +75,7 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 <p>Watch configurations and linked accounts are retained until you remove them (<code>/social list</code> → Remove, or by revoking a link) or remove the Bot from your server. You can request deletion of any data tied to your server or Discord account by contacting ${LEGAL_CONTACT}.</p>
 
 <h2>Third-party services</h2>
-<p>The Bot communicates with Discord's API, and — where you've configured it — YouTube, Twitter/X, Twitch, Meta's Instagram Graph API, and TikTok's API. Each of those platforms has its own privacy policy governing data you share with them directly.</p>
+<p>The Bot communicates with Discord's API, and - where you've configured it - YouTube, Twitter/X, Twitch, Meta's Instagram Graph API, and TikTok's API. Each of those platforms has its own privacy policy governing data you share with them directly.</p>
 
 <h2>YouTube API Services</h2>
 <p>The Bot uses YouTube API Services to check the YouTube channels you choose to track for new videos, Shorts, and live streams. Use of YouTube API Services through the Bot is subject to the <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>, and Google's handling of data is described in the <a href="http://www.google.com/policies/privacy">Google Privacy Policy</a>.</p>
@@ -109,12 +110,12 @@ ${statusLine}
 
 <h2>What it does</h2>
 <ul>
-<li><strong>Multi-platform tracking</strong> — follow accounts on YouTube, Twitter/X, Twitch, Kick, Instagram, and TikTok from one bot, each with its own channel and settings.</li>
-<li><strong>Custom notification messages</strong> — write your own message per platform and per post type (video, short, live, VOD, reel, story, etc.), with placeholders like <code>{author}</code>, <code>{title}</code>, and <code>{url}</code> filled in automatically.</li>
-<li><strong>Live stream tracking</strong> — a "went live" message updates itself in place once the stream ends, instead of posting a second message.</li>
-<li><strong>Smart batching</strong> — if several posts land at once (one prolific account, or several tracked accounts posting in the same channel back to back), they're combined into a single tidy message instead of flooding the channel.</li>
-<li><strong>Preview before it fires</strong> — see exactly what a notification will look like, styling and all, without waiting for a real post.</li>
-<li><strong>Consent-based linking</strong> — Instagram and TikTok accounts connect through official OAuth (<code>/social link</code>); Notifyer only ever reads accounts that have explicitly authorized it.</li>
+<li><strong>Multi-platform tracking</strong> - follow accounts on YouTube, Twitter/X, Twitch, Kick, Instagram, and TikTok from one bot, each with its own channel and settings.</li>
+<li><strong>Custom notification messages</strong> - write your own message per platform and per post type (video, short, live, VOD, reel, story, etc.), with placeholders like <code>{author}</code>, <code>{title}</code>, and <code>{url}</code> filled in automatically.</li>
+<li><strong>Live stream tracking</strong> - a "went live" message updates itself in place once the stream ends, instead of posting a second message.</li>
+<li><strong>Smart batching</strong> - if several posts land at once (one prolific account, or several tracked accounts posting in the same channel back to back), they're combined into a single tidy message instead of flooding the channel.</li>
+<li><strong>Preview before it fires</strong> - see exactly what a notification will look like, styling and all, without waiting for a real post.</li>
+<li><strong>Consent-based linking</strong> - Instagram and TikTok accounts connect through official OAuth (<code>/social link</code>); Notifyer only ever reads accounts that have explicitly authorized it.</li>
 </ul>
 
 <h2>How it works</h2>

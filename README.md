@@ -1,4 +1,4 @@
-Get fast and free notifications from you favourite creators across YouTube, Twitter/X, Twitch and Kick with Notifyer.
+Get fast and free notifications from you favourite creators across YouTube, Twitter/X, Twitch, Kick and TikTok with Notifyer.
 
 # Commands
 ## Social:

@@ -30,4 +30,9 @@ const { client } = require('./client.js');
 
 process.on('unhandledRejection', e => console.error('⚠️ Unhandled rejection:', e));
 
-client.on('error', e => console.error('⚠️ Discord client error:', e));
+client.on('error', e => {
+    // 40060 (already acknowledged) / 10062 (unknown interaction) are late or duplicate replies, not crashes.
+    // Seeing them often usually means a second copy of the bot is running with the same token.
+    if (e && (e.code === 40060 || e.code === 10062)) return console.warn(`⚠️ Ignored a late/duplicate interaction response (Discord ${e.code}). If this repeats a lot, make sure only ONE copy of the bot is running with this token.`);
+    console.error('⚠️ Discord client error:', e);
+});

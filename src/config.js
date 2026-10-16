@@ -155,6 +155,10 @@ const FAST_POLL_INTERVAL_MS = 20 * 1000; // 20 seconds
 
 const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 
+// While a YouTube channel's WebSub push is confirmed by the hub, polling is only a safety net, so it runs this
+// often instead of every SLOW_POLL_INTERVAL_MS. Override with YOUTUBE_POLL_INTERVAL_MS (never below the slow interval).
+const YOUTUBE_PUSH_POLL_INTERVAL_MS = Math.max(SLOW_POLL_INTERVAL_MS, parseInt(process.env.YOUTUBE_POLL_INTERVAL_MS, 10) || 20 * 60 * 1000);
+
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
 
 const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter', 'bluesky']);
@@ -201,4 +205,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, activeTypeIds, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, activeTypeIds, isOwner, logStartupConfigSummary };

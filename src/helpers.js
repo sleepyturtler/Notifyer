@@ -2,7 +2,7 @@
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { EmbedBuilder } = require('discord.js');
-const { PLATFORM_NOTIFY_TYPES } = require('./config.js');
+const { PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 const E = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
@@ -20,6 +20,11 @@ function normalizeHandle(platform, raw) {
         h = h.replace(/^(twitter\.com|x\.com)\//i, '');
         h = h.replace(/^@/, '');
         h = h.split(/[/?]/)[0];
+    } else if (platform === 'bluesky') {
+        h = h.replace(/^bsky\.app\/profile\//i, '').replace(/^@/, '');
+        h = h.split(/[/?#]/)[0].toLowerCase();
+        // "alice" alone is almost always alice.bsky.social; DIDs and custom domains pass through.
+        if (h && !h.includes('.') && !h.startsWith('did:')) h += '.bsky.social';
     } else if (platform === 'twitch') {
         h = h.replace(/^twitch\.tv\//i, '');
         h = h.replace(/^@/, '');
@@ -44,6 +49,7 @@ function profileUrl(platform, handle) {
     switch (platform) {
         case 'youtube': return handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/channel/${handle}`;
         case 'twitter': return `https://x.com/${handle}`;
+        case 'bluesky': return `https://bsky.app/profile/${handle}`;
         case 'twitch': return `https://www.twitch.tv/${handle}`;
         case 'kick': return `https://kick.com/${handle}`;
         case 'instagram': return `https://www.instagram.com/${handle}`;
@@ -59,8 +65,7 @@ function profileUrl(platform, handle) {
 function canWatchBatch(w) {
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const nonLiveTypes = types.filter(t => t.id !== 'live');
-    const activeTypeIds = (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types : types.map(t => t.id);
-    return nonLiveTypes.length > 0 && activeTypeIds.some(id => id !== 'live');
+    return nonLiveTypes.length > 0 && activeTypeIds(w).some(id => id !== 'live');
 }
 
 module.exports = { E, canWatchBatch, normalizeHandle, profileUrl };

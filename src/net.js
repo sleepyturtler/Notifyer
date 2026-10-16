@@ -18,15 +18,20 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 // request, not an idle timer), oversized bodies, socket errors, and a connection that
 // closes before the response finished. `redirects` is how many 3xx hops to follow
 // (default 0: the 3xx is returned as-is); relative Location headers are resolved.
-function request(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs = 15000, redirects = 0 } = {}) {
+// timeoutMs is an IDLE timeout: it restarts whenever data arrives, so a slow mirror that keeps sending is fine,
+// while a connection that goes silent is cut off. maxMs is the absolute cap for a response that trickles forever.
+function request(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs = 15000, maxMs = Math.max(60000, timeoutMs * 4), redirects = 0 } = {}) {
     return new Promise((resolve, reject) => {
         let u;
         try { u = new URL(urlStr); } catch (e) { return reject(e); }
         if (u.protocol !== 'https:' && u.protocol !== 'http:') return reject(new Error(`Unsupported protocol ${u.protocol}`));
 
-        let settled = false, req;
-        const done = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); fn(v); };
-        const timer = setTimeout(() => { req?.destroy(); done(reject, new Error('Timeout')); }, timeoutMs);
+        let settled = false, req, idle;
+        const done = (fn, v) => { if (settled) return; settled = true; clearTimeout(idle); clearTimeout(cap); fn(v); };
+        const expire = () => { req?.destroy(); done(reject, new Error('Timeout')); };
+        const arm = () => { clearTimeout(idle); idle = setTimeout(expire, timeoutMs); };
+        const cap = setTimeout(expire, maxMs);
+        arm();
 
         const hdrs = { ...headers };
         if (body !== null) hdrs['Content-Length'] = Buffer.byteLength(body);
@@ -35,10 +40,11 @@ function request(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs 
                 res.resume();
                 let next;
                 try { next = new URL(res.headers.location, u).toString(); } catch (e) { return done(reject, e); }
-                return done(resolve, request(next, { method, headers, body, timeoutMs, redirects: redirects - 1 }));
+                return done(resolve, request(next, { method, headers, body, timeoutMs, maxMs, redirects: redirects - 1 }));
             }
             const chunks = []; let size = 0;
             res.on('data', c => {
+                arm();
                 size += c.length;
                 if (size > MAX_BODY_BYTES) { req.destroy(); return done(reject, new Error('Response too large')); }
                 chunks.push(c);
@@ -86,4 +92,4 @@ async function fetchText(url, headers = {}) {
     return text;
 }
 
-module.exports = { fetchJson, fetchText, postForm, postJson, xmlParser };
+module.exports = { fetchJson, fetchText, postForm, postJson, request, xmlParser };

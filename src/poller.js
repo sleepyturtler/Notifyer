@@ -1,14 +1,15 @@
 // pollAll (fast/slow loops + /social check), per-cycle fetch caching, Nitter outage tracking.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
-const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE } = require('./config.js');
+const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE, YOUTUBE_PUSH_POLL_INTERVAL_MS } = require('./config.js');
 const { client } = require('./client.js');
-const { getWatch, getAllWatches, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
+const { getWatch, getAllWatches, getPushCoveredYouTubeChannels, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
 const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
 const { fetchLatestKickAll } = require('./platforms/kick.js');
+const { fetchLatestBlueskyAll } = require('./platforms/bluesky.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { fetchLatestPost } = require('./platforms/index.js');
 
@@ -64,6 +65,14 @@ function handleNittersRecovered() {
     nitterAlerted = false;
 }
 
+// A YouTube watch whose channel has a hub-confirmed push subscription only needs a safety-net poll every
+// YOUTUBE_PUSH_POLL_INTERVAL_MS. Polls stay at the normal pace when: the last check failed, a live stream is being
+// tracked (polling is what notices it ended), or the channel isn't covered by push.
+function skipYouTubePoll(w, pushCovered, now = Date.now()) {
+    return Boolean(pushCovered && w.platform === 'youtube' && w.youtube_channel_id && pushCovered.has(w.youtube_channel_id)
+        && !w.youtube_live_video_id && !w.last_error && w.last_checked && (now - w.last_checked) < YOUTUBE_PUSH_POLL_INTERVAL_MS);
+}
+
 async function pollAll(platforms = null, onlyGuildId = null) {
     // /social check is a per-guild command, but pollAll(null) with no scoping
     // processes every watch on every server the bot is in — including the full
@@ -85,6 +94,8 @@ async function pollAll(platforms = null, onlyGuildId = null) {
         let watches = await getAllWatches(platforms);
         if (onlyGuildId) watches = watches.filter(w => w.guild_id === onlyGuildId);
         // Scoped to this one poll pass only — see the instagram/tiktok branch below.
+        // Manual /social check (onlyGuildId) always polls; the scheduled slow loop skips push-covered YouTube watches.
+        const pushCovered = (!onlyGuildId && watches.some(w => w.platform === 'youtube')) ? await getPushCoveredYouTubeChannels().catch(e => { console.error('push-covered lookup:', e.message); return null; }) : null;
         const perCyclePostsCache = new Map(); // key -> Promise<posts[] | null>; key is social_link_id (Instagram/TikTok) or `${platform}:${handle}` (Twitch/Kick)
         let nitterOk = 0, nitterFail = 0, nitterFailMsg = null, nitterLogged = false;
         for (let w of watches) {
@@ -97,6 +108,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             if (PLATFORMS[w.platform]?.unavailable) continue;
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
             if (minInterval && w.last_checked && (Date.now() - w.last_checked) < minInterval) continue;
+            if (skipYouTubePoll(w, pushCovered)) continue;
             if (watchesInFlight.has(w.id)) continue; // another pass is already handling this watch
             watchesInFlight.add(w.id);
             try {
@@ -167,10 +179,10 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     } else {
                         await touchLastChecked(w.id);
                     }
-                } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
+                } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky' || w.platform === 'instagram' || w.platform === 'tiktok') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
-                    if (w.platform === 'twitch' || w.platform === 'kick') {
+                    if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky') {
                         // Same redundant-external-call shape as the Instagram/TikTok shared-link
                         // case below — multiple watches (any servers) can track the same
                         // streamer by handle, and without caching each one independently re-hits
@@ -178,7 +190,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         // cycle (20s). Cache by platform+handle for the rest of this pass.
                         const handleCacheKey = `${w.platform}:${w.handle.toLowerCase()}`;
                         if (!perCyclePostsCache.has(handleCacheKey)) {
-                            perCyclePostsCache.set(handleCacheKey, w.platform === 'twitch' ? fetchLatestTwitchAll(w.handle) : fetchLatestKickAll(w.handle));
+                            perCyclePostsCache.set(handleCacheKey, (w.platform === 'twitch' ? fetchLatestTwitchAll : w.platform === 'kick' ? fetchLatestKickAll : fetchLatestBlueskyAll)(w.handle));
                         }
                         posts = await perCyclePostsCache.get(handleCacheKey);
                     } else {
@@ -276,4 +288,4 @@ async function pollAll(platforms = null, onlyGuildId = null) {
     }
 }
 
-module.exports = { pollAll };
+module.exports = { pollAll, skipYouTubePoll };

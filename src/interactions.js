@@ -458,7 +458,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isButton() && interaction.customId === 'setup_sample') {
         const demo = { id: 0, guild_id: guildId, platform: 'youtube', handle: '@yourfavoritecreator', channel_id: '0', role_id: null, message_template: null, message_templates: {}, notify_types: null };
         const payload = buildNotificationPayload(demo, buildSamplePost(demo, 'videos'));
-        return interaction.reply({ content: `Sample notification (nothing was posted):\n${payload.content || ''}`.slice(0, 2000), embeds: payload.embeds, components: payload.components, flags: [MessageFlags.Ephemeral] });
+        return interaction.reply({ content: `Sample notification (nothing was posted). Discord adds the video preview under the link.\n${payload.content || ''}`.slice(0, 2000), embeds: payload.embeds, components: payload.components, flags: [MessageFlags.Ephemeral, MessageFlags.SuppressEmbeds] });
     }
     if (interaction.isButton() && interaction.customId === 'setup_start') {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });

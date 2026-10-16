@@ -32,7 +32,7 @@ async function fetchLatestTwitter(handle) {
 
     const successes = results.filter(r => r.status === 'fulfilled').map(r => r.value);
     if (!successes.length) {
-        const errs = results.map((r, i) => `${instances[i]}: ${r.reason?.message || 'unknown error'}`).join('; ');
+        const errs = results.map((r, i) => `${instances[i]}: ${r.reason?.message || r.reason?.code || r.reason?.errors?.[0]?.code || r.reason?.name || 'connection failed'}`).join('; ');
         throw new Error(`All Nitter instances failed (${errs})`);
     }
 

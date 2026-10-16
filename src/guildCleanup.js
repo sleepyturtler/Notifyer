@@ -7,7 +7,7 @@
 // appear to be missing, which points to a Discord/connection problem rather than real removals.
 
 const { client } = require('./client.js');
-const { deleteGuildData, getStoredGuildIds } = require('./db.js');
+const { deleteGuildData, getStoredGuildIds, getWatches } = require('./db.js');
 const { revokeTikTokToken } = require('./platforms/social.js');
 
 // Never throws. Returns what was removed, or null if the deletion itself failed.
@@ -43,8 +43,11 @@ async function purgeOrphanedGuilds() {
 
     const limit = Math.max(5, Math.floor(stored.length * 0.25));
     if (orphans.length > limit && process.env.ALLOW_BULK_ORPHAN_PURGE !== 'true') {
-        console.warn(`⚠️ Orphan sweep REFUSED: ${orphans.length} of ${stored.length} stored servers are not in the bot's server list, more than the safe limit of ${limit}. `
-            + 'That looks like a connection/Discord problem, not real removals, so nothing was deleted. If these really are servers the bot left, set ALLOW_BULK_ORPHAN_PURGE=true and restart once.');
+        const sample = [];
+        for (const id of orphans.slice(0, 8)) sample.push(`${id} (${(await getWatches(id).catch(() => [])).length} watch(es))`);
+        console.warn(`⚠️ Orphan sweep REFUSED: ${orphans.length} of ${stored.length} stored servers are not in this bot's server list (the bot is in ${guilds.size}), more than the safe limit of ${limit}. Nothing was deleted.\n`
+            + `   Examples: ${sample.join(', ')}${orphans.length > 8 ? ', ...' : ''}\n`
+            + '   If this database belongs to a different bot (wrong DATABASE_URL?), fix that first. Only if these servers really are gone, set ALLOW_BULK_ORPHAN_PURGE=true and restart once.');
         return;
     }
     for (const id of orphans) await purgeGuild(id, 'the bot is no longer in this server');

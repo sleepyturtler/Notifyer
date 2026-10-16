@@ -3,7 +3,7 @@
 
 const { ButtonBuilder, ButtonStyle, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { getSocialLinks, getWatches } = require('./db.js');
-const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
+const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
 const { canWatchBatch } = require('./helpers.js');
@@ -159,7 +159,8 @@ function buildBatchHeaderModal(w) {
 // One line per active notify type: that type's own message, else the watch's old single message, else "default".
 function describeMessages(w) {
     const all = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-    const active = (Array.isArray(w.notify_types) && w.notify_types.length) ? all.filter(t => w.notify_types.includes(t.id)) : all;
+    const ids = activeTypeIds(w);
+    const active = all.filter(t => ids.includes(t.id));
     const templates = w.message_templates || {};
     return active.map(t => {
         const text = String(templates[t.id] || w.message_template || '').replace(/\s+/g, ' ').replace(/`/g, "'").trim();
@@ -174,7 +175,7 @@ function buildManageView(w) {
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
             { name: 'Ping role', value: w.role_id ? `<@&${w.role_id}>` : 'None', inline: true },
-            { name: 'Types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : 'All types', inline: true },
+            { name: 'Types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : ((PLATFORM_NOTIFY_TYPES[w.platform] || []).some(t => t.defaultOff) ? activeTypeIds(w).map(id => PLATFORM_NOTIFY_TYPES[w.platform].find(x => x.id === id).label).join(', ') : 'All types'), inline: true },
         );
     embed.addFields({ name: 'Messages', value: describeMessages(w) });
     embed.addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
@@ -280,7 +281,7 @@ const HELP_CATEGORIES = [
             .addFields(
                 { name: 'Platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') + '\n⚠️ = unavailable right now' },
                 { name: 'Placeholders', value: '`{author}` `{handle}` `{platform}` `{title}` `{url}`, plus `{is/was}` for Live.' },
-                { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. YouTube and Twitter: every 2 minutes (YouTube also pushes new uploads and streams instantly).' },
+                { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. Twitter and Bluesky: every 2 minutes. YouTube: new uploads and streams arrive instantly by push, with a backup check every 20 minutes (every 2 minutes if push is not active for that channel).' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
                 { name: 'Links', value: `[GitHub](https://github.com/sleepyturtler/Notifyer) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),

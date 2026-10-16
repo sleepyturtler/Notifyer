@@ -9,6 +9,9 @@ const { getYouTubeSubscription, updateWatchYouTubeIds, upsertYouTubeSubscription
 // Resolves a handle (or raw UC... channel ID) to its channel ID and uploads
 // playlist ID via the API — 1 quota unit, and only ever called once per watch
 // since the result gets cached (see updateWatchYouTubeIds / fetchLatestYouTubeEntries).
+// YouTube's error messages contain markup like <code>playlistId</code>; show plain text.
+const apiMessage = json => String(json?.error?.message || '').replace(/<[^>]+>/g, '').trim();
+
 async function resolveYouTubeChannel(handle) {
     if (!YOUTUBE_API_KEY) throw new Error('YOUTUBE_API_KEY is not set');
     const isRawId = /^UC[\w-]{22}$/.test(handle);
@@ -16,7 +19,7 @@ async function resolveYouTubeChannel(handle) {
         ? `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${handle}&key=${YOUTUBE_API_KEY}`
         : `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle=${encodeURIComponent(handle.startsWith('@') ? handle : '@' + handle)}&key=${YOUTUBE_API_KEY}`;
     const { status, json } = await fetchJson(url);
-    if (status !== 200) throw new Error(json?.error?.message || `HTTP ${status}`);
+    if (status !== 200) throw new Error(apiMessage(json) || `HTTP ${status}`);
     const item = json?.items?.[0];
     if (!item) throw new Error('Could not resolve that YouTube channel — check the handle/URL');
     return { channelId: item.id, uploadsPlaylistId: item.contentDetails.relatedPlaylists.uploads };
@@ -70,7 +73,11 @@ async function fetchLatestYouTubeEntries(w) {
     ensureYouTubeSubscription(channelId).catch(() => {});
 
     const { status, json } = await fetchJson(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${playlistId}&maxResults=10&key=${YOUTUBE_API_KEY}`);
-    if (status !== 200) throw new Error(json?.error?.message || `HTTP ${status}`);
+    // 404 playlistNotFound = the channel has no uploads yet (YouTube only creates the uploads playlist with the
+    // first video). That's an empty channel, not a failure: treating it as an error logged it on every poll and,
+    // because the watch got no baseline, swallowed the channel's first video as "baseline" when it finally appeared.
+    if (status === 404 && json?.error?.errors?.some(e => e.reason === 'playlistNotFound')) return [];
+    if (status !== 200) throw new Error(apiMessage(json) || `HTTP ${status}`);
     return (json.items || []).map(it => ({
         id: it.contentDetails.videoId,
         url: `https://www.youtube.com/watch?v=${it.contentDetails.videoId}`,
@@ -90,7 +97,7 @@ async function classifyYouTubeVideos(videoIds) {
     if (!videoIds.length) return {};
     if (!YOUTUBE_API_KEY) throw new Error('YOUTUBE_API_KEY is not set');
     const { status, json } = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${YOUTUBE_API_KEY}`);
-    if (status !== 200) throw new Error(json?.error?.message || `HTTP ${status}`);
+    if (status !== 200) throw new Error(apiMessage(json) || `HTTP ${status}`);
     const result = {};
     for (const item of json.items || []) {
         const isCurrentlyLive = item.snippet.liveBroadcastContent === 'live'

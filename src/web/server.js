@@ -6,7 +6,7 @@ const http = require('http');
 const crypto = require('crypto');
 const { SEEN_HISTORY_SIZE, WEBSUB_VERIFY_TOKEN, websubSecretFor } = require('../config.js');
 const { fetchText, xmlParser } = require('../net.js');
-const { getWatchesByYouTubeChannel, setWatchLiveMessage, setWatchYouTubeLiveVideo, updateLastPost, upsertSocialLink } = require('../db.js');
+const { getWatchesByYouTubeChannel, markYouTubeSubscriptionVerified, setWatchLiveMessage, setWatchYouTubeLiveVideo, updateLastPost, upsertSocialLink } = require('../db.js');
 const { classifyYouTubeVideos } = require('../platforms/youtube.js');
 const { sendNotification, shouldNotify } = require('../notify.js');
 const { sendOrExtendBatch } = require('../batch.js');
@@ -38,7 +38,16 @@ function handleYouTubeWebSubVerify(req, res) {
     const verifyToken = u.searchParams.get('hub.verify_token');
     if ((mode === 'subscribe' || mode === 'unsubscribe') && verifyToken === WEBSUB_VERIFY_TOKEN && challenge) {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end(challenge);
+        res.end(challenge);
+        // The hub confirming OUR subscription is what lets polling slow down for that channel (see skipYouTubePoll).
+        if (mode === 'subscribe') {
+            const channelId = (() => { try { return new URL(u.searchParams.get('hub.topic') || '').searchParams.get('channel_id'); } catch { return null; } })();
+            const lease = parseInt(u.searchParams.get('hub.lease_seconds'), 10);
+            if (YT_CHANNEL_ID_RE.test(channelId || '') && lease > 0) {
+                markYouTubeSubscriptionVerified(channelId, Math.min(lease, 30 * 24 * 60 * 60)).catch(e => console.error('mark WebSub verified:', e.message));
+            }
+        }
+        return;
     }
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found');

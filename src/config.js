@@ -75,6 +75,7 @@ const PLATFORMS = {
     // hold up consistently. Needs no credentials at all, so it's never
     // auto-disabled here the way the others below are.
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
+    bluesky:   { label: 'Bluesky',   emoji: '🦋', color: '#1185FE' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF', unavailable: !(process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET) },
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18', unavailable: !(process.env.KICK_CLIENT_ID && process.env.KICK_CLIENT_SECRET) },
     // Instagram/TikTok also need PUBLIC_BASE_URL — without it there's nowhere for
@@ -83,6 +84,12 @@ const PLATFORMS = {
     instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C', oauth: true, unavailable: !(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET && PUBLIC_BASE_URL) },
     tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#010101', oauth: true, unavailable: !(process.env.TIKTOK_CLIENT_KEY && process.env.TIKTOK_CLIENT_SECRET && PUBLIC_BASE_URL) },
 };
+
+// The notify types a watch fires for: its saved selection, else every type not marked defaultOff.
+function activeTypeIds(w) {
+    if (Array.isArray(w.notify_types) && w.notify_types.length) return w.notify_types;
+    return (PLATFORM_NOTIFY_TYPES[w.platform] || []).filter(t => !t.defaultOff).map(t => t.id);
+}
 
 function isOwner(userId) {
     const ownerId = process.env.BOT_OWNER_ID;
@@ -112,6 +119,12 @@ const PLATFORM_NOTIFY_TYPES = {
         { id: 'live',   label: 'Live',    description: 'Stream goes live' },
     ],
     twitter:   [{ id: 'posts', label: 'Posts', description: 'New tweets/posts' }],
+    // Replies and reposts are opt-in (defaultOff): a watch with no saved selection only fires for posts.
+    bluesky:   [
+        { id: 'posts',   label: 'Posts',   description: 'New posts' },
+        { id: 'replies', label: 'Replies', description: 'Replies to other posts', defaultOff: true },
+        { id: 'reposts', label: 'Reposts', description: 'Posts they reposted', defaultOff: true },
+    ],
     twitch:    [
         { id: 'live',   label: 'Live',   description: 'Stream goes live' },
         { id: 'vods',   label: 'VODs',   description: 'New VOD/past broadcast uploaded' },
@@ -144,7 +157,7 @@ const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
 
-const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter']);
+const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter', 'bluesky']);
 
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
 
@@ -169,6 +182,7 @@ function logStartupConfigSummary() {
     if (process.env.YOUTUBE_API_KEY) ok('YouTube');
     else off('YouTube', 'missing YOUTUBE_API_KEY');
 
+    ok('Bluesky (public API, no credentials needed)');
     ok(`Twitter/X (via Nitter, ${NITTER_INSTANCES.length} mirror(s) configured)`);
 
     if (process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET) {
@@ -187,4 +201,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, activeTypeIds, isOwner, logStartupConfigSummary };

@@ -109,6 +109,11 @@ async function initDB() {
         );
         CREATE INDEX IF NOT EXISTS social_links_guild_platform ON social_links(guild_id, platform);
     `);
+    // verified_until = when the hub-confirmed push lease runs out (set by the hub's verification request, see
+    // markYouTubeSubscriptionVerified). Rows that predate the column were already live, so they start out trusted.
+    const hadVerifiedCol = (await pool.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'youtube_subscriptions' AND column_name = 'verified_until'")).rowCount > 0;
+    await pool.query('ALTER TABLE youtube_subscriptions ADD COLUMN IF NOT EXISTS verified_until BIGINT');
+    if (!hadVerifiedCol) await pool.query('UPDATE youtube_subscriptions SET verified_until = expires_at WHERE signed');
     // Backfill seen_post_ids for existing rows so nothing re-fires after migration
     await pool.query(`
         UPDATE watches
@@ -226,6 +231,22 @@ async function upsertYouTubeSubscription(channelId, expiresAt) {
     );
 }
 
+// Called when the hub's verification request for OUR subscription arrives. Upserts, because that request can land
+// before ensureYouTubeSubscription has recorded its own row (it records after the hub's 202 comes back).
+async function markYouTubeSubscriptionVerified(channelId, leaseSeconds) {
+    const until = Date.now() + leaseSeconds * 1000;
+    await pool.query(
+        'INSERT INTO youtube_subscriptions (channel_id, expires_at, signed, verified_until) VALUES ($1, $2, TRUE, $2) ON CONFLICT (channel_id) DO UPDATE SET verified_until = $2, signed = TRUE',
+        [channelId, until]
+    );
+}
+
+// Channels whose push subscription the hub has confirmed and which hasn't lapsed: polling can slow down for these.
+async function getPushCoveredYouTubeChannels() {
+    const res = await pool.query('SELECT channel_id FROM youtube_subscriptions WHERE signed AND verified_until > $1', [Date.now()]);
+    return new Set(res.rows.map(r => r.channel_id));
+}
+
 async function setWatchSocialLink(guildId, id, socialLinkId) {
     await pool.query('UPDATE watches SET social_link_id = $1 WHERE guild_id = $2 AND id = $3', [socialLinkId, guildId, id]);
 }
@@ -320,4 +341,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getStoredGuildIds, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getPushCoveredYouTubeChannels, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getStoredGuildIds, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, markYouTubeSubscriptionVerified, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

@@ -3,7 +3,7 @@
 
 const { URL } = require('url');
 const { MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
+const { PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { reportDeliveryFailure } = require('./announcements.js');
 const { profileUrl } = require('./helpers.js');
 const { fetchJson } = require('./net.js');
@@ -20,7 +20,7 @@ const LIVE_DEFAULT_TEMPLATE = '🔴 **{author}** {is/was} live on {platform}!\n{
 // Shown wherever someone's about to set a custom message, so new users don't have to
 // dig through /help to discover these — Discord modals can't show static text inside
 // the form itself, so this goes on the embed screen right before the modal opens.
-const PLACEHOLDER_HELP = '`{author}` `{handle}` `{platform}` `{title}` `{url}` — for Live, also `{is/was}` (is/was live)';
+const PLACEHOLDER_HELP = '`{author}` `{handle}` `{platform}` `{title}` `{url}` — for Live, also `{is/was}` (is/was live) and `{category}`';
 
 // Resolves the message template for a watch + post, preferring a per-post-type
 // override (w.message_templates[post.postType]) over the watch's single
@@ -42,19 +42,21 @@ function renderTemplate(template, post, platform, handle, ended = false) {
         .replace(/\{handle\}/g, () => handle)
         .replace(/\{platform\}/g, () => PLATFORMS[platform].label)
         .replace(/\{title\}/g, () => post.title || '')
-        .replace(/\{url\}/g, () => post.url || '');
+        .replace(/\{url\}/g, () => post.url || '')
+        .replace(/\{category\}/g, () => post.category || '');
 }
 
 function shouldNotify(w, post) {
-    const types = Array.isArray(w.notify_types) && w.notify_types.length ? w.notify_types : null;
-    if (!types) return true; // no filter = all types
-    return post.postType ? types.includes(post.postType) : true;
+    if (!post.postType) return true;
+    // No saved selection = every type except those a platform marks defaultOff (Bluesky replies/reposts).
+    return activeTypeIds(w).includes(post.postType);
 }
 
 // ── Post-type → button label map (used instead of a generic "View post") ───
 const POST_TYPE_BUTTON_LABEL = {
     youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
     twitter:   { posts: 'View Tweet' },
+    bluesky:   { posts: 'View Post', replies: 'View Reply', reposts: 'View Repost' },
     twitch:    { live: 'Join Stream', vods: 'Watch VOD' },
     kick:      { live: 'Join Stream' },
     instagram: { posts: 'View Post', reels: 'Watch Reel', stories: 'View Story' },
@@ -79,6 +81,7 @@ function buildSamplePost(w, postType) {
         timestamp: new Date().toISOString(),
         postType,
         isLive: postType === 'live',
+        category: postType === 'live' && (w.platform === 'twitch' || w.platform === 'kick') ? 'Just Chatting' : null,
     };
 }
 
@@ -179,6 +182,7 @@ function buildNotificationPayload(w, post) {
         .setDescription(post.title || null)
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
+    if (post.isLive && post.category) embed.addFields({ name: 'Category', value: String(post.category).slice(0, 1024), inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
     return { content, embeds: [embed], components: [linkRow], wantsNativeVideo: false };
 }

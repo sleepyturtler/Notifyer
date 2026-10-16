@@ -3,7 +3,7 @@
 
 const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE } = require('./config.js');
 const { client } = require('./client.js');
-const { getAllWatches, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
+const { getWatch, getAllWatches, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
@@ -33,14 +33,20 @@ const watchesInFlight = new Set();
 const NITTER_DOWN_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000; // re-alert at most every 6 hours
 
 let nitterDownSince = null;
+let nitterAlerted = false;
+// Public mirrors blip constantly. Only treat it as an outage (log + owner DM) once every mirror has been failing
+// continuously for this long; any successful poll in between resets the clock.
+const NITTER_DOWN_GRACE_MS = 10 * 60 * 1000;
 
 let lastNitterDownAlertAt = 0;
 
 async function handleAllNittersDown(errorMessage) {
     const now = Date.now();
     if (!nitterDownSince) nitterDownSince = now;
+    if (now - nitterDownSince < NITTER_DOWN_GRACE_MS) return;
     if (now - lastNitterDownAlertAt < NITTER_DOWN_ALERT_COOLDOWN_MS) return;
     lastNitterDownAlertAt = now;
+    nitterAlerted = true;
     console.error(`🚨 All ${NITTER_INSTANCES.length} configured Nitter mirror(s) are down — Twitter/X tracking has been failing since ${new Date(nitterDownSince).toISOString()}. Update NITTER_INSTANCES with working mirrors.`);
     if (!process.env.BOT_OWNER_ID) return;
     try {
@@ -53,8 +59,9 @@ async function handleAllNittersDown(errorMessage) {
 
 function handleNittersRecovered() {
     if (!nitterDownSince) return;
-    console.log(`✅ Nitter mirrors recovered — Twitter/X tracking had been down since ${new Date(nitterDownSince).toISOString()}.`);
+    if (nitterAlerted) console.log(`✅ Nitter mirrors recovered — Twitter/X tracking had been down since ${new Date(nitterDownSince).toISOString()}.`);
     nitterDownSince = null;
+    nitterAlerted = false;
 }
 
 async function pollAll(platforms = null, onlyGuildId = null) {
@@ -79,7 +86,8 @@ async function pollAll(platforms = null, onlyGuildId = null) {
         if (onlyGuildId) watches = watches.filter(w => w.guild_id === onlyGuildId);
         // Scoped to this one poll pass only — see the instagram/tiktok branch below.
         const perCyclePostsCache = new Map(); // key -> Promise<posts[] | null>; key is social_link_id (Instagram/TikTok) or `${platform}:${handle}` (Twitch/Kick)
-        for (const w of watches) {
+        let nitterOk = 0, nitterFail = 0, nitterFailMsg = null, nitterLogged = false;
+        for (let w of watches) {
             if (!w.active) continue;
             // Platform's credentials were removed after this watch was created (or
             // it's an outage-flagged platform like Twitter during a Nitter mirror
@@ -92,6 +100,10 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             if (watchesInFlight.has(w.id)) continue; // another pass is already handling this watch
             watchesInFlight.add(w.id);
             try {
+                // The list above was read at the start of the pass and each watch is processed seconds later (jitter
+                // between watches), so re-read this row now: a WebSub push may have recorded a video in the meantime,
+                // and acting on the stale "seen" list would announce it a second time.
+                w = (await getWatch(w.guild_id, w.id)) || w;
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
                 if (w.platform === 'youtube') {
@@ -134,7 +146,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         // Twitter paths): if a send throws mid-loop, already-sent entries are not re-sent
                         // on every following poll.
                         const mergedSeen = [...new Set([...ready.map(e => e.id), ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
-                        await updateLastPost(w.id, entries[0].id, mergedSeen, true);
+                        await updateLastPost(w.id, ready[0].id, mergedSeen, true); // ready[0], NOT entries[0]: updateLastPost also adds this id to the seen list, which must never include a still-upcoming stream
                         // Chronological (oldest-first) so a batch reads/sends in upload order
                         const chronological = [...ready].reverse();
                         for (const entry of chronological) {
@@ -204,6 +216,10 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     // below) and always send individually — batching only applies to regular
                     // posts/VODs, never to "went live" events.
                     for (const post of toNotify.filter(p => p.isLive)) {
+                        // A new live post while an older live message is still tracked means the previous
+                        // stream ended and a new one began between two polls: close the old message out first,
+                        // otherwise it would keep saying "is live" forever once live_message_id is overwritten.
+                        if (w.live_message_id) { await markStreamOffline(w); w.live_message_id = null; }
                         const sent = await sendNotification(w, post);
                         if (sent) await setWatchLiveMessage(w.id, sent.id);
                     }
@@ -221,7 +237,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     }
                 } else {
                     const post = await fetchLatestPost(w.platform, w.handle);
-                    if (w.platform === 'twitter') handleNittersRecovered();
+                    if (w.platform === 'twitter') nitterOk++;
                     if (!post || !post.id) { await touchLastChecked(w.id); continue; }
                     if (w.last_post_id === null) {
                         await updateLastPost(w.id, post.id, seenIds);
@@ -235,11 +251,12 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             } catch (e) {
                 if (/HTTP 429/.test(e.message)) {
                     console.warn(`poll ${w.platform}/${w.handle}: rate-limited (429), retrying next cycle`);
+                } else if (w.platform === 'twitter' && /All Nitter instances failed/.test(e.message)) {
+                    // Print the per-mirror errors once per pass; every further account would repeat the same list.
+                    console.error(`poll twitter/${w.handle}:`, nitterLogged ? 'every mirror failed (mirror errors listed above)' : e.message);
+                    nitterLogged = true; nitterFail++; nitterFailMsg = e.message;
                 } else {
                     console.error(`poll ${w.platform}/${w.handle}:`, e.message);
-                }
-                if (w.platform === 'twitter' && /All Nitter instances failed/.test(e.message)) {
-                    await handleAllNittersDown(e.message).catch(() => {});
                 }
                 await touchLastChecked(w.id, e.message).catch(() => {});
             } finally {
@@ -249,6 +266,11 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             const jitter = 1000 + Math.random() * 1000;
             await new Promise(r => setTimeout(r, jitter));
         }
+        // A Nitter outage means EVERY twitter account failed in this pass. One account failing while others succeed is
+        // an account problem (suspended, protected, no tweets), not a dead mirror list; judging per account made the
+        // alert and the "recovered" message flip back and forth as accounts alternated.
+        if (nitterFail && !nitterOk) await handleAllNittersDown(nitterFailMsg).catch(() => {});
+        else if (nitterOk) handleNittersRecovered();
     } finally {
         pollInProgress[lockKey] = false;
     }

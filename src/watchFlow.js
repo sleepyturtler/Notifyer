@@ -8,6 +8,7 @@ const { addWatch, getSocialLinkByUsername, getWatches, setWatchSocialLink, updat
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
 const { fetchLatestKickAll } = require('./platforms/kick.js');
+const { fetchLatestBlueskyAll } = require('./platforms/bluesky.js');
 const { fetchLatestPost } = require('./platforms/index.js');
 const { fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
@@ -65,6 +66,10 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
                 baselineSeenIds = posts.map(p => p.id);
             } else if (platform === 'kick') {
                 const posts = await fetchLatestKickAll(handle);
+                post = posts[0] || null;
+                baselineSeenIds = posts.map(p => p.id);
+            } else if (platform === 'bluesky') {
+                const posts = await fetchLatestBlueskyAll(handle);
                 post = posts[0] || null;
                 baselineSeenIds = posts.map(p => p.id);
             } else if (platform === 'youtube') {
@@ -155,7 +160,7 @@ function buildAddWatchSuccessResponse(watch, post, handle, channel) {
             .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
     );
     const skipRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel(`${types.some(t => t.defaultOff) ? 'Default types' : 'All types'} (skip)`).setStyle(ButtonStyle.Secondary)
     );
     return { embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] };
 }

@@ -7,7 +7,7 @@ const { pollAll } = require('./poller.js');
 const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS } = require('./config.js');
 const { announceSupportServer, announceTwitterRestoredGuilds } = require('./announcements.js');
 const { getConfig, saveConfig } = require('./db.js');
-const { purgeGuild, purgeOrphanedGuilds } = require('./guildCleanup.js');
+const { purgeGuild, purgeOrphanedGuilds, sweepUnusedLinks } = require('./guildCleanup.js');
 const fs = require('fs');
 const path = require('path');
 // Beta-only owner/debug commands (see debugTools.js) — present only on builds that
@@ -48,6 +48,8 @@ client.once(Events.ClientReady, async () => {
     // Drop data for servers the bot is no longer in (left while offline, or from before this existed)
     // before polling starts, so they aren't polled for nothing. Guarded; see guildCleanup.js.
     await purgeOrphanedGuilds().catch(e => console.error('orphan sweep:', e.message));
+    sweepUnusedLinks();
+    setInterval(sweepUnusedLinks, 6 * 60 * 60 * 1000);
 
     // Start polling — two independent cadences, see FAST/SLOW_POLL_* above.
     pollAll(FAST_POLL_PLATFORMS).catch(e => console.error('initial fast poll:', e.message));

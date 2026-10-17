@@ -72,6 +72,12 @@ async function migrateSocialLinks() {
     try {
         await pool.query('ALTER TABLE social_links ADD COLUMN IF NOT EXISTS needs_relink_at BIGINT'); // token rejected: owner must re-link
         await pool.query('ALTER TABLE social_links ADD COLUMN IF NOT EXISTS unused_since BIGINT');     // first sweep that saw no watch using it
+        // Servers that may use a linked account they didn't link or first use, approved by the person who linked it.
+        // Deleted automatically with the link (unlinking revokes every approval).
+        await pool.query(`CREATE TABLE IF NOT EXISTS social_link_approvals (
+            link_id INTEGER NOT NULL REFERENCES social_links(id) ON DELETE CASCADE,
+            guild_id TEXT NOT NULL, approved_by TEXT, approved_at BIGINT NOT NULL,
+            PRIMARY KEY (link_id, guild_id))`);
         const done = (await pool.query("SELECT 1 FROM pg_indexes WHERE indexname = 'social_links_account'")).rowCount > 0;
         if (done) return;
         const conn = await pool.connect();
@@ -359,6 +365,15 @@ async function getLinkUsage(linkId) {
     return res.rows[0] || { watches: 0, guilds: 0 };
 }
 
+async function hasLinkApproval(linkId, guildId) {
+    const res = await pool.query('SELECT 1 FROM social_link_approvals WHERE link_id = $1 AND guild_id = $2', [linkId, guildId]);
+    return res.rowCount > 0;
+}
+
+async function approveLinkForGuild(linkId, guildId, approvedBy) {
+    await pool.query('INSERT INTO social_link_approvals (link_id, guild_id, approved_by, approved_at) VALUES ($1, $2, $3, $4) ON CONFLICT (link_id, guild_id) DO UPDATE SET approved_by = EXCLUDED.approved_by, approved_at = EXCLUDED.approved_at', [linkId, guildId, approvedBy, Date.now()]);
+}
+
 async function getWatchesByLink(linkId) {
     return (await pool.query('SELECT id, guild_id, handle, platform FROM watches WHERE social_link_id = $1', [linkId])).rows;
 }
@@ -419,6 +434,7 @@ async function deleteGuildData(guildId) {
         // Linked accounts belong to the account, not the server, so they stay; the unused-link sweep removes any that no watch uses.
         const watches = (await conn.query('DELETE FROM watches WHERE guild_id = $1', [guildId])).rowCount;
         await conn.query('DELETE FROM configs WHERE guild_id = $1', [guildId]);
+        await conn.query('DELETE FROM social_link_approvals WHERE guild_id = $1', [guildId]);
         await conn.query('DELETE FROM youtube_subscriptions WHERE channel_id NOT IN (SELECT youtube_channel_id FROM watches WHERE youtube_channel_id IS NOT NULL)');
         await conn.query('COMMIT');
         configCache.delete(guildId);
@@ -449,4 +465,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, isLinkUsedInGuild, markSocialLinkDead, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, approveLinkForGuild, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

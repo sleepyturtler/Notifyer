@@ -3,13 +3,14 @@
 
 const { MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, EmbedBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ChannelSelectMenuBuilder, ChannelType } = require('discord.js');
 const { client } = require('./client.js');
-const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, canUsePlatform, isOwner } = require('./config.js');
+const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, canUnlinkLink, canUsePlatform, isOwner } = require('./config.js');
 const { E, canWatchBatch } = require('./helpers.js');
 const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
-const { deleteSocialLink, getConfig, getSocialLinkById, getWatch, getWatches, removeWatch, saveConfig, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
+const { countOtherWatchesUsingLink, deleteSocialLink, getConfig, getLinkUsage, getSocialLinkById, getWatch, getWatches, getWatchesByLink, isLinkUsedInGuild, removeWatch, saveConfig, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
 const { hasCommandPermission } = require('./permissions.js');
 const { buildAddWatchSuccessResponse, createWatchFlow } = require('./watchFlow.js');
 const { pollAll } = require('./poller.js');
+const { reportLinkProblem } = require('./announcements.js');
 const { revokeTikTokToken } = require('./platforms/social.js');
 const { SETUP_PICK_TTL_MS, createOAuthState, pendingSetupPicks } = require('./state.js');
 const { buildNotificationPayload, buildSamplePost } = require('./notify.js');
@@ -145,14 +146,14 @@ client.on('interactionCreate', async interaction => {
                     new ButtonBuilder().setLabel(`Authorize with ${PLATFORMS[platform].label}`).setStyle(ButtonStyle.Link).setURL(authUrl)
                 );
                 return reply({
-                    embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nThis link expires <t:${Math.floor(expires / 1000)}:R>.`)],
+                    embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nOnce linked, the account can be tracked in **any server** that uses Notifyer. You can unlink it any time from \`/social links\`.\n\nThis link expires <t:${Math.floor(expires / 1000)}:R>.`)],
                     components: [row],
                     flags: [MessageFlags.Ephemeral],
                 });
             }
 
             if (sub === 'links') {
-                const { embeds, components } = await buildSocialLinksEmbed(guildId);
+                const { embeds, components } = await buildSocialLinksEmbed(guildId, interaction.user.id);
                 return reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
             }
         }
@@ -191,7 +192,7 @@ client.on('interactionCreate', async interaction => {
     // ── Buttons: refresh linked-accounts list ───────────────────────────────
     if (interaction.isButton() && interaction.customId.startsWith('sociallinks_refresh_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const { embeds, components } = await buildSocialLinksEmbed(guildId);
+        const { embeds, components } = await buildSocialLinksEmbed(guildId, interaction.user.id);
         return interaction.update({ embeds, components });
     }
 
@@ -200,10 +201,11 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const [platform, idStr] = interaction.values[0].split(':');
         const link = await getSocialLinkById(parseInt(idStr, 10));
-        if (!link || link.guild_id !== guildId || link.platform !== platform) {
+        // Visible if this server's watches use it or you linked it; never just because it exists.
+        if (!link || link.platform !== platform || !(link.linked_by === interaction.user.id || await isLinkUsedInGuild(link.id, guildId))) {
             return interaction.reply({ content: '❌ Linked account not found (it may have been removed).', flags: [MessageFlags.Ephemeral] });
         }
-        const { embeds, components } = buildSocialLinkManageView(link);
+        const { embeds, components } = buildSocialLinkManageView(link, { guildId, canUnlink: canUnlinkLink(link, interaction.user.id), usage: await getLinkUsage(link.id) });
         return interaction.update({ embeds, components });
     }
 
@@ -214,7 +216,7 @@ client.on('interactionCreate', async interaction => {
         const action = parts[1];
 
         if (action === 'back') {
-            const { embeds, components } = await buildSocialLinksEmbed(guildId);
+            const { embeds, components } = await buildSocialLinksEmbed(guildId, interaction.user.id);
             return interaction.update({ embeds, components });
         }
 
@@ -222,9 +224,13 @@ client.on('interactionCreate', async interaction => {
             const platform = parts[2];
             const id = parseInt(parts[3], 10);
             const link = await getSocialLinkById(id);
-            if (!link || link.guild_id !== guildId) {
-                const { embeds, components } = await buildSocialLinksEmbed(guildId);
+            if (!link || link.platform !== platform || !(link.linked_by === interaction.user.id || await isLinkUsedInGuild(link.id, guildId))) {
+                const { embeds, components } = await buildSocialLinksEmbed(guildId, interaction.user.id);
                 return interaction.update({ content: '❌ Linked account not found (it may have already been removed).', embeds, components });
+            }
+            // A linked account may be used by other servers, and unlinking pauses all of them.
+            if (!canUnlinkLink(link, interaction.user.id)) {
+                return interaction.reply({ content: `❌ Only <@${link.linked_by}> (who linked it) or the bot owner can unlink this account, because other servers may be using it. To stop it in this server, remove its watches from \`/social list\`.`, flags: [MessageFlags.Ephemeral], allowedMentions: { parse: [] } });
             }
 
             let revokeNote = '';
@@ -239,9 +245,13 @@ client.on('interactionCreate', async interaction => {
                 revokeNote = '\nInstagram doesn\'t let apps revoke their own tokens — if the account owner wants to fully disconnect on their end too, they can do it from Instagram → Settings → Apps and Websites → Notifyer → Remove.';
             }
 
-            await deleteSocialLink(guildId, id);
-            const { embeds, components } = await buildSocialLinksEmbed(guildId);
-            return interaction.update({ content: `✅ Unlinked **${link.external_username}** (${PLATFORMS[platform].label}). Any watches for that account are now paused until it's re-linked and re-added.${revokeNote}`, embeds, components });
+            const affected = await getWatchesByLink(link.id);
+            await deleteSocialLink(link.id);
+            // Tells the affected servers' admins (and you, if the bot owner did it). Fire and forget.
+            reportLinkProblem(link, 'unlinked', affected, link.linked_by === interaction.user.id ? null : 'unlinked by someone else');
+            const servers = new Set(affected.map(a => a.guild_id)).size;
+            const { embeds, components } = await buildSocialLinksEmbed(guildId, interaction.user.id);
+            return interaction.update({ content: `✅ Unlinked **${link.external_username}** (${PLATFORMS[platform].label}).${affected.length ? ` ${affected.length} watch${affected.length === 1 ? '' : 'es'} in ${servers} server${servers === 1 ? '' : 's'} paused; they resume if the account is linked again.` : ''}${revokeNote}`, embeds, components });
         }
     }
 
@@ -371,24 +381,10 @@ client.on('interactionCreate', async interaction => {
         if (action === 'remove') {
             let unlinkNote = '';
             if (w.social_link_id) {
-                // A linked account can be tracked into more than one channel — only
-                // unlink if no OTHER watch still references it, so removing one
-                // doesn't silently break a sibling watch of the same account.
-                const guildWatches = await getWatches(guildId);
-                const stillUsed = guildWatches.some(other => other.id !== w.id && other.social_link_id === w.social_link_id);
-                if (!stillUsed) {
-                    const link = await getSocialLinkById(w.social_link_id);
-                    if (link) {
-                        if (w.platform === 'tiktok') {
-                            const result = await revokeTikTokToken(link);
-                            unlinkNote = result.ok
-                                ? '\nAlso unlinked the TikTok account (token revoked with TikTok) since no other watches were using it.'
-                                : `\nAlso unlinked the TikTok account locally, though revoking the token with TikTok failed (${result.reason}) — the account owner may want to remove app access manually from TikTok's app permissions settings.`;
-                        } else if (w.platform === 'instagram') {
-                            unlinkNote = '\nAlso unlinked the Instagram account locally since no other watches were using it. Instagram doesn\'t let apps revoke their own tokens — the account owner can fully disconnect from Instagram → Settings → Apps and Websites → Notifyer → Remove.';
-                        }
-                        await deleteSocialLink(guildId, w.social_link_id);
-                    }
+                // Linked accounts are shared across servers, so only say something when no watch anywhere uses it any
+                // more. It isn't deleted right away (you may track it elsewhere); the daily sweep removes it after 30 days.
+                if (await countOtherWatchesUsingLink(w.social_link_id, w.id) === 0) {
+                    unlinkNote = '\nNo watches use that linked account any more. It stays linked for 30 days in case you track it again, then is removed automatically. To remove it now, use `/social links`.';
                 }
             }
             await removeWatch(guildId, id);

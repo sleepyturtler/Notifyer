@@ -56,6 +56,7 @@ function shouldNotify(w, post) {
 const POST_TYPE_BUTTON_LABEL = {
     youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
     twitter:   { posts: 'View Tweet' },
+    rss:       { posts: 'Read More' },
     bluesky:   { posts: 'View Post', replies: 'View Reply', reposts: 'View Repost' },
     twitch:    { live: 'Join Stream', vods: 'Watch VOD' },
     kick:      { live: 'Join Stream' },
@@ -179,7 +180,7 @@ function buildNotificationPayload(w, post) {
         .setColor(post.isLive ? '#FF0000' : p.color)
         .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
         .setURL(post.url)
-        .setDescription(post.title || null)
+        .setDescription([post.title, post.summary].filter(Boolean).join('\n\n').slice(0, 4000) || null)
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.isLive && post.category) embed.addFields({ name: 'Category', value: String(post.category).slice(0, 1024), inline: true });

@@ -279,7 +279,7 @@ const HELP_CATEGORIES = [
         id: 'info', emoji: 'ℹ️', label: 'Info',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Info`)
             .addFields(
-                { name: 'Platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') + '\n⚠️ = unavailable right now' },
+                { name: 'Platforms', value: Object.values(PLATFORMS).filter(p => !p.restricted).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') + '\n⚠️ = unavailable right now' },
                 { name: 'Placeholders', value: '`{author}` `{handle}` `{platform}` `{title}` `{url}`, plus `{is/was}` for Live.' },
                 { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. Twitter and Bluesky: every 2 minutes. YouTube: new uploads and streams arrive instantly by push, with a backup check every 20 minutes (every 2 minutes if push is not active for that channel).' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
@@ -311,7 +311,7 @@ function buildSetupView(tabId, watchCount = 0) {
         case 'welcome':
             embed.setDescription(
                 'Notifyer posts in a channel when an account you track uploads, posts or goes live.\n\n' +
-                `**Platforms:** ${Object.values(PLATFORMS).map(p => p.label + (p.unavailable ? ' (unavailable)' : '')).join(', ')}\n\n` +
+                `**Platforms:** ${Object.values(PLATFORMS).filter(p => !p.restricted).map(p => p.label + (p.unavailable ? ' (unavailable)' : '')).join(', ')}\n\n` +
                 'Click through the tabs to see how it works, then add your first account.');
             break;
         case 'track':

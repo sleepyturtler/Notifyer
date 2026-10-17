@@ -7,7 +7,7 @@
 // appear to be missing, which points to a Discord/connection problem rather than real removals.
 
 const { client } = require('./client.js');
-const { deleteGuildData, getStoredGuildIds, getWatches } = require('./db.js');
+const { deleteGuildData, getStoredGuildIds, getWatches, sweepUnusedSocialLinks } = require('./db.js');
 const { revokeTikTokToken } = require('./platforms/social.js');
 
 // Never throws. Returns what was removed, or null if the deletion itself failed.
@@ -19,15 +19,8 @@ async function purgeGuild(guildId, why) {
         console.error(`purgeGuild (${guildId}): deletion failed, nothing was removed:`, e.message);
         return null;
     }
-    // Best effort: tell TikTok to drop the tokens so the bot disappears from the owner's "Manage app
-    // permissions" page. (Meta has no app-side revoke for Instagram; the account owner removes it there.)
-    let revoked = 0;
-    for (const link of result.links) {
-        if (link.platform !== 'tiktok') continue;
-        const r = await revokeTikTokToken(link).catch(e => ({ ok: false, reason: e.message }));
-        if (r.ok) revoked++;
-    }
-    console.log(`🧹 Removed all stored data for guild ${guildId} (${why}): ${result.watches} watch(es), ${result.links.length} linked account(s), ${revoked} TikTok token(s) revoked`);
+    // Linked accounts belong to the account, not the server, so they stay; sweepUnusedLinks() removes any that no watch uses.
+    console.log(`🧹 Removed all stored data for guild ${guildId} (${why}): ${result.watches} watch(es)`);
     return result;
 }
 
@@ -53,4 +46,22 @@ async function purgeOrphanedGuilds() {
     for (const id of orphans) await purgeGuild(id, 'the bot is no longer in this server');
 }
 
-module.exports = { purgeGuild, purgeOrphanedGuilds };
+// Removes linked accounts no watch has used for UNUSED_LINK_GRACE_MS, revoking the TikTok token (Meta has no app-side
+// revoke for Instagram). Never throws. Runs at startup and every few hours; see events.js.
+const UNUSED_LINK_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+async function sweepUnusedLinks() {
+    try {
+        const removed = await sweepUnusedSocialLinks(UNUSED_LINK_GRACE_MS);
+        let revoked = 0;
+        for (const link of removed) {
+            if (link.platform !== 'tiktok') continue;
+            const r = await revokeTikTokToken(link).catch(e => ({ ok: false, reason: e.message }));
+            if (r.ok) revoked++;
+        }
+        if (removed.length) console.log(`🧹 Removed ${removed.length} linked account(s) unused for 30 days (${revoked} TikTok token(s) revoked)`);
+    } catch (e) {
+        console.error('unused-link sweep:', e.message);
+    }
+}
+
+module.exports = { purgeGuild, purgeOrphanedGuilds, sweepUnusedLinks, UNUSED_LINK_GRACE_MS };

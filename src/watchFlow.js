@@ -43,7 +43,10 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
         // Instagram/TikTok can only be watched for accounts that have gone through
         // /social link — there's no way to poll an arbitrary public account via
         // their official APIs without that account's consent.
-        const link = await getSocialLinkByUsername(guildId, platform, handle);
+        const link = await getSocialLinkByUsername(platform, handle);
+        if (link && link.needs_relink_at) {
+            return { ok: false, message: `❌ The linked **${handle}** account needs to be re-linked first: its owner has to run \`/social link\` again.` };
+        }
         if (!link) {
             return { ok: false, message: `❌ **${handle}** hasn't been linked yet. That account needs to run \`/social link\` and authorize with ${PLATFORMS[platform].label} first — this bot can't watch ${PLATFORMS[platform].label} accounts that haven't consented.\nUse \`/social links\` to see what's already linked in this server.` };
         }

@@ -2,7 +2,7 @@
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { ButtonBuilder, ButtonStyle, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
-const { getSocialLinks, getWatches } = require('./db.js');
+const { getSocialLinksVisible, getWatches } = require('./db.js');
 const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
@@ -80,21 +80,21 @@ async function buildWatchListEmbed(guildId) {
     return { embeds: [embed], components };
 }
 
-async function buildSocialLinksEmbed(guildId) {
-    const igLinks = await getSocialLinks(guildId, 'instagram');
-    const ttLinks = await getSocialLinks(guildId, 'tiktok');
-    const allLinks = [...igLinks, ...ttLinks];
+async function buildSocialLinksEmbed(guildId, userId) {
+    const links = await getSocialLinksVisible(guildId, userId);
+    const ofPlatform = p => links.filter(l => l.platform === p);
+    const line = l => `• ${l.external_username} (linked by <@${l.linked_by}>)${l.needs_relink_at ? ' ⚠️ needs re-link' : ''}`;
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Linked Accounts').setTimestamp()
-        .setDescription('Accounts authorized via `/social link` in this server. Only these can be added with `/social add`.')
+        .setDescription('Accounts this server tracks, plus accounts you linked. A linked account works in **any server** that uses Notifyer, and only the person who linked it can unlink it.')
         .addFields(
-            { name: '📸 Instagram', value: igLinks.length ? igLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
-            { name: '🎵 TikTok', value: ttLinks.length ? ttLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
+            { name: '📸 Instagram', value: (ofPlatform('instagram').map(line).join('\n') || '*(none)*').slice(0, 1000) },
+            { name: '🎵 TikTok', value: (ofPlatform('tiktok').map(line).join('\n') || '*(none)*').slice(0, 1000) },
         );
-    if (!allLinks.length) return { embeds: [embed], components: [] };
+    if (!links.length) return { embeds: [embed], components: [] };
     const components = [
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallinks_manage_${guildId}`).setPlaceholder('Manage a linked account…')
-                .addOptions(allLinks.slice(0, 25).map(l => ({
+                .addOptions(links.slice(0, 25).map(l => ({
                     label: `${PLATFORMS[l.platform].label} — ${l.external_username}`.slice(0, 100),
                     value: `${l.platform}:${l.id}`,
                     emoji: PLATFORMS[l.platform]?.emojiButton,
@@ -105,18 +105,21 @@ async function buildSocialLinksEmbed(guildId) {
     return { embeds: [embed], components };
 }
 
-function buildSocialLinkManageView(link) {
+// canUnlink: only the person who linked it (or the bot owner) may; usage = { watches, guilds } across all servers.
+function buildSocialLinkManageView(link, { guildId, canUnlink = false, usage = null } = {}) {
     const p = PLATFORMS[link.platform];
     const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage Link — ${p.emojiTag} ${link.external_username}`).setTimestamp()
         .addFields(
             { name: 'Platform', value: p.label, inline: true },
-            { name: 'Linked by', value: link.linked_by, inline: true },
+            { name: 'Linked by', value: `<@${link.linked_by}>`, inline: true },
+            { name: 'Status', value: link.needs_relink_at ? '⚠️ Needs re-link (`/social link`)' : '✅ Working', inline: true },
         );
-    const components = [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`sociallinkmanage_unlink_${link.platform}_${link.id}`).setLabel('Unlink').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`sociallinkmanage_back_${link.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
-    )];
-    return { embeds: [embed], components };
+    if (usage) embed.addFields({ name: 'Used by', value: `${usage.watches} watch${usage.watches === 1 ? '' : 'es'} in ${usage.guilds} server${usage.guilds === 1 ? '' : 's'}`, inline: true });
+    if (!canUnlink) embed.setFooter({ text: 'Only the person who linked this account can unlink it.' });
+    const row = new ActionRowBuilder();
+    if (canUnlink) row.addComponents(new ButtonBuilder().setCustomId(`sociallinkmanage_unlink_${link.platform}_${link.id}`).setLabel('Unlink').setStyle(ButtonStyle.Danger));
+    row.addComponents(new ButtonBuilder().setCustomId(`sociallinkmanage_back_${guildId}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary));
+    return { embeds: [embed], components: [row] };
 }
 
 // Shared modal builder used both from the manage view's "Edit Messages"
@@ -264,8 +267,8 @@ const HELP_CATEGORIES = [
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Linking`)
             .setDescription("Instagram and TikTok need the account owner's consent.")
             .addFields(
-                { name: '/social link', value: 'Link an Instagram or TikTok account. The owner opens the link and approves.' },
-                { name: '/social links', value: 'See linked accounts. Pick one to unlink it.' },
+                { name: '/social link', value: 'Link an Instagram or TikTok account once. The owner approves. It then works in any server.' },
+                { name: '/social links', value: 'See linked accounts used here or linked by you. Whoever linked one can unlink it.' },
             ),
     },
     {
@@ -321,7 +324,7 @@ function buildSetupView(tabId, watchCount = 0) {
                 '`/social list` See every tracked account. Pick one to manage it.\n' +
                 '`/social preview` See a sample notification for any account.\n' +
                 '`/social check` Check everything now instead of waiting.' +
-                (oauthAvailable ? '\n`/social link` Link an Instagram or TikTok account first. The owner approves it.' : ''));
+                (oauthAvailable ? '\n`/social link` Link an Instagram or TikTok account first. The owner approves it, once, for every server.' : ''));
             break;
         case 'customize':
             embed.setDescription(

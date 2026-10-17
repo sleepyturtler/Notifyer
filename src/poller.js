@@ -3,7 +3,7 @@
 
 const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE, YOUTUBE_PUSH_POLL_INTERVAL_MS } = require('./config.js');
 const { client } = require('./client.js');
-const { getWatch, getAllWatches, getPushCoveredYouTubeChannels, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
+const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
@@ -14,6 +14,7 @@ const { fetchLatestRssAll } = require('./platforms/rss.js');
 const { computeRssInterval, nextRssBackoff, rssPollDue } = require('./rssPoll.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { fetchLatestPost } = require('./platforms/index.js');
+const { reportLinkProblem } = require('./announcements.js');
 
 // ── Polling loop ───────────────────────────────────────────────────────────
 const PLATFORM_MIN_INTERVAL_MS = {};
@@ -209,10 +210,18 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                             perCyclePostsCache.set(w.social_link_id, (async () => {
                                 const link = await getSocialLinkById(w.social_link_id);
                                 if (!link) return null; // link was removed
-                                return w.platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
+                                if (link.needs_relink_at) return { dead: true }; // the platform rejected its login; waiting for the owner to re-link
+                                try {
+                                    return w.platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
+                                } catch (e) {
+                                    // Once per link per pass (this promise is shared by every watch using it, in every server).
+                                    if (e.relinkNeeded) reportLinkProblem(link, 'dead', await getWatchesByLink(link.id).catch(() => []), e.message);
+                                    throw e;
+                                }
                             })());
                         }
                         posts = await perCyclePostsCache.get(w.social_link_id);
+                        if (posts && posts.dead) { await touchLastChecked(w.id, 'The linked account needs to be re-linked (/social link).'); continue; }
                         if (posts === null) { await touchLastChecked(w.id); continue; } // link was removed
                     }
                     let newSeenIds = [...seenIds];

@@ -3,13 +3,15 @@
 
 const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE, YOUTUBE_PUSH_POLL_INTERVAL_MS } = require('./config.js');
 const { client } = require('./client.js');
-const { getWatch, getAllWatches, getPushCoveredYouTubeChannels, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
+const { getWatch, getAllWatches, getPushCoveredYouTubeChannels, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
 const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
 const { fetchLatestKickAll } = require('./platforms/kick.js');
 const { fetchLatestBlueskyAll } = require('./platforms/bluesky.js');
+const { fetchLatestRssAll } = require('./platforms/rss.js');
+const { computeRssInterval, nextRssBackoff, rssPollDue } = require('./rssPoll.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { fetchLatestPost } = require('./platforms/index.js');
 
@@ -109,6 +111,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
             if (minInterval && w.last_checked && (Date.now() - w.last_checked) < minInterval) continue;
             if (skipYouTubePoll(w, pushCovered)) continue;
+            if (!onlyGuildId && w.platform === 'rss' && !rssPollDue(w)) continue; // adaptive: each feed has its own interval
             if (watchesInFlight.has(w.id)) continue; // another pass is already handling this watch
             watchesInFlight.add(w.id);
             try {
@@ -179,20 +182,21 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     } else {
                         await touchLastChecked(w.id);
                     }
-                } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky' || w.platform === 'instagram' || w.platform === 'tiktok') {
+                } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky' || w.platform === 'rss' || w.platform === 'instagram' || w.platform === 'tiktok') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
-                    if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky') {
+                    if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky' || w.platform === 'rss') {
                         // Same redundant-external-call shape as the Instagram/TikTok shared-link
                         // case below — multiple watches (any servers) can track the same
                         // streamer by handle, and without caching each one independently re-hits
                         // the real Twitch/Kick API for the identical channel, every fast-poll
                         // cycle (20s). Cache by platform+handle for the rest of this pass.
-                        const handleCacheKey = `${w.platform}:${w.handle.toLowerCase()}`;
+                        const handleCacheKey = `${w.platform}:${w.platform === 'rss' ? w.handle : w.handle.toLowerCase()}`; // feed URLs are case-sensitive
                         if (!perCyclePostsCache.has(handleCacheKey)) {
-                            perCyclePostsCache.set(handleCacheKey, (w.platform === 'twitch' ? fetchLatestTwitchAll : w.platform === 'kick' ? fetchLatestKickAll : fetchLatestBlueskyAll)(w.handle));
+                            perCyclePostsCache.set(handleCacheKey, (w.platform === 'twitch' ? fetchLatestTwitchAll : w.platform === 'kick' ? fetchLatestKickAll : w.platform === 'rss' ? fetchLatestRssAll : fetchLatestBlueskyAll)(w.handle));
                         }
                         posts = await perCyclePostsCache.get(handleCacheKey);
+                        if (w.platform === 'rss') await setWatchPollInterval(w.id, computeRssInterval((posts || []).map(p => p.timestamp))).catch(() => {});
                     } else {
                         if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
                         // Multiple watches (even across channels/guilds) can share one linked
@@ -270,6 +274,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                 } else {
                     console.error(`poll ${w.platform}/${w.handle}:`, e.message);
                 }
+                if (w.platform === 'rss') await setWatchPollInterval(w.id, nextRssBackoff(w.poll_interval_ms)).catch(() => {}); // dead feeds back off
                 await touchLastChecked(w.id, e.message).catch(() => {});
             } finally {
                 watchesInFlight.delete(w.id);

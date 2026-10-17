@@ -63,7 +63,7 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 <ul>
 <li><b>Server configuration:</b> the Discord server (guild) ID, channel IDs, role IDs, and the account handles/URLs you choose to track, along with any custom notification message templates you set.</li>
 <li><b>Discord identifiers:</b> the Discord user ID and username of whoever adds a watch or links an account, stored only to show who configured something.</li>
-<li><b>OAuth tokens:</b> if you use <code>/social link</code> to connect an Instagram or TikTok account, we store the access token, refresh token, and the linked account's platform user ID/username, so the Bot can check that account for new posts on your behalf.</li>
+<li><b>OAuth tokens:</b> if you use <code>/social link</code> to connect an Instagram or TikTok account, we store the access token, refresh token, and the linked account's platform user ID/username, so the Bot can check that account for new posts on your behalf. A linked account belongs to the account itself, not to one server: once linked it can be tracked in any server that uses the Bot, and only the person who linked it (or the Bot's operator) can unlink it. Linked accounts that no watch has used for 30 days are removed automatically.</li>
 <li><b>Post metadata:</b> IDs and timestamps of posts already seen, so the Bot doesn't re-notify for the same content.</li>
 </ul>
 <p>We do not collect message content from your Discord server beyond what's needed to operate slash commands, and we do not read or store the content of DMs.</p>

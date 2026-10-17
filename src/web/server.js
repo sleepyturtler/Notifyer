@@ -175,7 +175,7 @@ async function handleOAuthCallback(platform, req, res) {
             accessToken: identity.accessToken, refreshToken: identity.refreshToken, expiresAt: identity.expiresAt,
             linkedBy: stateEntry.userId,
         });
-        return htmlResponse(res, 200, 'Linked!', `<b>${escapeHtml(identity.externalUsername)}</b> is now linked. You can close this tab and go back to Discord, then use <code>/social add</code> to start tracking it.`);
+        return htmlResponse(res, 200, 'Linked!', `<b>${escapeHtml(identity.externalUsername)}</b> is now linked. It can be tracked in any server that uses Notifyer: close this tab, go back to Discord and use <code>/social add</code>. You can unlink it any time from <code>/social links</code>.`);
     } catch (e) {
         console.error(`OAuth callback (${platform}):`, e.message);
         return htmlResponse(res, 500, 'Link failed', `${escapeHtml(e.message)} — you can close this tab and try /social link again.`);

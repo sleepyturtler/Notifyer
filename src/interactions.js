@@ -11,6 +11,7 @@ const { hasCommandPermission } = require('./permissions.js');
 const { buildAddWatchSuccessResponse, createWatchFlow } = require('./watchFlow.js');
 const { pollAll } = require('./poller.js');
 const { reportLinkProblem } = require('./announcements.js');
+const { handleLinkRequestButton } = require('./linkRequests.js');
 const { revokeTikTokToken } = require('./platforms/social.js');
 const { SETUP_PICK_TTL_MS, createOAuthState, pendingSetupPicks } = require('./state.js');
 const { buildNotificationPayload, buildSamplePost } = require('./notify.js');
@@ -26,6 +27,8 @@ const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? requir
 
 client.on('interactionCreate', async interaction => {
   try {
+    // Approve/Deny buttons arrive by DM, so there is no guild: handle them before the guild-only checks below.
+    if (interaction.isButton() && interaction.customId.startsWith('linkreq_')) return await handleLinkRequestButton(interaction);
     const guildId = interaction.guild?.id;
     if (!guildId) return;
     const reply = (payload) => {
@@ -90,7 +93,7 @@ client.on('interactionCreate', async interaction => {
 
                 await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
-                const result = await createWatchFlow(guildId, platform, rawHandle, channel.id, interaction.user.tag, bypassUnavailable);
+                const result = await createWatchFlow(guildId, platform, rawHandle, channel.id, interaction.user.tag, bypassUnavailable, interaction.user.id);
                 if (!result.ok) return interaction.editReply(result.message);
 
                 const { embeds, components } = buildAddWatchSuccessResponse(result.watch, result.post, result.handle, channel);
@@ -511,7 +514,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.update({ content: 'Setting that up…', components: [] });
         if (!canUsePlatform(pending.platform, interaction.user.id)) return interaction.editReply({ content: '❌ That platform is not available yet.' });
         const bypassUnavailable = Boolean(PLATFORMS[pending.platform]?.ownerOnly && isOwner(interaction.user.id));
-        const result = await createWatchFlow(guildId, pending.platform, pending.rawHandle, channelId, interaction.user.tag, bypassUnavailable);
+        const result = await createWatchFlow(guildId, pending.platform, pending.rawHandle, channelId, interaction.user.tag, bypassUnavailable, interaction.user.id);
         if (!result.ok) return interaction.editReply({ content: result.message });
         const { embeds, components } = buildAddWatchSuccessResponse(result.watch, result.post, result.handle, channel);
         return interaction.editReply({ content: null, embeds, components });

@@ -9,6 +9,7 @@ const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/s
 const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
 const { fetchLatestKickAll } = require('./platforms/kick.js');
 const { fetchLatestBlueskyAll } = require('./platforms/bluesky.js');
+const { fetchLatestRssAll } = require('./platforms/rss.js');
 const { fetchLatestPost } = require('./platforms/index.js');
 const { fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
@@ -66,6 +67,10 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
                 baselineSeenIds = posts.map(p => p.id);
             } else if (platform === 'kick') {
                 const posts = await fetchLatestKickAll(handle);
+                post = posts[0] || null;
+                baselineSeenIds = posts.map(p => p.id);
+            } else if (platform === 'rss') {
+                const posts = await fetchLatestRssAll(handle);
                 post = posts[0] || null;
                 baselineSeenIds = posts.map(p => p.id);
             } else if (platform === 'bluesky') {

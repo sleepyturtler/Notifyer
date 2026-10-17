@@ -20,6 +20,17 @@ function normalizeHandle(platform, raw) {
         h = h.replace(/^(twitter\.com|x\.com)\//i, '');
         h = h.replace(/^@/, '');
         h = h.split(/[/?]/)[0];
+    } else if (platform === 'rss') {
+        // The handle IS the feed URL. Keep path/query case; reject anything that isn't a plain http(s) URL.
+        h = raw.trim(); // the generic scheme/www stripping above would change the feed's real address
+        if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(h)) h = 'https://' + h;
+        try {
+            const u = new URL(h);
+            if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.username || u.password) return '';
+            u.hash = '';
+            h = u.toString();
+        } catch { return ''; }
+        if (h.length > 300) return '';
     } else if (platform === 'bluesky') {
         h = h.replace(/^bsky\.app\/profile\//i, '').replace(/^@/, '');
         h = h.split(/[/?#]/)[0].toLowerCase();
@@ -49,6 +60,7 @@ function profileUrl(platform, handle) {
     switch (platform) {
         case 'youtube': return handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/channel/${handle}`;
         case 'twitter': return `https://x.com/${handle}`;
+        case 'rss': return handle;
         case 'bluesky': return `https://bsky.app/profile/${handle}`;
         case 'twitch': return `https://www.twitch.tv/${handle}`;
         case 'kick': return `https://kick.com/${handle}`;

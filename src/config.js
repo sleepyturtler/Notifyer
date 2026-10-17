@@ -76,6 +76,8 @@ const PLATFORMS = {
     // auto-disabled here the way the others below are.
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
     bluesky:   { label: 'Bluesky',   emoji: '🦋', color: '#1185FE' },
+    // Arbitrary user-supplied feed URLs: owner-only (restricted) until RSS_PUBLIC=true.
+    rss:       { label: 'RSS',       emoji: '📰', color: '#F26522', restricted: process.env.RSS_PUBLIC !== 'true' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF', unavailable: !(process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET) },
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18', unavailable: !(process.env.KICK_CLIENT_ID && process.env.KICK_CLIENT_SECRET) },
     // Instagram/TikTok also need PUBLIC_BASE_URL — without it there's nowhere for
@@ -94,6 +96,12 @@ function activeTypeIds(w) {
 function isOwner(userId) {
     const ownerId = process.env.BOT_OWNER_ID;
     return Boolean(ownerId && userId === ownerId);
+}
+
+// Restricted platforms (RSS) can only be used by the bot owner.
+function canUsePlatform(key, userId) {
+    const p = PLATFORMS[key];
+    return Boolean(p) && (!p.restricted || isOwner(userId));
 }
 
 // Custom (application) emoji support via EMOJI_<PLATFORM> env vars — optional,
@@ -120,6 +128,7 @@ const PLATFORM_NOTIFY_TYPES = {
     ],
     twitter:   [{ id: 'posts', label: 'Posts', description: 'New tweets/posts' }],
     // Replies and reposts are opt-in (defaultOff): a watch with no saved selection only fires for posts.
+    rss:       [{ id: 'posts', label: 'Posts', description: 'New feed items' }],
     bluesky:   [
         { id: 'posts',   label: 'Posts',   description: 'New posts' },
         { id: 'replies', label: 'Replies', description: 'Replies to other posts', defaultOff: true },
@@ -159,9 +168,16 @@ const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 // often instead of every SLOW_POLL_INTERVAL_MS. Override with YOUTUBE_POLL_INTERVAL_MS (never below the slow interval).
 const YOUTUBE_PUSH_POLL_INTERVAL_MS = Math.max(SLOW_POLL_INTERVAL_MS, parseInt(process.env.YOUTUBE_POLL_INTERVAL_MS, 10) || 20 * 60 * 1000);
 
+// RSS watches adapt their own poll interval to how often the feed posts (see rssPoll.js). Starts at the default,
+// speeds up for busy feeds down to the min (the slow loop's tick, so it can't go lower), and slows to the max for quiet ones.
+const envMs = (name, fallback) => { const n = parseInt(process.env[name], 10); return n > 0 ? n : fallback; };
+const RSS_POLL_MIN_MS = Math.max(SLOW_POLL_INTERVAL_MS, envMs('RSS_POLL_MIN_MS', SLOW_POLL_INTERVAL_MS));
+const RSS_POLL_MAX_MS = Math.max(RSS_POLL_MIN_MS, envMs('RSS_POLL_MAX_MS', 60 * 60 * 1000));
+const RSS_POLL_DEFAULT_MS = Math.min(RSS_POLL_MAX_MS, Math.max(RSS_POLL_MIN_MS, envMs('RSS_POLL_DEFAULT_MS', 10 * 60 * 1000)));
+
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
 
-const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter', 'bluesky']);
+const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter', 'bluesky', 'rss']);
 
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
 
@@ -187,6 +203,7 @@ function logStartupConfigSummary() {
     else off('YouTube', 'missing YOUTUBE_API_KEY');
 
     ok('Bluesky (public API, no credentials needed)');
+    ok(`RSS (${PLATFORMS.rss.restricted ? 'owner-only' : 'public'})`);
     ok(`Twitter/X (via Nitter, ${NITTER_INSTANCES.length} mirror(s) configured)`);
 
     if (process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET) {
@@ -205,4 +222,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, activeTypeIds, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, RSS_POLL_DEFAULT_MS, RSS_POLL_MIN_MS, RSS_POLL_MAX_MS, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };

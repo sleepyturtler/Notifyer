@@ -98,6 +98,12 @@ function isOwner(userId) {
     return Boolean(ownerId && userId === ownerId);
 }
 
+// A linked account may be used from any server, so unlinking it (which pauses every server's watches) is limited to the
+// person who linked it and the bot owner.
+function canUnlinkLink(link, userId) {
+    return Boolean(link) && ((Boolean(link.linked_by) && String(link.linked_by) === String(userId)) || isOwner(userId));
+}
+
 // Restricted platforms (RSS) can only be used by the bot owner.
 function canUsePlatform(key, userId) {
     const p = PLATFORMS[key];
@@ -222,4 +228,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, RSS_POLL_DEFAULT_MS, RSS_POLL_MIN_MS, RSS_POLL_MAX_MS, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, RSS_POLL_DEFAULT_MS, RSS_POLL_MIN_MS, RSS_POLL_MAX_MS, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };

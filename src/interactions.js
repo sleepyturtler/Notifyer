@@ -3,7 +3,7 @@
 
 const { MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, EmbedBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ChannelSelectMenuBuilder, ChannelType } = require('discord.js');
 const { client } = require('./client.js');
-const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, isOwner } = require('./config.js');
+const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, canUsePlatform, isOwner } = require('./config.js');
 const { E, canWatchBatch } = require('./helpers.js');
 const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
 const { deleteSocialLink, getConfig, getSocialLinkById, getWatch, getWatches, removeWatch, saveConfig, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
@@ -37,7 +37,7 @@ client.on('interactionCreate', async interaction => {
             const focused = interaction.options.getFocused().toLowerCase();
             const ownerHere = isOwner(interaction.user.id);
             const choices = Object.entries(PLATFORMS)
-                .filter(([, v]) => !v.unavailable || (v.ownerOnly && ownerHere))
+                .filter(([k, v]) => canUsePlatform(k, interaction.user.id) && (!v.unavailable || (v.ownerOnly && ownerHere)))
                 .map(([k, v]) => ({ name: `${v.emoji} ${v.label}`, value: k }))
                 .filter(c => c.name.toLowerCase().includes(focused));
             return interaction.respond(choices.slice(0, 25));
@@ -85,6 +85,7 @@ client.on('interactionCreate', async interaction => {
                 const rawHandle = interaction.options.getString('handle');
                 const channel = interaction.options.getChannel('channel');
                 const bypassUnavailable = Boolean(PLATFORMS[platform]?.ownerOnly && isOwner(interaction.user.id));
+                if (PLATFORMS[platform] && !canUsePlatform(platform, interaction.user.id)) return reply('❌ That platform is not available yet.');
 
                 await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
@@ -464,7 +465,7 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const ownerHere = isOwner(interaction.user.id);
         const options = Object.entries(PLATFORMS)
-            .filter(([, v]) => !v.unavailable || (v.ownerOnly && ownerHere))
+            .filter(([k, v]) => canUsePlatform(k, interaction.user.id) && (!v.unavailable || (v.ownerOnly && ownerHere)))
             .map(([k, v]) => ({ label: v.label, value: k, emoji: v.emojiButton }));
         const row = new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId('setup_platform_pick').setPlaceholder('Choose a platform…').addOptions(options)
@@ -475,6 +476,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isStringSelectMenu() && interaction.customId === 'setup_platform_pick') {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const platform = interaction.values[0];
+        if (!canUsePlatform(platform, interaction.user.id)) return interaction.update({ content: '❌ That platform is not available yet.', components: [] });
         pendingSetupPicks.set(`${guildId}_${interaction.user.id}`, { platform, expires: Date.now() + SETUP_PICK_TTL_MS });
         const modal = new ModalBuilder().setCustomId('setup_handle_modal').setTitle(`Add a ${PLATFORMS[platform].label} account`)
             .addComponents(new ActionRowBuilder().addComponents(
@@ -511,6 +513,7 @@ client.on('interactionCreate', async interaction => {
         const channelId = interaction.values[0];
         const channel = interaction.guild.channels.cache.get(channelId);
         await interaction.update({ content: 'Setting that up…', components: [] });
+        if (!canUsePlatform(pending.platform, interaction.user.id)) return interaction.editReply({ content: '❌ That platform is not available yet.' });
         const bypassUnavailable = Boolean(PLATFORMS[pending.platform]?.ownerOnly && isOwner(interaction.user.id));
         const result = await createWatchFlow(guildId, pending.platform, pending.rawHandle, channelId, interaction.user.tag, bypassUnavailable);
         if (!result.ok) return interaction.editReply({ content: result.message });

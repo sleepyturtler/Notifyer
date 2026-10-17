@@ -13,13 +13,14 @@ const { fetchLatestRssAll } = require('./platforms/rss.js');
 const { fetchLatestPost } = require('./platforms/index.js');
 const { fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
+const { checkLinkAccess, requestLinkApproval } = require('./linkRequests.js');
 
 // ── Shared watch-creation flow ──────────────────────────────────────────────
 // Used by both /social add and the /setup wizard so there's exactly one place
 // that validates a platform+handle+channel and creates the watch — no risk of
 // the two entry points drifting apart. Returns { ok: true, watch, post } or
 // { ok: false, message } (message is already a user-facing ❌ reply string).
-async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByTag, bypassUnavailable = false) {
+async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByTag, bypassUnavailable = false, userId = null) {
     if (!PLATFORMS[platform]) {
         return { ok: false, message: `❌ Unrecognized platform \`${platform}\`. Please pick one of the options Discord suggests as you type.` };
     }
@@ -49,6 +50,11 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
         }
         if (!link) {
             return { ok: false, message: `❌ **${handle}** hasn't been linked yet. That account needs to run \`/social link\` and authorize with ${PLATFORMS[platform].label} first — this bot can't watch ${PLATFORMS[platform].label} accounts that haven't consented.\nUse \`/social links\` to see what's already linked in this server.` };
+        }
+        // Someone else's linked account can only be added by them, the bot owner, or a server that already uses it or
+        // was approved; anyone else triggers an approval request to the person who linked it.
+        if (!(await checkLinkAccess(link, guildId, userId)).allowed) {
+            return { ok: false, message: (await requestLinkApproval(link, guildId, userId, addedByTag)).message };
         }
         socialLinkId = link.id;
         try {

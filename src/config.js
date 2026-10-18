@@ -172,12 +172,21 @@ const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 // often instead of every SLOW_POLL_INTERVAL_MS. Override with YOUTUBE_POLL_INTERVAL_MS (never below the slow interval).
 const YOUTUBE_PUSH_POLL_INTERVAL_MS = Math.max(SLOW_POLL_INTERVAL_MS, parseInt(process.env.YOUTUBE_POLL_INTERVAL_MS, 10) || 20 * 60 * 1000);
 
-// RSS watches adapt their own poll interval to how often the feed posts (see rssPoll.js). Starts at the default,
-// speeds up for busy feeds down to the min (the slow loop's tick, so it can't go lower), and slows to the max for quiet ones.
+// Some platforms adapt each watch's poll interval to how often the account posts (see rssPoll.js). A watch starts at the
+// default, speeds up for busy accounts down to the min (the slow loop's tick, so it can't go lower), and slows to the max
+// for quiet ones. Each can be overridden with <PREFIX>_POLL_DEFAULT_MS / _MIN_MS / _MAX_MS.
 const envMs = (name, fallback) => { const n = parseInt(process.env[name], 10); return n > 0 ? n : fallback; };
-const RSS_POLL_MIN_MS = Math.max(SLOW_POLL_INTERVAL_MS, envMs('RSS_POLL_MIN_MS', SLOW_POLL_INTERVAL_MS));
-const RSS_POLL_MAX_MS = Math.max(RSS_POLL_MIN_MS, envMs('RSS_POLL_MAX_MS', 60 * 60 * 1000));
-const RSS_POLL_DEFAULT_MS = Math.min(RSS_POLL_MAX_MS, Math.max(RSS_POLL_MIN_MS, envMs('RSS_POLL_DEFAULT_MS', 10 * 60 * 1000)));
+function adaptiveBounds(prefix, defMs, maxMs) {
+    const min = Math.max(SLOW_POLL_INTERVAL_MS, envMs(`${prefix}_POLL_MIN_MS`, SLOW_POLL_INTERVAL_MS));
+    const max = Math.max(min, envMs(`${prefix}_POLL_MAX_MS`, maxMs));
+    const def = Math.min(max, Math.max(min, envMs(`${prefix}_POLL_DEFAULT_MS`, defMs)));
+    return { min, max, def };
+}
+const ADAPTIVE_POLL = {
+    rss: adaptiveBounds('RSS', 10 * 60 * 1000, 60 * 60 * 1000),
+    twitter: adaptiveBounds('TWITTER', 5 * 60 * 1000, 30 * 60 * 1000), // tweets are time-sensitive: slower cap, quicker default
+};
+const RSS_POLL_MIN_MS = ADAPTIVE_POLL.rss.min, RSS_POLL_MAX_MS = ADAPTIVE_POLL.rss.max, RSS_POLL_DEFAULT_MS = ADAPTIVE_POLL.rss.def;
 
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
 
@@ -226,4 +235,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, RSS_POLL_DEFAULT_MS, RSS_POLL_MIN_MS, RSS_POLL_MAX_MS, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, ADAPTIVE_POLL, RSS_POLL_DEFAULT_MS, RSS_POLL_MIN_MS, RSS_POLL_MAX_MS, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };

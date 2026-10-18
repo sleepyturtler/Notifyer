@@ -11,7 +11,7 @@ const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
 const { fetchLatestKickAll } = require('./platforms/kick.js');
 const { fetchLatestBlueskyAll } = require('./platforms/bluesky.js');
 const { fetchLatestRssAll } = require('./platforms/rss.js');
-const { computeRssInterval, nextRssBackoff, rssPollDue } = require('./rssPoll.js');
+const { computeInterval, hasAdaptivePolling, nextBackoff, pollDue } = require('./rssPoll.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { fetchLatestPost } = require('./platforms/index.js');
 const { reportLinkProblem } = require('./announcements.js');
@@ -112,7 +112,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
             if (minInterval && w.last_checked && (Date.now() - w.last_checked) < minInterval) continue;
             if (skipYouTubePoll(w, pushCovered)) continue;
-            if (!onlyGuildId && w.platform === 'rss' && !rssPollDue(w)) continue; // adaptive: each feed has its own interval
+            if (!onlyGuildId && hasAdaptivePolling(w.platform) && !pollDue(w.platform, w)) continue; // adaptive: each account has its own interval
             if (watchesInFlight.has(w.id)) continue; // another pass is already handling this watch
             watchesInFlight.add(w.id);
             try {
@@ -197,7 +197,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                             perCyclePostsCache.set(handleCacheKey, (w.platform === 'twitch' ? fetchLatestTwitchAll : w.platform === 'kick' ? fetchLatestKickAll : w.platform === 'rss' ? fetchLatestRssAll : fetchLatestBlueskyAll)(w.handle));
                         }
                         posts = await perCyclePostsCache.get(handleCacheKey);
-                        if (w.platform === 'rss') await setWatchPollInterval(w.id, computeRssInterval((posts || []).map(p => p.timestamp))).catch(() => {});
+                        if (w.platform === 'rss') await setWatchPollInterval(w.id, computeInterval('rss', (posts || []).map(p => p.timestamp))).catch(() => {});
                     } else {
                         if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
                         // Multiple watches (even across channels/guilds) can share one linked
@@ -261,8 +261,18 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         await touchLastChecked(w.id);
                     }
                 } else {
-                    const post = await fetchLatestPost(w.platform, w.handle);
-                    if (w.platform === 'twitter') nitterOk++;
+                    // Twitter fetches ask every Nitter mirror, so accounts tracked by several servers share one fetch per pass.
+                    let postPromise;
+                    if (w.platform === 'twitter') {
+                        const key = `twitter:${w.handle.toLowerCase()}`;
+                        if (!perCyclePostsCache.has(key)) perCyclePostsCache.set(key, fetchLatestPost(w.platform, w.handle));
+                        postPromise = perCyclePostsCache.get(key);
+                    } else postPromise = fetchLatestPost(w.platform, w.handle);
+                    const post = await postPromise;
+                    if (w.platform === 'twitter') {
+                        nitterOk++;
+                        await setWatchPollInterval(w.id, computeInterval('twitter', post ? [post.timestamp, ...(post.recentTimestamps || [])] : [])).catch(() => {});
+                    }
                     if (!post || !post.id) { await touchLastChecked(w.id); continue; }
                     if (w.last_post_id === null) {
                         await updateLastPost(w.id, post.id, seenIds);
@@ -283,7 +293,11 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                 } else {
                     console.error(`poll ${w.platform}/${w.handle}:`, e.message);
                 }
-                if (w.platform === 'rss') await setWatchPollInterval(w.id, nextRssBackoff(w.poll_interval_ms)).catch(() => {}); // dead feeds back off
+                // Dead feeds back off. A Nitter outage is NOT the account's fault (every account fails together), so
+                // Twitter keeps its interval then rather than leaving every account slow once the mirrors recover.
+                if (w.platform === 'rss' || (w.platform === 'twitter' && !/All Nitter instances failed/.test(e.message))) {
+                    await setWatchPollInterval(w.id, nextBackoff(w.platform, w.poll_interval_ms)).catch(() => {});
+                }
                 await touchLastChecked(w.id, e.message).catch(() => {});
             } finally {
                 watchesInFlight.delete(w.id);

@@ -15,9 +15,7 @@ const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
         'https://nitter.jaydenha.uk',
         'https://nitter.kareem.one',
         'https://nitter.meowing.monster',
-        'https://shitter.thepixora.com',
-        'https://nitter.xitter.cc',
-        'https://x.n0g.xyz',
+        'https://nitter.netbub.com',
     ]);
 
 // YouTube Data API v3 — replaces scraping youtube.com for uploads/Shorts/live

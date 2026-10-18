@@ -3,6 +3,7 @@
 
 const { MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, EmbedBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ChannelSelectMenuBuilder, ChannelType } = require('discord.js');
 const { client } = require('./client.js');
+const { fetchJson, fetchText, postForm, postJson, request } = require('./net.js');
 const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, canUnlinkLink, canUsePlatform, isOwner } = require('./config.js');
 const { E, canWatchBatch } = require('./helpers.js');
 const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
@@ -166,7 +167,8 @@ client.on('interactionCreate', async interaction => {
     // Beta-only: /killbot — see debugTools.js. Entirely absent as a registered
     // command on a build that doesn't have that file, so this never matches there.
     if (debugTools && interaction.isChatInputCommand() && interaction.commandName === 'killbot') {
-        const handled = await debugTools.handleTopLevelCommand(interaction);
+        // debugTools destructures its helpers from a second argument (it threw "Cannot destructure 'postJson' of 'deps'").
+        const handled = await debugTools.handleTopLevelCommand(interaction, { postJson, fetchJson, fetchText, postForm, request, client, PLATFORMS, isOwner });
         if (handled) return;
     }
 

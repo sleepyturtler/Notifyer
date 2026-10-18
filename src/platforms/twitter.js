@@ -15,7 +15,8 @@ async function fetchLatestTwitter(handle) {
         const data = xmlParser.parse(xml);
         const items = data?.rss?.channel?.item;
         if (!items) throw new Error('No items in feed');
-        const item = Array.isArray(items) ? items[0] : items;
+        const list = Array.isArray(items) ? items : [items];
+        const item = list[0];
         const idMatch = (item.link || item.guid || '').match(/status\/(\d+)/);
         if (!idMatch) throw new Error('Could not parse tweet ID');
         return {
@@ -26,6 +27,8 @@ async function fetchLatestTwitter(handle) {
             author: data?.rss?.channel?.title,
             thumbnail: null,
             timestamp: item.pubDate,
+            // Dates of the feed's recent items: the poller derives how often this account posts from them.
+            recentTimestamps: list.slice(0, 20).map(it => (typeof it?.pubDate === 'string' ? it.pubDate : it?.pubDate?.['#text'])).filter(Boolean),
             source: base,
         };
     }));

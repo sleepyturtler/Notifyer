@@ -2,7 +2,8 @@
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { ButtonBuilder, ButtonStyle, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
-const { getSocialLinksVisible, getWatches } = require('./db.js');
+const { getPushCoveredYouTubeChannels, getSocialLinksVisible, getWatches } = require('./db.js');
+const { describePollFrequency } = require('./rssPoll.js');
 const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
@@ -25,6 +26,8 @@ async function buildWatchListEmbed(guildId) {
         return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setDescription('No accounts are being tracked yet. Use `/social add` to add one.')], components: [] };
     }
     const STALE_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
+    // Only YouTube's text depends on live data (whether push is confirmed for the channel).
+    const pushCovered = watches.some(x => x.platform === 'youtube') ? await getPushCoveredYouTubeChannels().catch(() => null) : null;
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setTimestamp()
         .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
     for (const w of watches.slice(0, 25)) {
@@ -32,6 +35,7 @@ async function buildWatchListEmbed(guildId) {
         const lines = [
             `Posts to <#${w.channel_id}>`,
             `ID: \`${w.id}\``,
+            `Checks: ${describePollFrequency(w, pushCovered)}`,
             w.message_template ? `Custom message: \`${w.message_template.slice(0, 80)}${w.message_template.length > 80 ? '…' : ''}\`` : 'Using default message',
         ];
         if (w.last_post_at) {
@@ -284,7 +288,7 @@ const HELP_CATEGORIES = [
             .addFields(
                 { name: 'Platforms', value: Object.values(PLATFORMS).filter(p => !p.restricted).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') + '\n⚠️ = unavailable right now' },
                 { name: 'Placeholders', value: '`{author}` `{handle}` `{platform}` `{title}` `{url}`, plus `{is/was}` for Live.' },
-                { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. Twitter and Bluesky: every 2 minutes. YouTube: new uploads and streams arrive instantly by push, with a backup check every 20 minutes (every 2 minutes if push is not active for that channel).' },
+                { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. Bluesky: every 2 minutes. Twitter and RSS: adapts to how often the account posts (Twitter 2 to 30 min, RSS 2 to 60 min). YouTube: new uploads and streams arrive instantly by push, with a backup check every 20 minutes (every 2 minutes if push is not active for that channel).' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
                 { name: 'Links', value: `[GitHub](https://github.com/sleepyturtler/Notifyer) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),

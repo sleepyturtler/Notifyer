@@ -117,6 +117,12 @@ function buildBatchPayload(entries) {
     return { components: [header, container], flags: MessageFlags.IsComponentsV2, allowedMentions: { roles: roleIds } };
 }
 
+// Best effort: a fallback that sends a FRESH batch message has to remove the message it supersedes, otherwise the
+// same posts show up twice (once in the old message, once in the new one). Failure to delete is harmless.
+async function dropMessage(channel, id) {
+    if (channel && id) await channel.messages.delete(id).catch(() => {});
+}
+
 async function sendBatchNotification(entries) {
     const w0 = entries[0].w;
     const { guild, channel } = resolveWatchChannel(w0);
@@ -223,7 +229,7 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
                     retryEntries = retryEntries.slice(-MAX_BATCH_ENTRIES_PER_MESSAGE);
                     sent = await sendBatchNotification(retryEntries);
                 }
-                if (sent) { state.messageId = sent.id; state.entries = retryEntries; }
+                if (sent) { await dropMessage(channel, state.messageId); state.messageId = sent.id; state.entries = retryEntries; }
                 else recentBatchState.delete(key);
                 return sent;
             }
@@ -253,7 +259,8 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
             } catch (e) {
                 console.error(`merge batch (${key}):`, e.message);
                 const sent = await sendBatchNotification(state.entries);
-                if (sent) { state.messageId = sent.id; state.isBatch = true; }
+                // The first post's own standalone message is still sitting in the channel and is now inside the new batch.
+                if (sent) { await dropMessage(resolveWatchChannel(state.entries[0].w).channel, state.entries[0].standaloneMessageId); state.messageId = sent.id; state.isBatch = true; }
                 else recentBatchState.delete(key);
                 return sent;
             }

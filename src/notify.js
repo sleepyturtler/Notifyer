@@ -5,7 +5,7 @@ const { URL } = require('url');
 const { MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { reportDeliveryFailure } = require('./announcements.js');
-const { profileUrl } = require('./helpers.js');
+const { profileUrl, watchName } = require('./helpers.js');
 const { fetchJson } = require('./net.js');
 const { client } = require('./client.js');
 const { setWatchLiveMessage } = require('./db.js');
@@ -77,7 +77,7 @@ function buildSamplePost(w, postType) {
         id: 'preview',
         url: profileUrl(w.platform, w.handle) || 'https://example.com',
         title: 'Sample post title for preview',
-        author: w.handle,
+        author: watchName(w),
         thumbnail: null,
         timestamp: new Date().toISOString(),
         postType,
@@ -159,7 +159,7 @@ async function ensureVideoEmbedFallback(channel, messageId, post) {
 function buildNotificationPayload(w, post) {
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
-    let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
+    let content = renderTemplate(resolveTemplate(w, post), post, w.platform, watchName(w));
     // For YouTube/TikTok, make sure a URL that Discord will actually unfurl into a
     // playable video is present on its own line (not just inside a custom embed).
     const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
@@ -178,7 +178,7 @@ function buildNotificationPayload(w, post) {
     }
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
-        .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
+        .setAuthor({ name: `${post.author || watchName(w)} • ${p.label}${typeLabel}` })
         .setURL(post.url)
         .setDescription([post.title, post.summary].filter(Boolean).join('\n\n').slice(0, 4000) || null)
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());

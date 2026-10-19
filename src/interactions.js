@@ -5,7 +5,7 @@ const { MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFl
 const { client } = require('./client.js');
 const { fetchJson, fetchText, postForm, postJson, request } = require('./net.js');
 const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, canUnlinkLink, canUsePlatform, isOwner } = require('./config.js');
-const { E, canWatchBatch } = require('./helpers.js');
+const { E, canWatchBatch, watchName } = require('./helpers.js');
 const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
 const { countOtherWatchesUsingLink, deleteSocialLink, getConfig, getLinkUsage, getSocialLinkById, getWatch, getWatches, getWatchesByLink, isLinkUsedInGuild, removeWatch, saveConfig, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
 const { hasCommandPermission } = require('./permissions.js');
@@ -113,7 +113,7 @@ client.on('interactionCreate', async interaction => {
                 const row = new ActionRowBuilder().addComponents(
                     new StringSelectMenuBuilder().setCustomId(`socialpreview_pick_${guildId}`).setPlaceholder('Pick a watch to preview…')
                         .addOptions(watches.slice(0, 25).map(w => ({
-                            label: `${PLATFORMS[w.platform]?.label || w.platform} — ${w.handle}`.slice(0, 100),
+                            label: `${PLATFORMS[w.platform]?.label || w.platform} — ${watchName(w)}`.slice(0, 100),
                             value: `${w.id}`,
                             emoji: PLATFORMS[w.platform]?.emojiButton,
                         })))
@@ -286,7 +286,7 @@ client.on('interactionCreate', async interaction => {
         if (!w) return interaction.update({ content: '❌ Watch not found (it may have been removed).', components: [] });
         const p = PLATFORMS[w.platform];
         const types = (PLATFORM_NOTIFY_TYPES[w.platform] || [{ id: null, label: 'Post' }]);
-        await interaction.update({ content: `Previewing **${p?.label || w.platform} — ${w.handle}** (${types.length} notify type${types.length > 1 ? 's' : ''}):`, components: [] });
+        await interaction.update({ content: `Previewing **${p?.label || w.platform} — ${watchName(w)}** (${types.length} notify type${types.length > 1 ? 's' : ''}):`, components: [] });
         for (const t of types) {
             const post = buildSamplePost(w, t.id);
             const payload = buildNotificationPayload(w, post);
@@ -334,7 +334,7 @@ client.on('interactionCreate', async interaction => {
 
         if (action === 'channel') {
             return interaction.update({
-                embeds: [E('#5865F2', `Change Channel — ${w.handle}`).setDescription('Select the new channel for this watch\'s notifications.')],
+                embeds: [E('#5865F2', `Change Channel — ${watchName(w)}`).setDescription('Select the new channel for this watch\'s notifications.')],
                 components: [new ActionRowBuilder().addComponents(
                     new ChannelSelectMenuBuilder().setCustomId(`socialchannel_select_${id}`).setPlaceholder('Select a channel…')
                         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
@@ -344,7 +344,7 @@ client.on('interactionCreate', async interaction => {
 
         if (action === 'role') {
             return interaction.update({
-                embeds: [E('#5865F2', `Ping Role — ${w.handle}`).setDescription('Select a role to ping on every notification, or click "Clear Role" to remove it.')],
+                embeds: [E('#5865F2', `Ping Role — ${watchName(w)}`).setDescription('Select a role to ping on every notification, or click "Clear Role" to remove it.')],
                 components: [
                     new ActionRowBuilder().addComponents(
                         new RoleSelectMenuBuilder().setCustomId(`socialrole_select_${id}`).setPlaceholder('Select a role…')
@@ -362,7 +362,7 @@ client.on('interactionCreate', async interaction => {
             if (types.length <= 1) return interaction.update({ content: 'This platform only has one notification type.', embeds: [], components: [] });
             const current = activeTypeIds(w);
             return interaction.update({
-                embeds: [E('#5865F2', `Notification Types — ${w.handle}`).setDescription(`Choose which **${PLATFORMS[w.platform].label}** content types to get notified for.`)],
+                embeds: [E('#5865F2', `Notification Types — ${watchName(w)}`).setDescription(`Choose which **${PLATFORMS[w.platform].label}** content types to get notified for.`)],
                 components: [
                     new ActionRowBuilder().addComponents(
                         new StringSelectMenuBuilder().setCustomId(`socialtype_select_${id}`)
@@ -394,7 +394,7 @@ client.on('interactionCreate', async interaction => {
             }
             await removeWatch(guildId, id);
             const { embeds, components } = await buildWatchListEmbed(guildId);
-            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform].label} — ${w.handle}.${unlinkNote}`, embeds, components });
+            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform].label} — ${watchName(w)}.${unlinkNote}`, embeds, components });
         }
 
         if (action === 'backto') {
@@ -622,7 +622,7 @@ client.on('interactionCreate', async interaction => {
         if (isNewFlow && canWatchBatch(updated)) {
             const embed = new EmbedBuilder().setColor(PLATFORMS[updated.platform].color)
                 .setTitle('One more optional step')
-                .setDescription(`Want a custom header for when 2+ posts from ${updated.handle} (or another watch in the same channel) land within 10 minutes of each other? Default is \`${DEFAULT_BATCH_HEADER}\`.`);
+                .setDescription(`Want a custom header for when 2+ posts from ${watchName(updated)} (or another watch in the same channel) land within 10 minutes of each other? Default is \`${DEFAULT_BATCH_HEADER}\`.`);
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId(`socialbatchheaderadd_open_${id}`).setLabel('Set Batch Header').setStyle(ButtonStyle.Primary),
                 new ButtonBuilder().setCustomId(`socialbatchheaderadd_skip_${id}`).setLabel('Skip').setStyle(ButtonStyle.Secondary)

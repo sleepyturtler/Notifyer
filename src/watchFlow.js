@@ -3,7 +3,7 @@
 
 const { EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
-const { E, normalizeHandle } = require('./helpers.js');
+const { E, normalizeHandle, watchName } = require('./helpers.js');
 const { addWatch, getSocialLinkByUsername, getWatches, setWatchSocialLink, updateLastPost } = require('./db.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
@@ -37,6 +37,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
     if (watches.length >= 50) return { ok: false, message: '❌ This server has reached the maximum of 50 tracked accounts.' };
 
     let post = null;
+    let displayName = null; // RSS: the feed's own title, used instead of the URL
     let baselineSeenIds = [];
     let fetchedOk = false; // a fetch really succeeded (even if it found nothing yet)
     let socialLinkId = null;
@@ -81,6 +82,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
             } else if (platform === 'rss') {
                 const posts = await fetchLatestRssAll(handle);
                 post = posts[0] || null;
+                displayName = posts[0]?.author || null;
                 baselineSeenIds = posts.map(p => p.id);
             } else if (platform === 'bluesky') {
                 const posts = await fetchLatestBlueskyAll(handle);
@@ -106,7 +108,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
         }
     }
 
-    const watch = await addWatch({ guildId, platform, handle, channelId, addedBy: addedByTag });
+    const watch = await addWatch({ guildId, platform, handle, channelId, addedBy: addedByTag, displayName });
     if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
 
     if (platform === 'youtube') {
@@ -141,7 +143,7 @@ function buildAddWatchSuccessResponse(watch, post, handle, channel) {
     const types = PLATFORM_NOTIFY_TYPES[watch.platform];
     const successEmbed = E('#00ff00', 'Now Tracking').addFields(
         { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
-        { name: 'Account', value: handle, inline: true },
+        { name: 'Account', value: watchName(watch) !== watch.handle ? watchName(watch) : handle, inline: true },
         { name: 'Channel', value: `${channel}`, inline: true },
         post?.title
             ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }

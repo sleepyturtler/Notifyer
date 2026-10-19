@@ -7,7 +7,7 @@ const { describePollFrequency } = require('./rssPoll.js');
 const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
-const { canWatchBatch } = require('./helpers.js');
+const { canWatchBatch, watchName } = require('./helpers.js');
 const fs = require('fs');
 const path = require('path');
 // Beta-only "Admin" help category (see debugTools.js) — only added if that file is
@@ -57,14 +57,14 @@ async function buildWatchListEmbed(guildId) {
             // smaller/dimmer subtext style plus a clear label instead.
             lines.push(`-# ⚠️ ${p.label} is currently unavailable — see \`/help\` → Info for why.`);
             embed.addFields({
-                name: `${p.emojiTag} ${p.label} — ${w.handle} *(unavailable)*${w.active ? '' : ' (paused)'}`,
+                name: `${p.emojiTag} ${p.label} — ${watchName(w)} *(unavailable)*${w.active ? '' : ' (paused)'}`,
                 value: lines.join('\n'),
                 inline: false,
             });
             continue;
         }
         embed.addFields({
-            name: `${p.emojiTag} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
+            name: `${p.emojiTag} ${p.label} — ${watchName(w)}${w.active ? '' : ' (paused)'}`,
             value: lines.join('\n'),
             inline: false,
         });
@@ -74,7 +74,7 @@ async function buildWatchListEmbed(guildId) {
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallist_manage_${guildId}`).setPlaceholder('Manage a watch…')
                 .addOptions(watches.slice(0, 25).map(w => ({
-                    label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${w.handle}`.slice(0, 100),
+                    label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${watchName(w)}`.slice(0, 100),
                     value: `${w.id}`,
                     emoji: PLATFORMS[w.platform]?.emojiButton,
                 })))
@@ -134,7 +134,7 @@ function buildSocialLinkManageView(link, { guildId, canUnlink = false, usage = n
 function buildPerTypeMessageModal(w, isNewFlow = false) {
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const templates = w.message_templates || {};
-    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}${isNewFlow ? '_new' : ''}`).setTitle(`Edit Messages for ${w.handle}`.slice(0, 45));
+    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}${isNewFlow ? '_new' : ''}`).setTitle(`Edit Messages for ${watchName(w)}`.slice(0, 45));
     // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
     modal.addComponents(
         ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
@@ -177,7 +177,7 @@ function describeMessages(w) {
 
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
-    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${w.handle}`).setTimestamp()
+    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${watchName(w)}`).setTimestamp()
         .addFields(
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },

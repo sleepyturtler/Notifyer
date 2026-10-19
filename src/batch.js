@@ -42,16 +42,18 @@ function getBatchMinThreshold(cfg) {
 // tracked accounts.
 const BATCH_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
+const { watchName } = require('./helpers.js');
+
 const DEFAULT_BATCH_HEADER = '**{author}** posted {count} times!';
 
 // allHandles: every distinct handle contributing to this batch (just [w.handle]
 // for a single-creator batch) — lets {creators} resolve correctly even when the
 // template being rendered belongs to one specific watch in a multi-creator batch.
-function renderBatchHeader(w, count, allHandles = [w.handle]) {
+function renderBatchHeader(w, count, allHandles = [watchName(w)]) {
     const tmpl = w.batch_header_template || DEFAULT_BATCH_HEADER;
     return tmpl
-        .replace(/\{author\}/g, () => w.handle)
-        .replace(/\{handle\}/g, () => w.handle)
+        .replace(/\{author\}/g, () => watchName(w))
+        .replace(/\{handle\}/g, () => watchName(w))
         .replace(/\{creators\}/g, () => formatCreatorList(allHandles))
         .replace(/\{platform\}/g, () => PLATFORMS[w.platform]?.label || w.platform)
         .replace(/\{count\}/g, () => String(count));
@@ -66,7 +68,7 @@ function formatCreatorList(handles) {
 
 // entries: [{ w, post }] all sharing one channel+platform (see sendOrExtendBatch).
 function renderBatchHeaderForEntries(entries) {
-    const handles = entries.map(e => e.w.handle);
+    const handles = entries.map(e => watchName(e.w));
     const unique = [...new Set(handles)];
     if (unique.length === 1) {
         // Single creator — honor that watch's own customizable header template.
@@ -287,4 +289,4 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
 }
 
 
-module.exports = { DEFAULT_BATCH_HEADER, sendOrExtendBatch, MAX_BATCH_ENTRIES_PER_MESSAGE };
+module.exports = { DEFAULT_BATCH_HEADER, renderBatchHeader, renderBatchHeaderForEntries, sendOrExtendBatch, MAX_BATCH_ENTRIES_PER_MESSAGE };

@@ -176,6 +176,7 @@ async function initDB() {
     await pool.query('ALTER TABLE youtube_subscriptions ADD COLUMN IF NOT EXISTS verified_until BIGINT');
     if (!hadVerifiedCol) await pool.query('UPDATE youtube_subscriptions SET verified_until = expires_at WHERE signed');
     await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS poll_interval_ms INTEGER'); // RSS adaptive polling
+    await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS display_name TEXT'); // RSS: the feed title, shown instead of the URL
     await migrateSocialLinks();
     // Backfill seen_post_ids for existing rows so nothing re-fires after migration
     await pool.query(`
@@ -221,10 +222,10 @@ async function getAllWatches(platforms = null) {
     return res.rows;
 }
 
-async function addWatch({ guildId, platform, handle, channelId, messageTemplate, addedBy }) {
+async function addWatch({ guildId, platform, handle, channelId, messageTemplate, addedBy, displayName = null }) {
     const res = await pool.query(
-        'INSERT INTO watches (guild_id, platform, handle, channel_id, message_template, added_by, added_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-        [guildId, platform, handle, channelId, messageTemplate ?? null, addedBy, Date.now()]
+        'INSERT INTO watches (guild_id, platform, handle, channel_id, message_template, added_by, added_at, display_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+        [guildId, platform, handle, channelId, messageTemplate ?? null, addedBy, Date.now(), displayName]
     );
     return res.rows[0];
 }
@@ -308,6 +309,10 @@ async function markYouTubeSubscriptionVerified(channelId, leaseSeconds) {
 async function getPushCoveredYouTubeChannels() {
     const res = await pool.query('SELECT channel_id FROM youtube_subscriptions WHERE signed AND verified_until > $1', [Date.now()]);
     return new Set(res.rows.map(r => r.channel_id));
+}
+
+async function setWatchDisplayName(id, name) {
+    await pool.query('UPDATE watches SET display_name = $2 WHERE id = $1', [id, String(name).slice(0, 200)]);
 }
 
 async function setWatchPollInterval(id, ms) {
@@ -465,4 +470,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, approveLinkForGuild, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, approveLinkForGuild, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

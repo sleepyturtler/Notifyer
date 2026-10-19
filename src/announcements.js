@@ -3,6 +3,7 @@
 
 const { PermissionFlagsBits, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, SUPPORT_SERVER_URL } = require('./config.js');
+const { watchName } = require('./helpers.js');
 const { getAllWatches, getConfig, getWatches, markSocialLinkDead, saveConfig } = require('./db.js');
 const { client } = require('./client.js');
 
@@ -169,7 +170,7 @@ async function reportDeliveryFailure(w, cause) {
         const { problem, fix, noLink } = describeDeliveryProblem(guild, failing, cause);
         const affected = (await getWatches(guild.id).catch(() => [])).filter(x => x.channel_id === w.channel_id && x.active !== false);
         if (!affected.some(x => x.id === w.id)) affected.unshift(w);
-        const label = x => `\`${String(x.handle).replace(/`/g, '')}\` (${PLATFORMS[x.platform]?.label || x.platform})`;
+        const label = x => `\`${String(watchName(x)).replace(/`/g, '')}\` (${PLATFORMS[x.platform]?.label || x.platform})`;
         const listed = affected.slice(0, 5).map(label).join(', ') + (affected.length > 5 ? ` and ${affected.length - 5} more` : '');
 
         const embed = new EmbedBuilder().setColor('#ED4245')
@@ -186,7 +187,7 @@ async function reportDeliveryFailure(w, cause) {
             .setURL(`https://discord.com/channels/${guild.id}/${w.channel_id}`)
             .setLabel((failing ? `Open #${failing.name}` : 'Open channel').slice(0, 80));
         const manage = new ButtonBuilder().setStyle(ButtonStyle.Secondary).setCustomId(`deliveryfail_manage_${w.id}`)
-            .setLabel(`Manage ${String(w.handle)}`.slice(0, 80));
+            .setLabel(`Manage ${String(watchName(w))}`.slice(0, 80));
         const rows = [new ActionRowBuilder().addComponents(...(noLink ? [] : [link]), manage)];
         // The manage button needs a server context, so a DM only carries the channel link (when it can exist).
         const dmRows = noLink ? [] : [new ActionRowBuilder().addComponents(link)];

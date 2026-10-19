@@ -80,4 +80,31 @@ function canWatchBatch(w) {
     return nonLiveTypes.length > 0 && activeTypeIds(w).some(id => id !== 'live');
 }
 
-module.exports = { E, canWatchBatch, normalizeHandle, profileUrl };
+// A short readable label for a feed URL when its title isn't known: host plus a trimmed path, generic feed
+// filenames dropped. https://www.theverge.com/rss/index.xml -> theverge.com, reddit.com/r/node/.rss -> reddit.com/r/node
+function shortFeedLabel(url) {
+    try {
+        const u = new URL(url);
+        let p = u.pathname.replace(/\/+$/, '');
+        for (let i = 0; i < 4; i++) {
+            const next = p.replace(/\/?\.(rss|atom|xml)$/i, '').replace(/\/(feed|feeds|rss|atom|index)(\.(xml|rss|atom))?$/i, '').replace(/\.(xml|rss|atom)$/i, '');
+            if (next === p) break;
+            p = next;
+        }
+        const label = u.hostname.replace(/^www\./i, '') + (p && p !== '/' ? p : '');
+        return label.length > 40 ? label.slice(0, 39) + '…' : label;
+    } catch { return String(url).slice(0, 40); }
+}
+
+// What to show for a watch wherever the handle used to be: the handle itself, except RSS, whose handle is the full feed
+// URL. RSS shows the feed's own title (saved from the feed), or a short form of the URL until it is known. Cleaned so a
+// feed title can't inject markdown or mentions.
+function watchName(w) {
+    if (w.platform !== 'rss') return w.handle;
+    const raw = (w.display_name && String(w.display_name).trim()) || shortFeedLabel(w.handle);
+    const clean = raw.replace(/[*`~|>\\\[\]]/g, '').replace(/@/g, '@\u200b').replace(/\s+/g, ' ').trim();
+    const out = clean.length > 40 ? clean.slice(0, 39).trimEnd() + '…' : clean;
+    return out || shortFeedLabel(w.handle);
+}
+
+module.exports = { E, canWatchBatch, normalizeHandle, profileUrl, shortFeedLabel, watchName };

@@ -3,7 +3,7 @@
 
 const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE, YOUTUBE_PUSH_POLL_INTERVAL_MS } = require('./config.js');
 const { client } = require('./client.js');
-const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
+const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels, setWatchDisplayName, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
@@ -197,7 +197,11 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                             perCyclePostsCache.set(handleCacheKey, (w.platform === 'twitch' ? fetchLatestTwitchAll : w.platform === 'kick' ? fetchLatestKickAll : w.platform === 'rss' ? fetchLatestRssAll : fetchLatestBlueskyAll)(w.handle));
                         }
                         posts = await perCyclePostsCache.get(handleCacheKey);
-                        if (w.platform === 'rss') await setWatchPollInterval(w.id, computeInterval('rss', (posts || []).map(p => p.timestamp))).catch(() => {});
+                        if (w.platform === 'rss') {
+                            await setWatchPollInterval(w.id, computeInterval('rss', (posts || []).map(p => p.timestamp))).catch(() => {});
+                            const title = posts && posts[0] && posts[0].author;
+                            if (title && title !== w.display_name) await setWatchDisplayName(w.id, title).catch(() => {}); // written only when the title is new or changed
+                        }
                     } else {
                         if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
                         // Multiple watches (even across channels/guilds) can share one linked

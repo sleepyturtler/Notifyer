@@ -4,7 +4,7 @@
 const { ButtonBuilder, ButtonStyle, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { getPushCoveredYouTubeChannels, getSocialLinksVisible, getWatches } = require('./db.js');
 const { describePollFrequency } = require('./rssPoll.js');
-const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
+const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds, linkablePlatforms } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
 const { canWatchBatch, watchName } = require('./helpers.js');
@@ -94,7 +94,15 @@ async function buildSocialLinksEmbed(guildId, userId) {
             { name: '📸 Instagram', value: (ofPlatform('instagram').map(line).join('\n') || '*(none)*').slice(0, 1000) },
             { name: '🎵 TikTok', value: (ofPlatform('tiktok').map(line).join('\n') || '*(none)*').slice(0, 1000) },
         );
-    if (!links.length) return { embeds: [embed], components: [] };
+    if (!links.length) {
+        // Nothing linked yet: offer to link one right here (the same sign-in a /social link would start).
+        if (!linkablePlatforms().length) {
+            embed.setFooter({ text: 'Linking is not set up on this bot yet.' });
+            return { embeds: [embed], components: [] };
+        }
+        return { embeds: [embed], components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`sociallinks_add_${guildId}`).setLabel('Link an account').setStyle(ButtonStyle.Primary))] };
+    }
     const components = [
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallinks_manage_${guildId}`).setPlaceholder('Manage a linked account…')
@@ -357,7 +365,7 @@ function buildSetupView(tabId, watchCount = 0) {
         new ButtonBuilder().setCustomId(`setup_tab_${t.id}`).setLabel(t.label).setStyle(t.id === tab.id ? ButtonStyle.Primary : ButtonStyle.Secondary)));
     const actions = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('setup_start').setLabel(n ? 'Add another account' : 'Add my first account').setStyle(ButtonStyle.Success),
-        ...(tab.id === 'customize' ? [new ButtonBuilder().setCustomId('setup_sample').setLabel('Show me a sample').setStyle(ButtonStyle.Secondary)] : []),
+        new ButtonBuilder().setCustomId('setup_sample').setLabel('Preview').setStyle(ButtonStyle.Secondary),
     );
     return { embeds: [embed], components: [tabs, actions] };
 }

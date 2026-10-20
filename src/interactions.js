@@ -4,7 +4,7 @@
 const { MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, EmbedBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ChannelSelectMenuBuilder, ChannelType } = require('discord.js');
 const { client } = require('./client.js');
 const { fetchJson, fetchText, postForm, postJson, request } = require('./net.js');
-const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, canUnlinkLink, canUsePlatform, isOwner } = require('./config.js');
+const { OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, activeTypeIds, canUnlinkLink, canUsePlatform, isOwner, linkablePlatforms } = require('./config.js');
 const { E, canWatchBatch, watchName } = require('./helpers.js');
 const { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
 const { countOtherWatchesUsingLink, deleteSocialLink, getConfig, getLinkUsage, getSocialLinkById, getWatch, getWatches, getWatchesByLink, isLinkUsedInGuild, removeWatch, saveConfig, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
@@ -15,7 +15,7 @@ const { reportLinkProblem } = require('./announcements.js');
 const { handleLinkRequestButton } = require('./linkRequests.js');
 const { revokeTikTokToken } = require('./platforms/social.js');
 const { SETUP_PICK_TTL_MS, createOAuthState, pendingSetupPicks } = require('./state.js');
-const { buildNotificationPayload, buildSamplePost } = require('./notify.js');
+const { buildNotificationPayload, buildOnboardingPreview, buildSamplePost } = require('./notify.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const fs = require('fs');
 const path = require('path');
@@ -25,6 +25,31 @@ const path = require('path');
 const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
 
 // ── Interaction handling ────────────────────────────────────────────────────
+
+// The private "Authorize with <platform>" message, shared by /social link and the Link button in /social links.
+// Resolves to { error } (a message to show) or { payload } (a ready ephemeral reply).
+function buildLinkPrompt(guildId, userId, platform) {
+    const cfg = OAUTH_CONFIG[platform];
+    if (!cfg) return { error: '❌ That platform can not be linked.' };
+    if (!cfg.clientId || !cfg.clientSecret) {
+        return { error: `❌ ${PLATFORMS[platform].label} OAuth isn't configured on this bot yet (missing app credentials env vars). Ask the bot owner to set them up.` };
+    }
+    if (!PUBLIC_BASE_URL) {
+        return { error: '❌ PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) isn\'t set, so OAuth redirects have nowhere to go. Ask the bot owner to configure it.' };
+    }
+    const { state, expires } = createOAuthState(guildId, userId, platform);
+    const authUrl = `${cfg.authUrl}?${cfg.clientIdParam}=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel(`Authorize with ${PLATFORMS[platform].label}`).setStyle(ButtonStyle.Link).setURL(authUrl)
+    );
+    return {
+        payload: {
+            embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nOnce linked, the account can be tracked in **any server** that uses Notifyer. You can unlink it any time from \`/social links\`.\n\nThis link expires <t:${Math.floor(expires / 1000)}:R>.`)],
+            components: [row],
+            flags: [MessageFlags.Ephemeral],
+        },
+    };
+}
 
 client.on('interactionCreate', async interaction => {
   try {
@@ -136,24 +161,8 @@ client.on('interactionCreate', async interaction => {
             }
 
             if (sub === 'link') {
-                const platform = interaction.options.getString('platform');
-                const cfg = OAUTH_CONFIG[platform];
-                if (!cfg.clientId || !cfg.clientSecret) {
-                    return reply(`❌ ${PLATFORMS[platform].label} OAuth isn't configured on this bot yet (missing app credentials env vars). Ask the bot owner to set them up.`);
-                }
-                if (!PUBLIC_BASE_URL) {
-                    return reply('❌ PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) isn\'t set, so OAuth redirects have nowhere to go. Ask the bot owner to configure it.');
-                }
-                const { state, expires } = createOAuthState(guildId, interaction.user.id, platform);
-                const authUrl = `${cfg.authUrl}?${cfg.clientIdParam}=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setLabel(`Authorize with ${PLATFORMS[platform].label}`).setStyle(ButtonStyle.Link).setURL(authUrl)
-                );
-                return reply({
-                    embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nOnce linked, the account can be tracked in **any server** that uses Notifyer. You can unlink it any time from \`/social links\`.\n\nThis link expires <t:${Math.floor(expires / 1000)}:R>.`)],
-                    components: [row],
-                    flags: [MessageFlags.Ephemeral],
-                });
+                const result = buildLinkPrompt(guildId, interaction.user.id, interaction.options.getString('platform'));
+                return reply(result.error || result.payload);
             }
 
             if (sub === 'links') {
@@ -195,6 +204,31 @@ client.on('interactionCreate', async interaction => {
     }
 
     // ── Buttons: refresh linked-accounts list ───────────────────────────────
+    // "Link an account" (shown when nothing is linked yet): same permission as /social link; if both Instagram and TikTok
+    // can be linked it asks which, otherwise it goes straight to the authorize message.
+    if (interaction.isButton() && interaction.customId.startsWith('sociallinks_add_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const options = linkablePlatforms();
+        if (!options.length) return reply('❌ Linking is not set up on this bot yet. Ask the bot owner to configure Instagram or TikTok.');
+        if (options.length === 1) {
+            const r = buildLinkPrompt(guildId, interaction.user.id, options[0]);
+            return reply(r.error || r.payload);
+        }
+        const menu = new StringSelectMenuBuilder().setCustomId(`sociallinks_addpick_${guildId}`).setPlaceholder('Which account do you want to link?')
+            .addOptions(options.map(k => ({ label: PLATFORMS[k].label, value: k, emoji: PLATFORMS[k].emojiButton })));
+        return reply({ content: 'Which account do you want to link?', components: [new ActionRowBuilder().addComponents(menu)], flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallinks_addpick_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const platform = interaction.values[0];
+        if (!linkablePlatforms().includes(platform)) return interaction.update({ content: '❌ That platform can not be linked right now.', components: [] });
+        const r = buildLinkPrompt(guildId, interaction.user.id, platform);
+        if (r.error) return interaction.update({ content: r.error, components: [] });
+        const { flags, ...rest } = r.payload; // the picker message is already private
+        return interaction.update({ content: null, ...rest });
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('sociallinks_refresh_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const { embeds, components } = await buildSocialLinksEmbed(guildId, interaction.user.id);
@@ -456,11 +490,10 @@ client.on('interactionCreate', async interaction => {
         const watches = await getWatches(guildId);
         return interaction.update(buildSetupView(interaction.customId.slice(10), watches.length));
     }
-    // "Show me a sample": renders a fake notification with the real builder. Nothing is posted or saved.
+    // Preview: a fake channel and video as a real embed. Built from constants (no YouTube fetch, no database), only
+    // shown to the person who clicked, and informational, so no permission check.
     if (interaction.isButton() && interaction.customId === 'setup_sample') {
-        const demo = { id: 0, guild_id: guildId, platform: 'youtube', handle: '@yourfavoritecreator', channel_id: '0', role_id: null, message_template: null, message_templates: {}, notify_types: null };
-        const payload = buildNotificationPayload(demo, buildSamplePost(demo, 'videos'));
-        return interaction.reply({ content: `Sample notification (nothing was posted). Discord adds the video preview under the link.\n${payload.content || ''}`.slice(0, 2000), embeds: payload.embeds, components: payload.components, flags: [MessageFlags.Ephemeral, MessageFlags.SuppressEmbeds] });
+        return interaction.reply({ ...buildOnboardingPreview(), flags: [MessageFlags.Ephemeral] });
     }
     if (interaction.isButton() && interaction.customId === 'setup_start') {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });

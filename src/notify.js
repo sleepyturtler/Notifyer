@@ -59,10 +59,16 @@ const POST_TYPE_BUTTON_LABEL = {
     rss:       { posts: 'Read More' },
     bluesky:   { posts: 'View Post', replies: 'View Reply', reposts: 'View Repost' },
     twitch:    { live: 'Join Stream', vods: 'Watch VOD' },
-    kick:      { live: 'Join Stream' },
+    kick:      { live: 'Join Stream', vods: 'Watch VOD' },
     instagram: { posts: 'View Post', reels: 'Watch Reel', stories: 'View Story' },
     tiktok:    { videos: 'Watch TikTok' },
 };
+
+// After a stream ends its button stops saying "Join Stream": it becomes the platform's VOD / video label.
+function endedButtonLabel(platform) {
+    const l = POST_TYPE_BUTTON_LABEL[platform];
+    return l?.vods || l?.videos || null;
+}
 
 function buttonLabelFor(platform, post) {
     if (post.isLive) return POST_TYPE_BUTTON_LABEL[platform]?.live || 'Join Stream';
@@ -84,6 +90,29 @@ function buildSamplePost(w, postType) {
         isLive: postType === 'live',
         category: postType === 'live' && (w.platform === 'twitch' || w.platform === 'kick') ? 'Just Chatting' : null,
     };
+}
+
+// The /setup preview: a made-up YouTube channel and video shown as a real embed. It is built from constants only, so
+// nothing is fetched (no YouTube call, no database) and nothing links to a real channel or video. A genuine YouTube
+// notification is just a link that Discord unfurls itself, which can't be shown in a preview, so this is an embed.
+function buildOnboardingPreview() {
+    const p = PLATFORMS.youtube;
+    const fakeUrl = 'https://www.youtube.com/';
+    const embed = new EmbedBuilder()
+        .setColor(p.color)
+        .setAuthor({ name: `Sample Creator • ${p.label}` })
+        .setTitle('I built my own Discord bot (full tutorial)')
+        .setURL(fakeUrl)
+        .setDescription('This is a made-up channel and video. A real notification looks like this, and arrives in the channel you pick as soon as the creator posts.')
+        .addFields(
+            { name: 'Channel', value: '@samplecreator', inline: true },
+            { name: 'Type', value: 'New video', inline: true },
+        )
+        .setFooter({ text: 'Preview only. Nothing was fetched or posted.' })
+        .setTimestamp(new Date());
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel('Watch Video').setStyle(ButtonStyle.Link).setURL(fakeUrl));
+    return { content: '**Preview** of a notification in your channel:', embeds: [embed], components: [row] };
 }
 
 // Platforms where Discord will render a native, playable video preview if the
@@ -177,7 +206,7 @@ function buildNotificationPayload(w, post) {
         return { content, embeds: [], components: [linkRow], wantsNativeVideo: true };
     }
     const embed = new EmbedBuilder()
-        .setColor(post.isLive ? '#FF0000' : p.color)
+        .setColor(p.color) // live streams use the platform's own color too (Twitch purple, Kick green)
         .setAuthor({ name: `${post.author || watchName(w)} • ${p.label}${typeLabel}` })
         .setURL(post.url)
         .setDescription([post.title, post.summary].filter(Boolean).join('\n\n').slice(0, 4000) || null)
@@ -231,7 +260,16 @@ async function markStreamOffline(w) {
                 .setAuthor({ name: `${w.handle} • ${p.label}` })
                 .setDescription('Stream ended.')
                 .setTimestamp();
-            await msg.edit({ content, embeds: [endedEmbed], components: msg.components })
+            // Same link, relabelled (the channel page is where past broadcasts live). Left as it was if there is no link button.
+            let components = msg.components;
+            const label = endedButtonLabel(w.platform);
+            const old = label ? (msg.components || []).flatMap(r => r.components || []).find(c => c.url) : null;
+            if (old) {
+                const btn = new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(old.url);
+                if (old.emoji) btn.setEmoji(old.emoji);
+                components = [new ActionRowBuilder().addComponents(btn)];
+            }
+            await msg.edit({ content, embeds: [endedEmbed], components })
                 .catch(e => console.error(`edit live-ended message (${w.id}):`, e.message));
         }
     } catch (e) {
@@ -241,4 +279,4 @@ async function markStreamOffline(w) {
     }
 }
 
-module.exports = { DEFAULT_TEMPLATE, PLACEHOLDER_HELP, buildNotificationPayload, buildSamplePost, buttonLabelFor, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };
+module.exports = { DEFAULT_TEMPLATE, PLACEHOLDER_HELP, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };

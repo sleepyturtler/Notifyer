@@ -14,8 +14,7 @@ const REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 const SNOWFLAKE = /^\d{5,25}$/;
 const recentRequests = new Map(); // `${linkId}:${guildId}` -> when the last request was DMed (limits DM spam; resets on restart)
 
-// Plain text safe to drop into an embed: no markdown, no mention syntax.
-const clean = (s, max = 80) => String(s ?? '').replace(/[*_`~|>\\[\]]/g, '').replace(/@/g, '@\u200b').replace(/\s+/g, ' ').trim().slice(0, max);
+const { plainText: clean } = require('./helpers.js');
 
 async function checkLinkAccess(link, guildId, userId) {
     if (userId && link.linked_by && String(link.linked_by) === String(userId)) return { allowed: true, reason: 'linker' };
@@ -94,4 +93,4 @@ async function handleLinkRequestButton(interaction) {
     if (!dmd && guild) await notifyGuildAdmins(guild, notice).catch(() => {});
 }
 
-module.exports = { checkLinkAccess, requestLinkApproval, handleLinkRequestButton, resetRecentRequests: () => recentRequests.clear(), REQUEST_TTL_MS };
+module.exports = { checkLinkAccess, requestLinkApproval, handleLinkRequestButton, resetRecentRequests: () => recentRequests.clear() };

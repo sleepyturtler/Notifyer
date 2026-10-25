@@ -1,10 +1,10 @@
-// One-off / recurring admin announcements (support server, Twitter restored) and delivery-failure reports.
+// One-off / recurring admin announcements (support server) and delivery-failure reports.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { PermissionFlagsBits, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, SUPPORT_SERVER_URL } = require('./config.js');
-const { watchName } = require('./helpers.js');
-const { getAllWatches, getConfig, getWatches, markSocialLinkDead, saveConfig } = require('./db.js');
+const { plainText, watchName } = require('./helpers.js');
+const { getConfig, getWatches, markSocialLinkDead, saveConfig } = require('./db.js');
 const { client } = require('./client.js');
 
 // Finds a channel to post admin/mod updates in. Prefers a channel hidden from
@@ -69,34 +69,6 @@ async function announceSupportServer(guild) {
         console.error(`announceSupportServer (${guild.id}):`, e.message);
         return false;
     }
-}
-
-// One-time follow-up that a mirror is back — separate flag so it sends even to
-// guilds already warned about the outage.
-async function announceTwitterRestoredForGuild(guildId) {
-    try {
-        const cfg = await getConfig(guildId);
-        if (cfg.twitterRestoredAnnounced) return;
-        const guild = client.guilds.cache.get(guildId);
-        if (!guild) return;
-        const channel = findAnnouncementChannel(guild);
-        if (!channel) return;
-        const embed = new EmbedBuilder().setColor('#00ff00').setTitle('✅ Twitter/X tracking is back')
-            .setDescription(
-                'This server has one or more Twitter/X watches. The Nitter mirrors this bot reads through have held up reliably, so Twitter/X tracking is fully re-enabled — no action needed, existing watches resume automatically.'
-            );
-        await channel.send({ embeds: [embed] }); // a failed send throws to the catch below, so the flag below is not set and it retries next boot
-        saveConfig(guildId, { ...cfg, twitterRestoredAnnounced: true });
-        console.log(`✅ Sent Twitter restored update to ${guild.name} (#${channel.name})`);
-    } catch (e) {
-        console.error(`announceTwitterRestoredForGuild (${guildId}):`, e.message);
-    }
-}
-
-async function announceTwitterRestoredGuilds() {
-    const watches = await getAllWatches(['twitter']);
-    const guildIdsWithTwitter = [...new Set(watches.map(w => w.guild_id))];
-    for (const guildId of guildIdsWithTwitter) await announceTwitterRestoredForGuild(guildId);
 }
 
 // ── Delivery-failure reports ────────────────────────────────────────────────
@@ -212,7 +184,7 @@ async function reportLinkProblem(link, kind, watches, detail = null) {
     try {
         if (kind === 'dead' && !(await markSocialLinkDead(link.id))) return;
         const platform = PLATFORMS[link.platform]?.label || link.platform;
-        const account = `${platform} account **${String(link.external_username).replace(/[*_`~|>]/g, '')}**`;
+        const account = `${platform} account **${plainText(link.external_username)}**`;
         const dead = kind === 'dead';
         const make = (n, where) => new EmbedBuilder().setColor(dead ? '#ED4245' : '#FEE75C')
             .setTitle(dead ? '⚠️ A linked account needs to be re-linked' : 'ℹ️ A linked account was unlinked')
@@ -248,4 +220,4 @@ async function notifyGuildAdmins(guild, embed) {
     return sendDeliveryReport(guild, findAnnouncementChannel(guild), embed, [], []);
 }
 
-module.exports = { announceSupportServer, announceTwitterRestoredGuilds, notifyGuildAdmins, reportDeliveryFailure, reportLinkProblem };
+module.exports = { announceSupportServer, notifyGuildAdmins, reportDeliveryFailure, reportLinkProblem };

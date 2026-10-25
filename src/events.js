@@ -5,7 +5,7 @@ const { ActivityType, ChannelType, Events, SlashCommandBuilder } = require('disc
 const { client } = require('./client.js');
 const { pollAll } = require('./poller.js');
 const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS } = require('./config.js');
-const { announceSupportServer, announceTwitterRestoredGuilds } = require('./announcements.js');
+const { announceSupportServer } = require('./announcements.js');
 const { getConfig, saveConfig } = require('./db.js');
 const { purgeGuild, purgeOrphanedGuilds, sweepUnusedLinks } = require('./guildCleanup.js');
 const fs = require('fs');
@@ -72,8 +72,6 @@ client.once(Events.ClientReady, async () => {
         await new Promise(r => setTimeout(r, 1000)); // light stagger to avoid rate limits
     }
 
-    // One-time update to servers with Twitter watches that it's fully back.
-    await announceTwitterRestoredGuilds();
 });
 
 // The bot was removed from a server (kicked, left, or the server was deleted): delete what we stored for

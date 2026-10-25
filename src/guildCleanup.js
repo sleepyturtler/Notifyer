@@ -64,4 +64,4 @@ async function sweepUnusedLinks() {
     }
 }
 
-module.exports = { purgeGuild, purgeOrphanedGuilds, sweepUnusedLinks, UNUSED_LINK_GRACE_MS };
+module.exports = { purgeGuild, purgeOrphanedGuilds, sweepUnusedLinks };

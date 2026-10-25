@@ -279,4 +279,4 @@ async function markStreamOffline(w) {
     }
 }
 
-module.exports = { DEFAULT_TEMPLATE, PLACEHOLDER_HELP, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };
+module.exports = { PLACEHOLDER_HELP, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };

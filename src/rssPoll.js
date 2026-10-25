@@ -73,9 +73,4 @@ function describePollFrequency(w, pushCovered = null) {
     }
 }
 
-// RSS-named aliases kept so existing callers and tests keep working.
-const computeRssInterval = (timestamps, now) => computeInterval('rss', timestamps, now);
-const nextRssBackoff = prevMs => nextBackoff('rss', prevMs);
-const rssPollDue = (w, now) => pollDue('rss', w, now);
-
-module.exports = { computeInterval, nextBackoff, pollDue, hasAdaptivePolling, formatInterval, describePollFrequency, computeRssInterval, nextRssBackoff, rssPollDue };
+module.exports = { computeInterval, nextBackoff, pollDue, hasAdaptivePolling, formatInterval, describePollFrequency };

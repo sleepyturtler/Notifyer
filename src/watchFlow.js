@@ -6,11 +6,8 @@ const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
 const { E, normalizeHandle, watchName } = require('./helpers.js');
 const { addWatch, getSocialLinkByUsername, getWatches, setWatchSocialLink, updateLastPost } = require('./db.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
-const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
-const { fetchLatestKickAll } = require('./platforms/kick.js');
-const { fetchLatestBlueskyAll } = require('./platforms/bluesky.js');
-const { fetchLatestRssAll } = require('./platforms/rss.js');
-const { fetchLatestPost } = require('./platforms/index.js');
+const { BULK_FETCHERS } = require('./platforms/index.js');
+const { fetchLatestTwitter } = require('./platforms/twitter.js');
 const { fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
 const { checkLinkAccess, requestLinkApproval } = require('./linkRequests.js');
@@ -71,30 +68,18 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
         }
     } else {
         try {
-            if (platform === 'twitch') {
-                const posts = await fetchLatestTwitchAll(handle);
+            if (BULK_FETCHERS[platform]) {
+                const posts = await BULK_FETCHERS[platform](handle);
                 post = posts[0] || null;
-                baselineSeenIds = posts.map(p => p.id);
-            } else if (platform === 'kick') {
-                const posts = await fetchLatestKickAll(handle);
-                post = posts[0] || null;
-                baselineSeenIds = posts.map(p => p.id);
-            } else if (platform === 'rss') {
-                const posts = await fetchLatestRssAll(handle);
-                post = posts[0] || null;
-                displayName = posts[0]?.author || null;
-                baselineSeenIds = posts.map(p => p.id);
-            } else if (platform === 'bluesky') {
-                const posts = await fetchLatestBlueskyAll(handle);
-                post = posts[0] || null;
+                if (platform === 'rss') displayName = posts[0]?.author || null;
                 baselineSeenIds = posts.map(p => p.id);
             } else if (platform === 'youtube') {
-                // fetchLatestPost() has no YouTube case — it's handled separately via
+                // YouTube is handled separately via
                 // the Data API + playlist-ID cache (fetchLatestYouTubeEntries), which
                 // needs a real watch.id to cache the resolved channel/playlist IDs
                 // against. Deferred until after addWatch() below, once we have one.
             } else {
-                post = await fetchLatestPost(platform, handle);
+                post = await fetchLatestTwitter(handle);
                 baselineSeenIds = post?.id ? [post.id] : [];
             }
             fetchedOk = platform !== 'youtube'; // YouTube's fetch happens after addWatch(), below

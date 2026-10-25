@@ -1,11 +1,10 @@
-// Single-post fetch dispatcher (only Twitter goes through it; other platforms use their bulk fetchers).
-// Moved verbatim out of the former single-file index.js; only the require/export lines are new.
+// Platforms that return a list of recent posts per account, by platform key. The poller and the add flow both go
+// through this map instead of repeating which fetcher belongs to which platform.
+const { fetchLatestTwitchAll } = require('./twitch.js');
+const { fetchLatestKickAll } = require('./kick.js');
+const { fetchLatestBlueskyAll } = require('./bluesky.js');
+const { fetchLatestRssAll } = require('./rss.js');
 
-const { fetchLatestTwitter } = require('./twitter.js');
+const BULK_FETCHERS = { twitch: fetchLatestTwitchAll, kick: fetchLatestKickAll, bluesky: fetchLatestBlueskyAll, rss: fetchLatestRssAll };
 
-// Every other platform is fetched through its own bulk fetcher (see pollAll / createWatchFlow).
-async function fetchLatestPost(platform, handle) {
-    return platform === 'twitter' ? fetchLatestTwitter(handle) : null;
-}
-
-module.exports = { fetchLatestPost };
+module.exports = { BULK_FETCHERS };

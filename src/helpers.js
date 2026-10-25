@@ -7,6 +7,16 @@ const { PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 // ── Helpers ────────────────────────────────────────────────────────────────
 const E = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
 
+// Platforms whose handle is just "site/@name" with nothing else to parse: the site prefix to strip, and whether the
+// platform treats names case-insensitively.
+const SIMPLE_HANDLES = {
+    twitter:   { site: /^(twitter\.com|x\.com)\//i },
+    twitch:    { site: /^twitch\.tv\//i, lower: true },
+    kick:      { site: /^kick\.com\//i, lower: true },
+    instagram: { site: /^instagram\.com\//i },
+    tiktok:    { site: /^tiktok\.com\//i },
+};
+
 function normalizeHandle(platform, raw) {
     let h = raw.trim();
     // Strip full URLs down to the handle/channel identifier
@@ -16,10 +26,10 @@ function normalizeHandle(platform, raw) {
         h = h.replace(/[?#].*$/, '').replace(/^channel\//i, ''); // /channel/UC... URLs and ?si=... tracking params
         h = h.replace(/\/(videos|featured|streams|shorts).*$/i, '');
         h = h.replace(/\/$/, '');
-    } else if (platform === 'twitter') {
-        h = h.replace(/^(twitter\.com|x\.com)\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
+    } else if (SIMPLE_HANDLES[platform]) {
+        const { site, lower } = SIMPLE_HANDLES[platform];
+        h = h.replace(site, '').replace(/^@/, '').split(/[/?]/)[0];
+        if (lower) h = h.toLowerCase();
     } else if (platform === 'rss') {
         // The handle IS the feed URL. Keep path/query case; reject anything that isn't a plain http(s) URL.
         h = raw.trim(); // the generic scheme/www stripping above would change the feed's real address
@@ -36,22 +46,6 @@ function normalizeHandle(platform, raw) {
         h = h.split(/[/?#]/)[0].toLowerCase();
         // "alice" alone is almost always alice.bsky.social; DIDs and custom domains pass through.
         if (h && !h.includes('.') && !h.startsWith('did:')) h += '.bsky.social';
-    } else if (platform === 'twitch') {
-        h = h.replace(/^twitch\.tv\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0].toLowerCase();
-    } else if (platform === 'kick') {
-        h = h.replace(/^kick\.com\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0].toLowerCase();
-    } else if (platform === 'instagram') {
-        h = h.replace(/^(instagram\.com)\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
-    } else if (platform === 'tiktok') {
-        h = h.replace(/^(tiktok\.com)\/@?/i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
     }
     return h;
 }
@@ -80,6 +74,11 @@ function canWatchBatch(w) {
     return nonLiveTypes.length > 0 && activeTypeIds(w).some(id => id !== 'live');
 }
 
+// Plain text safe to drop into an embed or message: no markdown, no mention syntax, collapsed whitespace.
+function plainText(s, max = 80) {
+    return String(s ?? '').replace(/[*`~|>\\\[\]]/g, '').replace(/@/g, '@\u200b').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
 // A short readable label for a feed URL when its title isn't known: host plus a trimmed path, generic feed
 // filenames dropped. https://www.theverge.com/rss/index.xml -> theverge.com, reddit.com/r/node/.rss -> reddit.com/r/node
 function shortFeedLabel(url) {
@@ -102,9 +101,9 @@ function shortFeedLabel(url) {
 function watchName(w) {
     if (w.platform !== 'rss') return w.handle;
     const raw = (w.display_name && String(w.display_name).trim()) || shortFeedLabel(w.handle);
-    const clean = raw.replace(/[*`~|>\\\[\]]/g, '').replace(/@/g, '@\u200b').replace(/\s+/g, ' ').trim();
+    const clean = plainText(raw, 200);
     const out = clean.length > 40 ? clean.slice(0, 39).trimEnd() + '…' : clean;
     return out || shortFeedLabel(w.handle);
 }
 
-module.exports = { E, canWatchBatch, normalizeHandle, profileUrl, shortFeedLabel, watchName };
+module.exports = { E, canWatchBatch, normalizeHandle, plainText, profileUrl, shortFeedLabel, watchName };

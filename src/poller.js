@@ -7,13 +7,10 @@ const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
-const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
-const { fetchLatestKickAll } = require('./platforms/kick.js');
-const { fetchLatestBlueskyAll } = require('./platforms/bluesky.js');
-const { fetchLatestRssAll } = require('./platforms/rss.js');
 const { computeInterval, hasAdaptivePolling, nextBackoff, pollDue } = require('./rssPoll.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
-const { fetchLatestPost } = require('./platforms/index.js');
+const { BULK_FETCHERS } = require('./platforms/index.js');
+const { fetchLatestTwitter } = require('./platforms/twitter.js');
 const { reportLinkProblem } = require('./announcements.js');
 
 // ── Polling loop ───────────────────────────────────────────────────────────
@@ -183,10 +180,10 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     } else {
                         await touchLastChecked(w.id);
                     }
-                } else if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky' || w.platform === 'rss' || w.platform === 'instagram' || w.platform === 'tiktok') {
+                } else if (BULK_FETCHERS[w.platform] || w.platform === 'instagram' || w.platform === 'tiktok') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
-                    if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'bluesky' || w.platform === 'rss') {
+                    if (BULK_FETCHERS[w.platform]) {
                         // Same redundant-external-call shape as the Instagram/TikTok shared-link
                         // case below — multiple watches (any servers) can track the same
                         // streamer by handle, and without caching each one independently re-hits
@@ -194,7 +191,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         // cycle (20s). Cache by platform+handle for the rest of this pass.
                         const handleCacheKey = `${w.platform}:${w.platform === 'rss' ? w.handle : w.handle.toLowerCase()}`; // feed URLs are case-sensitive
                         if (!perCyclePostsCache.has(handleCacheKey)) {
-                            perCyclePostsCache.set(handleCacheKey, (w.platform === 'twitch' ? fetchLatestTwitchAll : w.platform === 'kick' ? fetchLatestKickAll : w.platform === 'rss' ? fetchLatestRssAll : fetchLatestBlueskyAll)(w.handle));
+                            perCyclePostsCache.set(handleCacheKey, BULK_FETCHERS[w.platform](w.handle));
                         }
                         posts = await perCyclePostsCache.get(handleCacheKey);
                         if (w.platform === 'rss') {
@@ -264,19 +261,13 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     } else if (!updated) {
                         await touchLastChecked(w.id);
                     }
-                } else {
+                } else if (w.platform === 'twitter') {
                     // Twitter fetches ask every Nitter mirror, so accounts tracked by several servers share one fetch per pass.
-                    let postPromise;
-                    if (w.platform === 'twitter') {
-                        const key = `twitter:${w.handle.toLowerCase()}`;
-                        if (!perCyclePostsCache.has(key)) perCyclePostsCache.set(key, fetchLatestPost(w.platform, w.handle));
-                        postPromise = perCyclePostsCache.get(key);
-                    } else postPromise = fetchLatestPost(w.platform, w.handle);
-                    const post = await postPromise;
-                    if (w.platform === 'twitter') {
-                        nitterOk++;
-                        await setWatchPollInterval(w.id, computeInterval('twitter', post ? [post.timestamp, ...(post.recentTimestamps || [])] : [])).catch(() => {});
-                    }
+                    const key = `twitter:${w.handle.toLowerCase()}`;
+                    if (!perCyclePostsCache.has(key)) perCyclePostsCache.set(key, fetchLatestTwitter(w.handle));
+                    const post = await perCyclePostsCache.get(key);
+                    nitterOk++;
+                    await setWatchPollInterval(w.id, computeInterval('twitter', post ? [post.timestamp, ...(post.recentTimestamps || [])] : [])).catch(() => {});
                     if (!post || !post.id) { await touchLastChecked(w.id); continue; }
                     if (w.last_post_id === null) {
                         await updateLastPost(w.id, post.id, seenIds);

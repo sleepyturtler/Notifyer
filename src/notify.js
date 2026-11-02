@@ -174,12 +174,29 @@ async function ensureVideoEmbedFallback(channel, messageId, post) {
             .setAuthor({ name: `${oembed?.author || post.author || ''} • TikTok`.replace(/^ • /, '') })
             .setURL(post.url)
             .setDescription(oembed?.title || post.title || null)
-            .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
+            .setTimestamp(safeDate(post.timestamp));
         if (oembed?.thumbnail) fallback.setImage(oembed.thumbnail);
         await msg.edit({ embeds: [fallback] }).catch(e => console.error('embed fallback edit:', e.message));
     } catch (e) {
         console.error('ensureVideoEmbedFallback:', e.message);
     }
+}
+
+// Discord refuses a message over 2000 characters, and the post is already marked seen by then, so an over-long custom
+// template would silently lose the notification. Keep the start (role ping, text) and, for native-video links, the URL.
+const MAX_CONTENT = 2000;
+function clampContent(content, url = null) {
+    if (content.length <= MAX_CONTENT) return content;
+    if (url && content.endsWith(url)) return content.slice(0, MAX_CONTENT - url.length - 1) + '…' + url;
+    const cut = content.slice(0, MAX_CONTENT - 1) + '…';
+    return url && !cut.includes(url) ? content.slice(0, MAX_CONTENT - url.length - 2) + '…\n' + url : cut;
+}
+
+// A feed or poster can send any string as a date (Bluesky's is set by the poster's client), and an unparseable one makes
+// the embed builder throw, which would lose the notification. Fall back to "now".
+function safeDate(v) {
+    const d = v ? new Date(v) : null;
+    return d && Number.isFinite(d.getTime()) ? d : new Date();
 }
 
 // Builds the exact {content, embeds, components} a notification would use, without
@@ -192,11 +209,13 @@ function buildNotificationPayload(w, post) {
     // For YouTube/TikTok, make sure a URL that Discord will actually unfurl into a
     // playable video is present on its own line (not just inside a custom embed).
     const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
+    let embedUrl = null;
     if (wantsNativeVideo) {
-        const embedUrl = embeddableUrl(w.platform, post.url);
+        embedUrl = embeddableUrl(w.platform, post.url);
         content = content.includes(post.url) ? content.split(post.url).join(embedUrl) : `${content}\n${embedUrl}`;
     }
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
+    content = clampContent(content, embedUrl);
     const linkRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton)
     );
@@ -207,10 +226,10 @@ function buildNotificationPayload(w, post) {
     }
     const embed = new EmbedBuilder()
         .setColor(p.color) // live streams use the platform's own color too (Twitch purple, Kick green)
-        .setAuthor({ name: `${post.author || watchName(w)} • ${p.label}${typeLabel}` })
+        .setAuthor({ name: `${post.author || watchName(w)} • ${p.label}${typeLabel}`.slice(0, 256) })
         .setURL(post.url)
         .setDescription([post.title, post.summary].filter(Boolean).join('\n\n').slice(0, 4000) || null)
-        .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
+        .setTimestamp(safeDate(post.timestamp));
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.isLive && post.category) embed.addFields({ name: 'Category', value: String(post.category).slice(0, 1024), inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
@@ -279,4 +298,4 @@ async function markStreamOffline(w) {
     }
 }
 
-module.exports = { PLACEHOLDER_HELP, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };
+module.exports = { PLACEHOLDER_HELP, clampContent, safeDate, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };

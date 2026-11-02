@@ -10,6 +10,42 @@ const { getYouTubeSubscription, updateWatchYouTubeIds, upsertYouTubeSubscription
 // playlist ID via the API — 1 quota unit, and only ever called once per watch
 // since the result gets cached (see updateWatchYouTubeIds / fetchLatestYouTubeEntries).
 // YouTube's error messages contain markup like <code>playlistId</code>; show plain text.
+// ── Daily quota ──────────────────────────────────────────────────────────────
+// Every API call goes through ytGet. Once YouTube says the daily quota is used up (it resets at midnight Pacific time),
+// further calls would only fail, so they are refused locally until then instead of being retried every cycle.
+let quotaBlockedUntil = 0, quotaNotedFor = 0;
+
+function nextPacificMidnight(now = Date.now()) {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hourCycle: 'h23', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(now));
+    const get = t => Number(parts.find(p => p.type === t).value);
+    return now + (86400 - (get('hour') * 3600 + get('minute') * 60 + get('second'))) * 1000 + 60 * 1000; // a minute past, to be safe
+}
+
+class YouTubeQuotaError extends Error {
+    constructor(resumeAt) {
+        super(`YouTube API quota used up; checks resume ${new Date(resumeAt).toISOString()}`);
+        this.youtubeQuota = true; this.resumeAt = resumeAt;
+    }
+}
+
+const youtubeQuotaBlockedUntil = () => quotaBlockedUntil;
+// True the first time it is asked during each block, so callers log or alert once, not on every refused call.
+function noteQuotaOnce() {
+    if (quotaNotedFor === quotaBlockedUntil) return false;
+    quotaNotedFor = quotaBlockedUntil; return true;
+}
+
+async function ytGet(url) {
+    if (quotaBlockedUntil > Date.now()) throw new YouTubeQuotaError(quotaBlockedUntil);
+    const res = await fetchJson(url);
+    const reason = res.json?.error?.errors?.[0]?.reason;
+    if (res.status === 403 && (reason === 'quotaExceeded' || reason === 'dailyLimitExceeded')) { // not rateLimitExceeded: that is per-minute
+        quotaBlockedUntil = nextPacificMidnight();
+        throw new YouTubeQuotaError(quotaBlockedUntil);
+    }
+    return res;
+}
+
 const apiMessage = json => String(json?.error?.message || '').replace(/<[^>]+>/g, '').trim();
 
 async function resolveYouTubeChannel(handle) {
@@ -18,7 +54,7 @@ async function resolveYouTubeChannel(handle) {
     const url = isRawId
         ? `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${handle}&key=${YOUTUBE_API_KEY}`
         : `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle=${encodeURIComponent(handle.startsWith('@') ? handle : '@' + handle)}&key=${YOUTUBE_API_KEY}`;
-    const { status, json } = await fetchJson(url);
+    const { status, json } = await ytGet(url);
     if (status !== 200) throw new Error(apiMessage(json) || `HTTP ${status}`);
     const item = json?.items?.[0];
     if (!item) throw new Error('Could not resolve that YouTube channel — check the handle/URL');
@@ -72,7 +108,7 @@ async function fetchLatestYouTubeEntries(w) {
     // separate renewal scheduler is needed.
     ensureYouTubeSubscription(channelId).catch(() => {});
 
-    const { status, json } = await fetchJson(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${playlistId}&maxResults=10&key=${YOUTUBE_API_KEY}`);
+    const { status, json } = await ytGet(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${playlistId}&maxResults=10&key=${YOUTUBE_API_KEY}`);
     // 404 playlistNotFound = the channel has no uploads yet (YouTube only creates the uploads playlist with the
     // first video). That's an empty channel, not a failure: treating it as an error logged it on every poll and,
     // because the watch got no baseline, swallowed the channel's first video as "baseline" when it finally appeared.
@@ -96,7 +132,7 @@ async function fetchLatestYouTubeEntries(w) {
 async function classifyYouTubeVideos(videoIds) {
     if (!videoIds.length) return {};
     if (!YOUTUBE_API_KEY) throw new Error('YOUTUBE_API_KEY is not set');
-    const { status, json } = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${YOUTUBE_API_KEY}`);
+    const { status, json } = await ytGet(`https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoIds.join(',')}&key=${YOUTUBE_API_KEY}`);
     if (status !== 200) throw new Error(apiMessage(json) || `HTTP ${status}`);
     const result = {};
     for (const item of json.items || []) {
@@ -121,4 +157,4 @@ async function classifyYouTubeVideos(videoIds) {
     return result;
 }
 
-module.exports = { classifyYouTubeVideos, fetchLatestYouTubeEntries };
+module.exports = { YouTubeQuotaError, classifyYouTubeVideos, fetchLatestYouTubeEntries, nextPacificMidnight, noteQuotaOnce, youtubeQuotaBlockedUntil, _resetQuotaForTests: () => { quotaBlockedUntil = 0; quotaNotedFor = 0; } };

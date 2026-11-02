@@ -4,7 +4,7 @@
 const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE, YOUTUBE_PUSH_POLL_INTERVAL_MS } = require('./config.js');
 const { client } = require('./client.js');
 const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels, setWatchDisplayName, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
-const { classifyYouTubeVideos, fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
+const { classifyYouTubeVideos, fetchLatestYouTubeEntries, noteQuotaOnce, youtubeQuotaBlockedUntil } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
 const { computeInterval, hasAdaptivePolling, nextBackoff, pollDue } = require('./rssPoll.js');
@@ -73,6 +73,25 @@ function skipYouTubePoll(w, pushCovered, now = Date.now()) {
         && !w.youtube_live_video_id && !w.last_error && w.last_checked && (now - w.last_checked) < YOUTUBE_PUSH_POLL_INTERVAL_MS);
 }
 
+// True when the bot is in servers at all but not in this one: its watches wait out the deletion grace period without being
+// polled (nothing could be posted, and each poll costs a real API call). An empty server list is not trusted.
+function botHasLeft(guildId) {
+    const guilds = client.guilds && client.guilds.cache;
+    return Boolean(guilds && guilds.size > 0 && !guilds.has(guildId));
+}
+
+// Once per quota block: log it and tell the bot owner, since every YouTube watch is paused until the reset.
+async function reportYouTubeQuota(resumeAt) {
+    console.error(`🚨 YouTube API quota used up: YouTube checks pause until ${new Date(resumeAt).toISOString()} (the quota resets at midnight Pacific time).`);
+    if (!process.env.BOT_OWNER_ID) return;
+    try {
+        const owner = await client.users.fetch(process.env.BOT_OWNER_ID);
+        await owner.send(`🚨 **Notifyer: the YouTube API quota is used up.** YouTube checks are paused until <t:${Math.floor(resumeAt / 1000)}:f> (<t:${Math.floor(resumeAt / 1000)}:R>). New videos are picked up after that. Everything else keeps running.`);
+    } catch (e) {
+        console.error('YouTube quota owner DM failed:', e.message);
+    }
+}
+
 async function pollAll(platforms = null, onlyGuildId = null) {
     // /social check is a per-guild command, but pollAll(null) with no scoping
     // processes every watch on every server the bot is in — including the full
@@ -93,9 +112,17 @@ async function pollAll(platforms = null, onlyGuildId = null) {
         // path, which still fetches unfiltered.
         let watches = await getAllWatches(platforms);
         if (onlyGuildId) watches = watches.filter(w => w.guild_id === onlyGuildId);
+        watches = watches.filter(w => !botHasLeft(w.guild_id));
         // Scoped to this one poll pass only — see the instagram/tiktok branch below.
         // Manual /social check (onlyGuildId) always polls; the scheduled slow loop skips push-covered YouTube watches.
         const pushCovered = (!onlyGuildId && watches.some(w => w.platform === 'youtube')) ? await getPushCoveredYouTubeChannels().catch(e => { console.error('push-covered lookup:', e.message); return null; }) : null;
+        // YouTube: one fetch per channel and one classification per video for the whole pass, however many servers track it.
+        const ytClassified = new Map();
+        const classifyShared = async ids => {
+            const missing = ids.filter(id => !ytClassified.has(id));
+            if (missing.length) { const got = await classifyYouTubeVideos(missing); for (const id of missing) ytClassified.set(id, got[id] ?? null); }
+            return Object.fromEntries(ids.filter(id => ytClassified.get(id)).map(id => [id, ytClassified.get(id)]));
+        };
         const perCyclePostsCache = new Map(); // key -> Promise<posts[] | null>; key is social_link_id (Instagram/TikTok) or `${platform}:${handle}` (Twitch/Kick)
         let nitterOk = 0, nitterFail = 0, nitterFailMsg = null, nitterLogged = false;
         for (let w of watches) {
@@ -110,6 +137,14 @@ async function pollAll(platforms = null, onlyGuildId = null) {
             if (minInterval && w.last_checked && (Date.now() - w.last_checked) < minInterval) continue;
             if (skipYouTubePoll(w, pushCovered)) continue;
             if (!onlyGuildId && hasAdaptivePolling(w.platform) && !pollDue(w.platform, w)) continue; // adaptive: each account has its own interval
+            if (w.platform === 'youtube' && !onlyGuildId) {
+                const until = youtubeQuotaBlockedUntil();
+                if (until > Date.now()) { // quota used up: nothing to try until it resets, but say why on the watch (once, not every pass)
+                    if (!/quota used up/.test(w.last_error || '')) await touchLastChecked(w.id, `YouTube API quota used up; checks resume ${new Date(until).toISOString()}`).catch(() => {});
+                    continue;
+                }
+                if (w.last_error && w.poll_interval_ms && Date.now() - Number(w.last_checked) < Number(w.poll_interval_ms)) continue; // failing: backed off
+            }
             if (watchesInFlight.has(w.id)) continue; // another pass is already handling this watch
             watchesInFlight.add(w.id);
             try {
@@ -122,7 +157,10 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                 if (w.platform === 'youtube') {
                     // Walk every unseen entry, not just the newest, so bursty uploads
                     // between polls don't get silently skipped.
-                    const entries = await fetchLatestYouTubeEntries(w);
+                    const ytKey = `youtube:${w.youtube_uploads_playlist_id || String(w.handle).toLowerCase()}`;
+                    if (!perCyclePostsCache.has(ytKey)) perCyclePostsCache.set(ytKey, fetchLatestYouTubeEntries(w));
+                    const entries = await perCyclePostsCache.get(ytKey);
+                    if (w.poll_interval_ms) await setWatchPollInterval(w.id, null).catch(() => {}); // it works again: clear any error back-off
                     if (!entries.length) { await touchLastChecked(w.id); continue; }
                     if (w.last_post_id === null) {
                         // First check — seed baseline, don't notify for the back-catalog
@@ -137,7 +175,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     // videos.list costs 1 unit per call regardless of how many IDs, so
                     // there's no reason to ever call it per-video.
                     const idsToClassify = [...new Set([...newEntries.map(e => e.id), ...(w.youtube_live_video_id ? [w.youtube_live_video_id] : [])])];
-                    const classified = idsToClassify.length ? await classifyYouTubeVideos(idsToClassify) : {};
+                    const classified = idsToClassify.length ? await classifyShared(idsToClassify) : {};
 
                     // A previously-live video that's no longer live (or fell out of the
                     // classify batch entirely, e.g. deleted) has ended — same "edit the
@@ -279,7 +317,9 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     await sendOrExtendBatch(w, post);
                 }
             } catch (e) {
-                if (/HTTP 429/.test(e.message)) {
+                if (e.youtubeQuota) {
+                    if (noteQuotaOnce()) reportYouTubeQuota(e.resumeAt);
+                } else if (/HTTP 429/.test(e.message)) {
                     console.warn(`poll ${w.platform}/${w.handle}: rate-limited (429), retrying next cycle`);
                 } else if (w.platform === 'twitter' && /All Nitter instances failed/.test(e.message)) {
                     // Print the per-mirror errors once per pass; every further account would repeat the same list.
@@ -290,7 +330,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                 }
                 // Dead feeds back off. A Nitter outage is NOT the account's fault (every account fails together), so
                 // Twitter keeps its interval then rather than leaving every account slow once the mirrors recover.
-                if (w.platform === 'rss' || (w.platform === 'twitter' && !/All Nitter instances failed/.test(e.message))) {
+                if (w.platform === 'rss' || (w.platform === 'youtube' && !e.youtubeQuota) || (w.platform === 'twitter' && !/All Nitter instances failed/.test(e.message))) {
                     await setWatchPollInterval(w.id, nextBackoff(w.platform, w.poll_interval_ms)).catch(() => {});
                 }
                 await touchLastChecked(w.id, e.message).catch(() => {});

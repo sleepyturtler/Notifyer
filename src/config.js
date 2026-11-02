@@ -193,6 +193,12 @@ const ADAPTIVE_POLL = {
     twitter: adaptiveBounds('TWITTER', 5 * 60 * 1000, 30 * 60 * 1000), // tweets are time-sensitive: slower cap, quicker default
 };
 
+// /social check does a real fetch per watch (and costs YouTube quota), so a server can only run it this often.
+const SOCIAL_CHECK_COOLDOWN_MS = envMs('SOCIAL_CHECK_COOLDOWN_MS', 60 * 1000);
+
+// After the bot is removed from a server its data is kept this long before deletion (re-adding the bot cancels it).
+const GUILD_PURGE_GRACE_MS = envMs('GUILD_PURGE_GRACE_MS', 7 * 24 * 60 * 60 * 1000);
+
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
 
 const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter', 'bluesky', 'rss']);
@@ -240,4 +246,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, ADAPTIVE_POLL, linkablePlatforms, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, ADAPTIVE_POLL, GUILD_PURGE_GRACE_MS, SOCIAL_CHECK_COOLDOWN_MS, linkablePlatforms, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };

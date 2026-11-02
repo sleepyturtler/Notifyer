@@ -7,7 +7,7 @@ const { pollAll } = require('./poller.js');
 const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS } = require('./config.js');
 const { announceSupportServer } = require('./announcements.js');
 const { getConfig, saveConfig } = require('./db.js');
-const { purgeGuild, purgeOrphanedGuilds, sweepUnusedLinks } = require('./guildCleanup.js');
+const { cancelQueuedPurge, purgeOrphanedGuilds, queueGuildPurge, sweepRemovedGuilds, sweepUnusedLinks } = require('./guildCleanup.js');
 const fs = require('fs');
 const path = require('path');
 // Beta-only owner/debug commands (see debugTools.js) — present only on builds that
@@ -27,7 +27,8 @@ client.once(Events.ClientReady, async () => {
             .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
             .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
         .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
-        .addSubcommand(s => s.setName('preview').setDescription('Preview what a tracked account\'s notifications will look like'))
+        .addSubcommand(s => s.setName('preview').setDescription('Preview what a tracked account\'s notifications will look like')
+            .addIntegerOption(o => o.setName('watch').setDescription('The watch to preview (skips the picker)').setAutocomplete(true)))
         .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
         .addSubcommand(s => s.setName('link').setDescription('Connect an Instagram or TikTok account via OAuth so it can be tracked')
             .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
@@ -50,6 +51,8 @@ client.once(Events.ClientReady, async () => {
     await purgeOrphanedGuilds().catch(e => console.error('orphan sweep:', e.message));
     sweepUnusedLinks();
     setInterval(sweepUnusedLinks, 6 * 60 * 60 * 1000);
+    sweepRemovedGuilds();
+    setInterval(sweepRemovedGuilds, 6 * 60 * 60 * 1000);
 
     // Start polling — two independent cadences, see FAST/SLOW_POLL_* above.
     pollAll(FAST_POLL_PLATFORMS).catch(e => console.error('initial fast poll:', e.message));
@@ -74,14 +77,15 @@ client.once(Events.ClientReady, async () => {
 
 });
 
-// The bot was removed from a server (kicked, left, or the server was deleted): delete what we stored for
-// it. discord.js reports a temporary outage as a separate event, but guard against an unavailable guild anyway.
+// The bot was removed from a server (kicked, left, or the server was deleted): start the grace period after which what we
+// stored for it is deleted. discord.js reports a temporary outage as a separate event, but guard against an unavailable guild anyway.
 client.on(Events.GuildDelete, guild => {
     if (guild.available === false) return;
-    purgeGuild(guild.id, 'the bot was removed from the server');
+    queueGuildPurge(guild.id, 'the bot was removed from the server');
 });
 
 client.on('guildCreate', async (guild) => {
+    cancelQueuedPurge(guild.id); // re-added within the grace period: keep everything
     try {
         const cfg = await getConfig(guild.id);
         if (cfg.supportAnnounced) return;

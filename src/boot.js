@@ -13,7 +13,9 @@ const { client } = require('./client.js');
     try {
         await initDB();
     } catch (e) {
-        console.error('⚠️ initDB failed, starting bot anyway:', e.message);
+        // Without its tables nothing works, so stop and let the host restart it instead of running half-alive.
+        console.error('❌ initDB failed, exiting so the host restarts the bot:', e.message);
+        process.exit(1);
     }
     logStartupConfigSummary();
     if (!process.env.DISCORD_TOKEN || !process.env.DISCORD_TOKEN.trim()) {

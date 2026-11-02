@@ -98,7 +98,7 @@ function buildBatchPayload(entries) {
     // The header is its own top-level component — NOT inside the container —
     // so it renders outside the accent-colored box, only the per-post list
     // sits inside it.
-    const header = new TextDisplayBuilder().setContent(`${rolePrefix}${renderBatchHeaderForEntries(entries)}`);
+    const header = new TextDisplayBuilder().setContent(`${rolePrefix}${renderBatchHeaderForEntries(entries)}`.slice(0, 2000));
     const container = new ContainerBuilder().setAccentColor(hexColorToInt(p.color));
     entries.forEach(({ w, post }, i) => {
         if (i > 0) container.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));

@@ -94,6 +94,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
     }
 
     const watch = await addWatch({ guildId, platform, handle, channelId, addedBy: addedByTag, displayName });
+    if (!watch) return { ok: false, message: '❌ That account is already being tracked in this channel.' }; // lost a race with another add
     if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
 
     if (platform === 'youtube') {

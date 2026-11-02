@@ -16,6 +16,10 @@ const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 
 const hasAdaptivePolling = platform => Boolean(ADAPTIVE_POLL[platform]);
 
+// Platforms that poll at a fixed pace but back off while a watch keeps failing (a handle that doesn't resolve would
+// otherwise cost an API call every cycle, forever). Same doubling as the adaptive platforms; a success clears it.
+const ERROR_BACKOFF = { youtube: { min: SLOW_POLL_INTERVAL_MS, max: 60 * 60 * 1000, def: SLOW_POLL_INTERVAL_MS } };
+
 // timestamps: ms numbers or date strings; invalid ones are ignored, future ones count as "now".
 function computeInterval(platform, timestamps, now = Date.now()) {
     const { min, max, def } = ADAPTIVE_POLL[platform];
@@ -37,7 +41,7 @@ function computeInterval(platform, timestamps, now = Date.now()) {
 
 // After a failed check: double the current interval (starting from the default) up to the max; a success resets it.
 function nextBackoff(platform, prevMs) {
-    const { min, max, def } = ADAPTIVE_POLL[platform];
+    const { min, max, def } = ADAPTIVE_POLL[platform] || ERROR_BACKOFF[platform];
     return Math.round(clamp(Math.max(Number(prevMs) || 0, def) * 2, min, max));
 }
 

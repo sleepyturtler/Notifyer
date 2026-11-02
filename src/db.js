@@ -106,6 +106,21 @@ async function migrateSocialLinks() {
     }
 }
 
+// One watch per account per channel, enforced by the database (the check in the add flow alone can race: a double click or
+// two admins at once). Existing duplicates are reported and never deleted for you; the index is created once there are none.
+async function ensureUniqueWatches() {
+    try {
+        const dupes = (await pool.query('SELECT guild_id, platform, lower(handle) AS handle, channel_id, COUNT(*)::int AS n FROM watches GROUP BY 1, 2, 3, 4 HAVING COUNT(*) > 1')).rows;
+        if (dupes.length) {
+            console.error(`❌ ${dupes.length} group(s) of duplicate watches (same account twice in one channel), so the unique index was NOT created. Remove the extras with /social list, then restart. First few:`, JSON.stringify(dupes.slice(0, 5)));
+            return;
+        }
+        await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS watches_unique_account ON watches (guild_id, platform, lower(handle), channel_id)');
+    } catch (e) {
+        console.error('❌ could not enforce unique watches:', e.message);
+    }
+}
+
 async function initDB() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS configs   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
@@ -177,6 +192,11 @@ async function initDB() {
     if (!hadVerifiedCol) await pool.query('UPDATE youtube_subscriptions SET verified_until = expires_at WHERE signed');
     await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS poll_interval_ms INTEGER'); // RSS adaptive polling
     await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS display_name TEXT'); // RSS: the feed title, shown instead of the URL
+    // Servers the bot was removed from, waiting out the grace period before their data is deleted.
+    await pool.query('CREATE TABLE IF NOT EXISTS guild_purge_queue (guild_id TEXT PRIMARY KEY, delete_after BIGINT NOT NULL, queued_at BIGINT NOT NULL, reason TEXT)');
+    await pool.query('CREATE INDEX IF NOT EXISTS watches_social_link ON watches(social_link_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS watches_youtube_channel ON watches(youtube_channel_id)');
+    await ensureUniqueWatches();
     await migrateSocialLinks();
     // Backfill seen_post_ids for existing rows so nothing re-fires after migration
     await pool.query(`
@@ -223,10 +243,17 @@ async function getAllWatches(platforms = null) {
 }
 
 async function addWatch({ guildId, platform, handle, channelId, messageTemplate, addedBy, displayName = null }) {
-    const res = await pool.query(
+    // Resolves to null when the same account is already watched in that channel (unique index), so callers can say so.
+    let res;
+    try {
+        res = await pool.query(
         'INSERT INTO watches (guild_id, platform, handle, channel_id, message_template, added_by, added_at, display_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
         [guildId, platform, handle, channelId, messageTemplate ?? null, addedBy, Date.now(), displayName]
     );
+    } catch (e) {
+        if (e.code === '23505') return null;
+        throw e;
+    }
     return res.rows[0];
 }
 
@@ -316,7 +343,7 @@ async function setWatchDisplayName(id, name) {
 }
 
 async function setWatchPollInterval(id, ms) {
-    await pool.query('UPDATE watches SET poll_interval_ms = $2 WHERE id = $1', [id, Math.round(ms)]);
+    await pool.query('UPDATE watches SET poll_interval_ms = $2 WHERE id = $1', [id, ms == null ? null : Math.round(ms)]); // null clears it
 }
 
 async function setWatchSocialLink(guildId, id, socialLinkId) {
@@ -423,6 +450,22 @@ async function deleteSocialLink(id) {
     return res.rowCount > 0;
 }
 
+// Grace period before a removed server's data is deleted. Resolves to true only when the server was newly queued
+// (an existing entry keeps its original deadline, so repeated removals or sweeps never push it back).
+async function scheduleGuildPurge(guildId, deleteAfter, reason) {
+    const res = await pool.query('INSERT INTO guild_purge_queue (guild_id, delete_after, queued_at, reason) VALUES ($1, $2, $3, $4) ON CONFLICT (guild_id) DO NOTHING', [guildId, deleteAfter, Date.now(), reason]);
+    return res.rowCount > 0;
+}
+
+async function cancelGuildPurge(guildId) {
+    const res = await pool.query('DELETE FROM guild_purge_queue WHERE guild_id = $1', [guildId]);
+    return res.rowCount > 0;
+}
+
+async function getQueuedGuildPurges() {
+    return (await pool.query('SELECT guild_id, delete_after, reason FROM guild_purge_queue ORDER BY delete_after')).rows.map(r => ({ ...r, delete_after: Number(r.delete_after) }));
+}
+
 // Every guild ID that has anything stored (watches, linked accounts or settings).
 async function getStoredGuildIds() {
     const res = await pool.query('SELECT guild_id FROM watches UNION SELECT guild_id FROM configs');
@@ -440,6 +483,7 @@ async function deleteGuildData(guildId) {
         const watches = (await conn.query('DELETE FROM watches WHERE guild_id = $1', [guildId])).rowCount;
         await conn.query('DELETE FROM configs WHERE guild_id = $1', [guildId]);
         await conn.query('DELETE FROM social_link_approvals WHERE guild_id = $1', [guildId]);
+        await conn.query('DELETE FROM guild_purge_queue WHERE guild_id = $1', [guildId]);
         await conn.query('DELETE FROM youtube_subscriptions WHERE channel_id NOT IN (SELECT youtube_channel_id FROM watches WHERE youtube_channel_id IS NOT NULL)');
         await conn.query('COMMIT');
         configCache.delete(guildId);
@@ -470,4 +514,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, approveLinkForGuild, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, approveLinkForGuild, cancelGuildPurge, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getQueuedGuildPurges, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, scheduleGuildPurge, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

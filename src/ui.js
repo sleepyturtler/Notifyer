@@ -20,17 +20,25 @@ const BUILD_NAME = debugTools ? 'Notifyer Beta' : 'Notifyer';
 // ── Embeds / UI builders ──────────────────────────────────────────────────
 const refreshBtn = (id) => new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
 
-async function buildWatchListEmbed(guildId) {
+// A page is kept small on purpose: Discord caps an embed at 6000 characters in total and a watch's field can run to a few
+// hundred, so 25 at a time (the menu limit) could be refused outright.
+const WATCHES_PER_PAGE = 10;
+
+async function buildWatchListEmbed(guildId, page = 0) {
     const watches = await getWatches(guildId);
     if (!watches.length) {
         return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setDescription('No accounts are being tracked yet. Use `/social add` to add one.')], components: [] };
     }
     const STALE_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
+    const pages = Math.ceil(watches.length / WATCHES_PER_PAGE);
+    page = Math.min(Math.max(Number.isInteger(page) ? page : 0, 0), pages - 1);
+    const shown = watches.slice(page * WATCHES_PER_PAGE, (page + 1) * WATCHES_PER_PAGE);
     // Only YouTube's text depends on live data (whether push is confirmed for the channel).
-    const pushCovered = watches.some(x => x.platform === 'youtube') ? await getPushCoveredYouTubeChannels().catch(() => null) : null;
+    const pushCovered = shown.some(x => x.platform === 'youtube') ? await getPushCoveredYouTubeChannels().catch(() => null) : null;
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setTimestamp()
         .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
-    for (const w of watches.slice(0, 25)) {
+    const fields = [];
+    for (const w of shown) {
         const p = PLATFORMS[w.platform];
         const lines = [
             `Posts to <#${w.channel_id}>`,
@@ -56,30 +64,32 @@ async function buildWatchListEmbed(guildId) {
             // "Greyed out" look — embeds can't apply literal text color, so we use the
             // smaller/dimmer subtext style plus a clear label instead.
             lines.push(`-# ⚠️ ${p.label} is currently unavailable — see \`/help\` → Info for why.`);
-            embed.addFields({
-                name: `${p.emojiTag} ${p.label} — ${watchName(w)} *(unavailable)*${w.active ? '' : ' (paused)'}`,
-                value: lines.join('\n'),
-                inline: false,
-            });
+            fields.push({ name: (`${p.emojiTag} ${p.label} — ${watchName(w)} *(unavailable)*${w.active ? '' : ' (paused)'}`).slice(0, 256), value: lines.join('\n'), inline: false });
             continue;
         }
-        embed.addFields({
-            name: `${p.emojiTag} ${p.label} — ${watchName(w)}${w.active ? '' : ' (paused)'}`,
-            value: lines.join('\n'),
-            inline: false,
-        });
+        fields.push({ name: (`${p.emojiTag} ${p.label} — ${watchName(w)}${w.active ? '' : ' (paused)'}`).slice(0, 256), value: lines.join('\n'), inline: false });
     }
-    if (watches.length > 25) embed.setFooter({ text: `Showing first 25 of ${watches.length}` });
+    // Last line of defence for the 6000-character embed limit: shorten every field rather than have Discord refuse the list.
+    const fieldChars = () => fields.reduce((n, f) => n + f.name.length + f.value.length, 0);
+    if (fieldChars() > 5400) for (const f of fields) f.value = f.value.slice(0, 450);
+    if (fieldChars() > 5400) for (const f of fields) { f.value = f.value.slice(0, 300); f.name = f.name.slice(0, 120); }
+    embed.addFields(fields);
+    if (pages > 1) embed.setFooter({ text: `Page ${page + 1} of ${pages}` });
+    const nav = [refreshBtn(`sociallist_refresh_${guildId}_${page}`)];
+    if (pages > 1) {
+        nav.unshift(new ButtonBuilder().setCustomId(`sociallist_page_${guildId}_${page - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page === 0));
+        nav.splice(1, 0, new ButtonBuilder().setCustomId(`sociallist_page_${guildId}_${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page === pages - 1));
+    }
     const components = [
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallist_manage_${guildId}`).setPlaceholder('Manage a watch…')
-                .addOptions(watches.slice(0, 25).map(w => ({
+                .addOptions(shown.map(w => ({
                     label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${watchName(w)}`.slice(0, 100),
                     value: `${w.id}`,
                     emoji: PLATFORMS[w.platform]?.emojiButton,
                 })))
         ),
-        new ActionRowBuilder().addComponents(refreshBtn(`sociallist_refresh_${guildId}`)),
+        new ActionRowBuilder().addComponents(...nav),
     ];
     return { embeds: [embed], components };
 }
@@ -221,7 +231,7 @@ function buildManageView(w) {
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
         new ButtonBuilder().setCustomId(`socialmanage_remove_${w.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`socialmanage_back_${w.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`socialmanage_back_${w.id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
     );
     return { embeds: [embed], components: [row1, ...row1b, row2] };
 }
@@ -383,4 +393,4 @@ function buildHelpView(activeId) {
     return { embeds: [active.build()], components: rows };
 }
 
-module.exports = { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed };
+module.exports = { WATCHES_PER_PAGE, buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed };

@@ -74,8 +74,7 @@ const PLATFORMS = {
     // auto-disabled here the way the others below are.
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
     bluesky:   { label: 'Bluesky',   emoji: '🦋', color: '#1185FE' },
-    // Arbitrary user-supplied feed URLs: owner-only (restricted) until RSS_PUBLIC=true.
-    rss:       { label: 'RSS',       emoji: '📰', color: '#F26522', restricted: process.env.RSS_PUBLIC !== 'true' },
+    rss:       { label: 'RSS',       emoji: '📰', color: '#F26522' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF', unavailable: !(process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET) },
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18', unavailable: !(process.env.KICK_CLIENT_ID && process.env.KICK_CLIENT_SECRET) },
     // Instagram/TikTok also need PUBLIC_BASE_URL — without it there's nowhere for
@@ -84,6 +83,14 @@ const PLATFORMS = {
     instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C', oauth: true, unavailable: !(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET && PUBLIC_BASE_URL) },
     tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#010101', oauth: true, unavailable: !(process.env.TIKTOK_CLIENT_KEY && process.env.TIKTOK_CLIENT_SECRET && PUBLIC_BASE_URL) },
 };
+
+// Every platform is open to everyone by default. <PLATFORM>_OWNER_ONLY=true (YOUTUBE_OWNER_ONLY, TWITTER_OWNER_ONLY,
+// BLUESKY_OWNER_ONLY, RSS_OWNER_ONLY, TWITCH_OWNER_ONLY, KICK_OWNER_ONLY, INSTAGRAM_OWNER_ONLY, TIKTOK_OWNER_ONLY)
+// limits adding that platform to the bot owner. Watches that already exist keep running. RSS_PUBLIC=false still
+// works as the old way of restricting RSS.
+for (const [key, p] of Object.entries(PLATFORMS)) {
+    p.restricted = process.env[`${key.toUpperCase()}_OWNER_ONLY`] === 'true' || (key === 'rss' && process.env.RSS_PUBLIC === 'false');
+}
 
 // The notify types a watch fires for: its saved selection, else every type not marked defaultOff.
 function activeTypeIds(w) {
@@ -136,8 +143,12 @@ const PLATFORM_NOTIFY_TYPES = {
         { id: 'shorts', label: 'Shorts',  description: 'YouTube Shorts' },
         { id: 'live',   label: 'Live',    description: 'Stream goes live' },
     ],
-    twitter:   [{ id: 'posts', label: 'Posts', description: 'New tweets/posts' }],
     // Replies and reposts are opt-in (defaultOff): a watch with no saved selection only fires for posts.
+    twitter:   [
+        { id: 'posts',   label: 'Posts',   description: 'New tweets/posts' },
+        { id: 'replies', label: 'Replies', description: 'Replies to other accounts', defaultOff: true },
+        { id: 'reposts', label: 'Reposts', description: 'Tweets they retweeted', defaultOff: true },
+    ],
     rss:       [{ id: 'posts', label: 'Posts', description: 'New feed items' }],
     bluesky:   [
         { id: 'posts',   label: 'Posts',   description: 'New posts' },
@@ -227,8 +238,10 @@ function logStartupConfigSummary() {
     else off('YouTube', 'missing YOUTUBE_API_KEY');
 
     ok('Bluesky (public API, no credentials needed)');
-    ok(`RSS (${PLATFORMS.rss.restricted ? 'owner-only' : 'public'})`);
+    ok('RSS');
     ok(`Twitter/X (via Nitter, ${NITTER_INSTANCES.length} mirror(s) configured)`);
+    const ownerOnly = Object.entries(PLATFORMS).filter(([, p]) => p.restricted).map(([, p]) => p.label);
+    if (ownerOnly.length) lines.push(`   🔒 Owner only: ${ownerOnly.join(', ')}`);
 
     if (process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET) {
         if (PUBLIC_BASE_URL) ok('Instagram');

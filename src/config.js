@@ -15,9 +15,7 @@ const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
         'https://nitter.jaydenha.uk',
         'https://nitter.kareem.one',
         'https://nitter.meowing.monster',
-        'https://shitter.thepixora.com',
-        'https://nitter.xitter.cc',
-        'https://x.n0g.xyz',
+        'https://nitter.netbub.com',
     ]);
 
 // YouTube Data API v3 — replaces scraping youtube.com for uploads/Shorts/live
@@ -75,6 +73,8 @@ const PLATFORMS = {
     // hold up consistently. Needs no credentials at all, so it's never
     // auto-disabled here the way the others below are.
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
+    bluesky:   { label: 'Bluesky',   emoji: '🦋', color: '#1185FE' },
+    rss:       { label: 'RSS',       emoji: '📰', color: '#F26522' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF', unavailable: !(process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET) },
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18', unavailable: !(process.env.KICK_CLIENT_ID && process.env.KICK_CLIENT_SECRET) },
     // Instagram/TikTok also need PUBLIC_BASE_URL — without it there's nowhere for
@@ -84,9 +84,41 @@ const PLATFORMS = {
     tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#010101', oauth: true, unavailable: !(process.env.TIKTOK_CLIENT_KEY && process.env.TIKTOK_CLIENT_SECRET && PUBLIC_BASE_URL) },
 };
 
+// Every platform is open to everyone by default. <PLATFORM>_OWNER_ONLY=true (YOUTUBE_OWNER_ONLY, TWITTER_OWNER_ONLY,
+// BLUESKY_OWNER_ONLY, RSS_OWNER_ONLY, TWITCH_OWNER_ONLY, KICK_OWNER_ONLY, INSTAGRAM_OWNER_ONLY, TIKTOK_OWNER_ONLY)
+// limits adding that platform to the bot owner. Watches that already exist keep running. RSS_PUBLIC=false still
+// works as the old way of restricting RSS.
+for (const [key, p] of Object.entries(PLATFORMS)) {
+    p.restricted = process.env[`${key.toUpperCase()}_OWNER_ONLY`] === 'true' || (key === 'rss' && process.env.RSS_PUBLIC === 'false');
+}
+
+// The notify types a watch fires for: its saved selection, else every type not marked defaultOff.
+function activeTypeIds(w) {
+    if (Array.isArray(w.notify_types) && w.notify_types.length) return w.notify_types;
+    return (PLATFORM_NOTIFY_TYPES[w.platform] || []).filter(t => !t.defaultOff).map(t => t.id);
+}
+
 function isOwner(userId) {
     const ownerId = process.env.BOT_OWNER_ID;
     return Boolean(ownerId && userId === ownerId);
+}
+
+// The platforms a person can link right now: OAuth credentials set and a public address for the redirect.
+function linkablePlatforms() {
+    if (!PUBLIC_BASE_URL) return [];
+    return ['instagram', 'tiktok'].filter(k => OAUTH_CONFIG[k]?.clientId && OAUTH_CONFIG[k]?.clientSecret);
+}
+
+// A linked account may be used from any server, so unlinking it (which pauses every server's watches) is limited to the
+// person who linked it and the bot owner.
+function canUnlinkLink(link, userId) {
+    return Boolean(link) && ((Boolean(link.linked_by) && String(link.linked_by) === String(userId)) || isOwner(userId));
+}
+
+// Restricted platforms (RSS) can only be used by the bot owner.
+function canUsePlatform(key, userId) {
+    const p = PLATFORMS[key];
+    return Boolean(p) && (!p.restricted || isOwner(userId));
 }
 
 // Custom (application) emoji support via EMOJI_<PLATFORM> env vars — optional,
@@ -111,7 +143,18 @@ const PLATFORM_NOTIFY_TYPES = {
         { id: 'shorts', label: 'Shorts',  description: 'YouTube Shorts' },
         { id: 'live',   label: 'Live',    description: 'Stream goes live' },
     ],
-    twitter:   [{ id: 'posts', label: 'Posts', description: 'New tweets/posts' }],
+    // Replies and reposts are opt-in (defaultOff): a watch with no saved selection only fires for posts.
+    twitter:   [
+        { id: 'posts',   label: 'Posts',   description: 'New tweets/posts' },
+        { id: 'replies', label: 'Replies', description: 'Replies to other accounts', defaultOff: true },
+        { id: 'reposts', label: 'Reposts', description: 'Tweets they retweeted', defaultOff: true },
+    ],
+    rss:       [{ id: 'posts', label: 'Posts', description: 'New feed items' }],
+    bluesky:   [
+        { id: 'posts',   label: 'Posts',   description: 'New posts' },
+        { id: 'replies', label: 'Replies', description: 'Replies to other posts', defaultOff: true },
+        { id: 'reposts', label: 'Reposts', description: 'Posts they reposted', defaultOff: true },
+    ],
     twitch:    [
         { id: 'live',   label: 'Live',   description: 'Stream goes live' },
         { id: 'vods',   label: 'VODs',   description: 'New VOD/past broadcast uploaded' },
@@ -142,9 +185,34 @@ const FAST_POLL_INTERVAL_MS = 20 * 1000; // 20 seconds
 
 const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 
+// While a YouTube channel's WebSub push is confirmed by the hub, polling is only a safety net, so it runs this
+// often instead of every SLOW_POLL_INTERVAL_MS. Override with YOUTUBE_POLL_INTERVAL_MS (never below the slow interval).
+const YOUTUBE_PUSH_POLL_INTERVAL_MS = Math.max(SLOW_POLL_INTERVAL_MS, parseInt(process.env.YOUTUBE_POLL_INTERVAL_MS, 10) || 20 * 60 * 1000);
+
+// Some platforms adapt each watch's poll interval to how often the account posts (see rssPoll.js). A watch starts at the
+// default, speeds up for busy accounts down to the min (the slow loop's tick, so it can't go lower), and slows to the max
+// for quiet ones. Each can be overridden with <PREFIX>_POLL_DEFAULT_MS / _MIN_MS / _MAX_MS.
+const envMs = (name, fallback) => { const n = parseInt(process.env[name], 10); return n > 0 ? n : fallback; };
+function adaptiveBounds(prefix, defMs, maxMs) {
+    const min = Math.max(SLOW_POLL_INTERVAL_MS, envMs(`${prefix}_POLL_MIN_MS`, SLOW_POLL_INTERVAL_MS));
+    const max = Math.max(min, envMs(`${prefix}_POLL_MAX_MS`, maxMs));
+    const def = Math.min(max, Math.max(min, envMs(`${prefix}_POLL_DEFAULT_MS`, defMs)));
+    return { min, max, def };
+}
+const ADAPTIVE_POLL = {
+    rss: adaptiveBounds('RSS', 10 * 60 * 1000, 60 * 60 * 1000),
+    twitter: adaptiveBounds('TWITTER', 5 * 60 * 1000, 30 * 60 * 1000), // tweets are time-sensitive: slower cap, quicker default
+};
+
+// /social check does a real fetch per watch (and costs YouTube quota), so a server can only run it this often.
+const SOCIAL_CHECK_COOLDOWN_MS = envMs('SOCIAL_CHECK_COOLDOWN_MS', 60 * 1000);
+
+// After the bot is removed from a server its data is kept this long before deletion (re-adding the bot cancels it).
+const GUILD_PURGE_GRACE_MS = envMs('GUILD_PURGE_GRACE_MS', 7 * 24 * 60 * 60 * 1000);
+
 const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
 
-const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter']);
+const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter', 'bluesky', 'rss']);
 
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
 
@@ -169,7 +237,11 @@ function logStartupConfigSummary() {
     if (process.env.YOUTUBE_API_KEY) ok('YouTube');
     else off('YouTube', 'missing YOUTUBE_API_KEY');
 
+    ok('Bluesky (public API, no credentials needed)');
+    ok('RSS');
     ok(`Twitter/X (via Nitter, ${NITTER_INSTANCES.length} mirror(s) configured)`);
+    const ownerOnly = Object.entries(PLATFORMS).filter(([, p]) => p.restricted).map(([, p]) => p.label);
+    if (ownerOnly.length) lines.push(`   🔒 Owner only: ${ownerOnly.join(', ')}`);
 
     if (process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET) {
         if (PUBLIC_BASE_URL) ok('Instagram');
@@ -187,4 +259,4 @@ function logStartupConfigSummary() {
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, isOwner, logStartupConfigSummary };
+module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, ADAPTIVE_POLL, GUILD_PURGE_GRACE_MS, SOCIAL_CHECK_COOLDOWN_MS, linkablePlatforms, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };

@@ -3,14 +3,13 @@
 
 const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE, YOUTUBE_PUSH_POLL_INTERVAL_MS } = require('./config.js');
 const { client } = require('./client.js');
-const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels, setWatchDisplayName, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
+const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels, setWatchDisplayName, markWatchSeeded, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries, noteQuotaOnce, youtubeQuotaBlockedUntil } = require('./platforms/youtube.js');
 const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
 const { computeInterval, hasAdaptivePolling, nextBackoff, pollDue } = require('./rssPoll.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { BULK_FETCHERS } = require('./platforms/index.js');
-const { fetchLatestTwitter } = require('./platforms/twitter.js');
 const { reportLinkProblem } = require('./announcements.js');
 
 // ── Polling loop ───────────────────────────────────────────────────────────
@@ -236,6 +235,10 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                             await setWatchPollInterval(w.id, computeInterval('rss', (posts || []).map(p => p.timestamp))).catch(() => {});
                             const title = posts && posts[0] && posts[0].author;
                             if (title && title !== w.display_name) await setWatchDisplayName(w.id, title).catch(() => {}); // written only when the title is new or changed
+                        } else if (w.platform === 'twitter') {
+                            nitterOk++;
+                            // Pace follows the account's own tweets; a repost's date is the original's, so it says nothing about activity.
+                            await setWatchPollInterval(w.id, computeInterval('twitter', (posts || []).filter(p => p.postType !== 'reposts').map(p => p.timestamp))).catch(() => {});
                         }
                     } else {
                         if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
@@ -263,11 +266,16 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         if (posts && posts.dead) { await touchLastChecked(w.id, 'The linked account needs to be re-linked (/social link).'); continue; }
                         if (posts === null) { await touchLastChecked(w.id); continue; } // link was removed
                     }
+                    // Silent pass: nothing is announced, everything currently in the feed is just recorded as seen. That is the
+                    // first check of a new watch, and also a Twitter watch from before its feed included replies and
+                    // reposts (its seen list doesn't know those items, nor older tweets the new feed lists).
+                    const firstCheck = w.last_post_id === null;
+                    const silent = firstCheck || (w.platform === 'twitter' && !w.feed_seeded);
                     let newSeenIds = [...seenIds];
                     let updated = false;
                     const toNotify = [];
                     for (const post of posts) {
-                        if (w.last_post_id === null) continue; // first check — skip all
+                        if (silent) continue; // first check — skip all
                         if (newSeenIds.includes(post.id)) continue;
                         newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, SEEN_HISTORY_SIZE);
                         updated = true;
@@ -275,7 +283,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     }
                     // Record the new IDs before sending, so a throw mid-send can't cause the
                     // already-sent ones to be re-sent every following cycle.
-                    if (w.last_post_id !== null && updated) await updateLastPost(w.id, newSeenIds[0], newSeenIds, true);
+                    if (!silent && updated) await updateLastPost(w.id, newSeenIds[0], newSeenIds, true);
                     // Live posts keep their own message-edit tracking (see markStreamOffline
                     // below) and always send individually — batching only applies to regular
                     // posts/VODs, never to "went live" events.
@@ -293,28 +301,13 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     // show it ended instead of leaving it saying "is live" forever. (No-op for
                     // Instagram/TikTok posts, which never set isLive in the first place.)
                     if (!posts.some(p => p.isLive) && w.live_message_id) await markStreamOffline(w);
-                    if (w.last_post_id === null && posts.length) {
+                    if (silent && posts.length) {
                         // Seed baseline from first check
-                        await updateLastPost(w.id, posts[0].id, posts.map(p => p.id));
+                        await updateLastPost(w.id, posts[0].id, [...posts.map(p => p.id), ...seenIds]);
+                        if (w.platform === 'twitter') await markWatchSeeded(w.id);
                     } else if (!updated) {
                         await touchLastChecked(w.id);
                     }
-                } else if (w.platform === 'twitter') {
-                    // Twitter fetches ask every Nitter mirror, so accounts tracked by several servers share one fetch per pass.
-                    const key = `twitter:${w.handle.toLowerCase()}`;
-                    if (!perCyclePostsCache.has(key)) perCyclePostsCache.set(key, fetchLatestTwitter(w.handle));
-                    const post = await perCyclePostsCache.get(key);
-                    nitterOk++;
-                    await setWatchPollInterval(w.id, computeInterval('twitter', post ? [post.timestamp, ...(post.recentTimestamps || [])] : [])).catch(() => {});
-                    if (!post || !post.id) { await touchLastChecked(w.id); continue; }
-                    if (w.last_post_id === null) {
-                        await updateLastPost(w.id, post.id, seenIds);
-                        continue;
-                    }
-                    if (seenIds.includes(post.id)) { await touchLastChecked(w.id); continue; }
-                    await updateLastPost(w.id, post.id, seenIds, true);
-                    if (!shouldNotify(w, post)) continue;
-                    await sendOrExtendBatch(w, post);
                 }
             } catch (e) {
                 if (e.youtubeQuota) {

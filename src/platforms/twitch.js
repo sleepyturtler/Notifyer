@@ -77,6 +77,7 @@ async function fetchLatestTwitchAll(handle) {
             timestamp: stream.started_at,
             postType: 'live',
             isLive: true,
+            category: stream.game_name || null,
         });
     }
 

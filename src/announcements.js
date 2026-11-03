@@ -1,9 +1,10 @@
-// One-off / recurring admin announcements (support server, Twitter restored) and delivery-failure reports.
+// One-off / recurring admin announcements (support server) and delivery-failure reports.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { PermissionFlagsBits, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, SUPPORT_SERVER_URL } = require('./config.js');
-const { getAllWatches, getConfig, getWatches, saveConfig } = require('./db.js');
+const { plainText, watchName } = require('./helpers.js');
+const { getConfig, getWatches, markSocialLinkDead, saveConfig } = require('./db.js');
 const { client } = require('./client.js');
 
 // Finds a channel to post admin/mod updates in. Prefers a channel hidden from
@@ -68,34 +69,6 @@ async function announceSupportServer(guild) {
         console.error(`announceSupportServer (${guild.id}):`, e.message);
         return false;
     }
-}
-
-// One-time follow-up that a mirror is back — separate flag so it sends even to
-// guilds already warned about the outage.
-async function announceTwitterRestoredForGuild(guildId) {
-    try {
-        const cfg = await getConfig(guildId);
-        if (cfg.twitterRestoredAnnounced) return;
-        const guild = client.guilds.cache.get(guildId);
-        if (!guild) return;
-        const channel = findAnnouncementChannel(guild);
-        if (!channel) return;
-        const embed = new EmbedBuilder().setColor('#00ff00').setTitle('✅ Twitter/X tracking is back')
-            .setDescription(
-                'This server has one or more Twitter/X watches. The Nitter mirrors this bot reads through have held up reliably, so Twitter/X tracking is fully re-enabled — no action needed, existing watches resume automatically.'
-            );
-        await channel.send({ embeds: [embed] }); // a failed send throws to the catch below, so the flag below is not set and it retries next boot
-        saveConfig(guildId, { ...cfg, twitterRestoredAnnounced: true });
-        console.log(`✅ Sent Twitter restored update to ${guild.name} (#${channel.name})`);
-    } catch (e) {
-        console.error(`announceTwitterRestoredForGuild (${guildId}):`, e.message);
-    }
-}
-
-async function announceTwitterRestoredGuilds() {
-    const watches = await getAllWatches(['twitter']);
-    const guildIdsWithTwitter = [...new Set(watches.map(w => w.guild_id))];
-    for (const guildId of guildIdsWithTwitter) await announceTwitterRestoredForGuild(guildId);
 }
 
 // ── Delivery-failure reports ────────────────────────────────────────────────
@@ -169,7 +142,7 @@ async function reportDeliveryFailure(w, cause) {
         const { problem, fix, noLink } = describeDeliveryProblem(guild, failing, cause);
         const affected = (await getWatches(guild.id).catch(() => [])).filter(x => x.channel_id === w.channel_id && x.active !== false);
         if (!affected.some(x => x.id === w.id)) affected.unshift(w);
-        const label = x => `\`${String(x.handle).replace(/`/g, '')}\` (${PLATFORMS[x.platform]?.label || x.platform})`;
+        const label = x => `\`${String(watchName(x)).replace(/`/g, '')}\` (${PLATFORMS[x.platform]?.label || x.platform})`;
         const listed = affected.slice(0, 5).map(label).join(', ') + (affected.length > 5 ? ` and ${affected.length - 5} more` : '');
 
         const embed = new EmbedBuilder().setColor('#ED4245')
@@ -186,7 +159,7 @@ async function reportDeliveryFailure(w, cause) {
             .setURL(`https://discord.com/channels/${guild.id}/${w.channel_id}`)
             .setLabel((failing ? `Open #${failing.name}` : 'Open channel').slice(0, 80));
         const manage = new ButtonBuilder().setStyle(ButtonStyle.Secondary).setCustomId(`deliveryfail_manage_${w.id}`)
-            .setLabel(`Manage ${String(w.handle)}`.slice(0, 80));
+            .setLabel(`Manage ${String(watchName(w))}`.slice(0, 80));
         const rows = [new ActionRowBuilder().addComponents(...(noLink ? [] : [link]), manage)];
         // The manage button needs a server context, so a DM only carries the channel link (when it can exist).
         const dmRows = noLink ? [] : [new ActionRowBuilder().addComponents(link)];
@@ -203,4 +176,48 @@ async function reportDeliveryFailure(w, cause) {
     }
 }
 
-module.exports = { announceSupportServer, announceTwitterRestoredGuilds, reportDeliveryFailure };
+// A linked account stopped working ('dead': the platform rejected the saved login) or was unlinked ('unlinked'), so the
+// watches that use it, in every server, are paused. Tells the person who linked it (DM) and each affected server's
+// admin channel, once. `watches` is the list of watches that used the link; 'dead' marks the link first and does
+// nothing if it was already marked, so repeated failed polls don't repeat the notice. Never throws.
+async function reportLinkProblem(link, kind, watches, detail = null) {
+    try {
+        if (kind === 'dead' && !(await markSocialLinkDead(link.id))) return;
+        const platform = PLATFORMS[link.platform]?.label || link.platform;
+        const account = `${platform} account **${plainText(link.external_username)}**`;
+        const dead = kind === 'dead';
+        const make = (n, where) => new EmbedBuilder().setColor(dead ? '#ED4245' : '#FEE75C')
+            .setTitle(dead ? '⚠️ A linked account needs to be re-linked' : 'ℹ️ A linked account was unlinked')
+            .setDescription(dead
+                ? `The ${account} can no longer be read: the platform rejected its saved login.${n ? ` ${n} watch${n === 1 ? '' : 'es'} ${where} ${n === 1 ? 'is' : 'are'} paused.` : ''}
+
+The person who linked it${link.linked_by ? ` (<@${link.linked_by}>)` : ''} needs to run \`/social link\` again. Paused watches resume by themselves afterwards.`
+                : `The ${account} was unlinked, so ${n} watch${n === 1 ? '' : 'es'} ${where} ${n === 1 ? 'is' : 'are'} paused.
+
+It can be linked again with \`/social link\`; paused watches then resume by themselves.`)
+            .setFooter({ text: 'Instagram and TikTok accounts are shared across servers once linked' });
+        if (dead && detail) console.warn(`link ${link.id} (${link.platform}/${link.external_username}) marked dead: ${detail}`);
+
+        // The person who linked it (only useful for a rejected login; if they unlinked it themselves they know).
+        if (link.linked_by && (dead || detail)) {
+            const user = await client.users.fetch(link.linked_by).catch(() => null);
+            if (user) await user.send({ embeds: [make(watches.length, 'that use it')], allowedMentions: { parse: [] } }).catch(() => {});
+        }
+        const byGuild = new Map();
+        for (const w of watches) byGuild.set(w.guild_id, (byGuild.get(w.guild_id) || 0) + 1);
+        for (const [guildId, n] of byGuild) {
+            const guild = client.guilds.cache.get(guildId);
+            if (!guild) continue;
+            await sendDeliveryReport(guild, findAnnouncementChannel(guild), make(n, 'in this server'), [], []);
+        }
+    } catch (e) {
+        console.error(`reportLinkProblem (link ${link?.id}):`, e.message);
+    }
+}
+
+// Posts an embed to a server's private admin channel (owner DM fallback), same routing as the delivery reports.
+async function notifyGuildAdmins(guild, embed) {
+    return sendDeliveryReport(guild, findAnnouncementChannel(guild), embed, [], []);
+}
+
+module.exports = { announceSupportServer, notifyGuildAdmins, reportDeliveryFailure, reportLinkProblem };

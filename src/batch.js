@@ -42,16 +42,18 @@ function getBatchMinThreshold(cfg) {
 // tracked accounts.
 const BATCH_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
+const { watchName } = require('./helpers.js');
+
 const DEFAULT_BATCH_HEADER = '**{author}** posted {count} times!';
 
 // allHandles: every distinct handle contributing to this batch (just [w.handle]
 // for a single-creator batch) — lets {creators} resolve correctly even when the
 // template being rendered belongs to one specific watch in a multi-creator batch.
-function renderBatchHeader(w, count, allHandles = [w.handle]) {
+function renderBatchHeader(w, count, allHandles = [watchName(w)]) {
     const tmpl = w.batch_header_template || DEFAULT_BATCH_HEADER;
     return tmpl
-        .replace(/\{author\}/g, () => w.handle)
-        .replace(/\{handle\}/g, () => w.handle)
+        .replace(/\{author\}/g, () => watchName(w))
+        .replace(/\{handle\}/g, () => watchName(w))
         .replace(/\{creators\}/g, () => formatCreatorList(allHandles))
         .replace(/\{platform\}/g, () => PLATFORMS[w.platform]?.label || w.platform)
         .replace(/\{count\}/g, () => String(count));
@@ -66,7 +68,7 @@ function formatCreatorList(handles) {
 
 // entries: [{ w, post }] all sharing one channel+platform (see sendOrExtendBatch).
 function renderBatchHeaderForEntries(entries) {
-    const handles = entries.map(e => e.w.handle);
+    const handles = entries.map(e => watchName(e.w));
     const unique = [...new Set(handles)];
     if (unique.length === 1) {
         // Single creator — honor that watch's own customizable header template.
@@ -96,7 +98,7 @@ function buildBatchPayload(entries) {
     // The header is its own top-level component — NOT inside the container —
     // so it renders outside the accent-colored box, only the per-post list
     // sits inside it.
-    const header = new TextDisplayBuilder().setContent(`${rolePrefix}${renderBatchHeaderForEntries(entries)}`);
+    const header = new TextDisplayBuilder().setContent(`${rolePrefix}${renderBatchHeaderForEntries(entries)}`.slice(0, 2000));
     const container = new ContainerBuilder().setAccentColor(hexColorToInt(p.color));
     entries.forEach(({ w, post }, i) => {
         if (i > 0) container.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
@@ -115,6 +117,12 @@ function buildBatchPayload(entries) {
         );
     });
     return { components: [header, container], flags: MessageFlags.IsComponentsV2, allowedMentions: { roles: roleIds } };
+}
+
+// Best effort: a fallback that sends a FRESH batch message has to remove the message it supersedes, otherwise the
+// same posts show up twice (once in the old message, once in the new one). Failure to delete is harmless.
+async function dropMessage(channel, id) {
+    if (channel && id) await channel.messages.delete(id).catch(() => {});
 }
 
 async function sendBatchNotification(entries) {
@@ -223,7 +231,7 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
                     retryEntries = retryEntries.slice(-MAX_BATCH_ENTRIES_PER_MESSAGE);
                     sent = await sendBatchNotification(retryEntries);
                 }
-                if (sent) { state.messageId = sent.id; state.entries = retryEntries; }
+                if (sent) { await dropMessage(channel, state.messageId); state.messageId = sent.id; state.entries = retryEntries; }
                 else recentBatchState.delete(key);
                 return sent;
             }
@@ -253,7 +261,8 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
             } catch (e) {
                 console.error(`merge batch (${key}):`, e.message);
                 const sent = await sendBatchNotification(state.entries);
-                if (sent) { state.messageId = sent.id; state.isBatch = true; }
+                // The first post's own standalone message is still sitting in the channel and is now inside the new batch.
+                if (sent) { await dropMessage(resolveWatchChannel(state.entries[0].w).channel, state.entries[0].standaloneMessageId); state.messageId = sent.id; state.isBatch = true; }
                 else recentBatchState.delete(key);
                 return sent;
             }
@@ -280,4 +289,4 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
 }
 
 
-module.exports = { DEFAULT_BATCH_HEADER, sendOrExtendBatch, MAX_BATCH_ENTRIES_PER_MESSAGE };
+module.exports = { DEFAULT_BATCH_HEADER, renderBatchHeader, renderBatchHeaderForEntries, sendOrExtendBatch, MAX_BATCH_ENTRIES_PER_MESSAGE };

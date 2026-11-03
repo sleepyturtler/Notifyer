@@ -45,6 +45,82 @@ async function ensureIPv4Pool() {
 }
 
 // ── DB ─────────────────────────────────────────────────────────────────────
+// Picks, for each (platform, account) that has several rows, the row to keep (the one whose token was refreshed
+// most recently, so the freshest login) and the rows to merge into it. Pure so it can be tested without a database.
+function planSocialLinkMerge(rows) {
+    const groups = new Map();
+    for (const r of rows) {
+        const k = `${r.platform}\u0000${r.external_user_id}`;
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(r);
+    }
+    const num = v => (v === null || v === undefined ? -Infinity : Number(v));
+    const plan = [];
+    for (const g of groups.values()) {
+        if (g.length < 2) continue;
+        g.sort((a, b) => num(b.expires_at) - num(a.expires_at) || num(b.linked_at) - num(a.linked_at) || b.id - a.id);
+        plan.push({ keep: g[0].id, drop: g.slice(1).map(r => r.id) });
+    }
+    return plan;
+}
+
+// Linked accounts used to belong to one server each. They now belong to the account itself (one row per platform
+// + account, usable from any server). One-time and idempotent: runs while the unique index doesn't exist yet, in a
+// single transaction, and merges any account that was linked in several servers into one row, repointing watches.
+// A failure here is logged loudly but doesn't stop the bot: other platforms keep working, only linking is affected.
+async function migrateSocialLinks() {
+    try {
+        await pool.query('ALTER TABLE social_links ADD COLUMN IF NOT EXISTS needs_relink_at BIGINT'); // token rejected: owner must re-link
+        await pool.query('ALTER TABLE social_links ADD COLUMN IF NOT EXISTS unused_since BIGINT');     // first sweep that saw no watch using it
+        // Servers that may use a linked account they didn't link or first use, approved by the person who linked it.
+        // Deleted automatically with the link (unlinking revokes every approval).
+        await pool.query(`CREATE TABLE IF NOT EXISTS social_link_approvals (
+            link_id INTEGER NOT NULL REFERENCES social_links(id) ON DELETE CASCADE,
+            guild_id TEXT NOT NULL, approved_by TEXT, approved_at BIGINT NOT NULL,
+            PRIMARY KEY (link_id, guild_id))`);
+        const done = (await pool.query("SELECT 1 FROM pg_indexes WHERE indexname = 'social_links_account'")).rowCount > 0;
+        if (done) return;
+        const conn = await pool.connect();
+        try {
+            await conn.query('BEGIN');
+            const rows = (await conn.query('SELECT id, platform, external_user_id, expires_at, linked_at FROM social_links')).rows;
+            const plan = planSocialLinkMerge(rows);
+            for (const { keep, drop } of plan) {
+                await conn.query('UPDATE watches SET social_link_id = $1 WHERE social_link_id = ANY($2::int[])', [keep, drop]);
+                await conn.query('DELETE FROM social_links WHERE id = ANY($1::int[])', [drop]);
+            }
+            const olds = (await conn.query("SELECT conname FROM pg_constraint WHERE conrelid = 'social_links'::regclass AND contype = 'u'")).rows;
+            for (const { conname } of olds) await conn.query(`ALTER TABLE social_links DROP CONSTRAINT "${conname.replace(/"/g, '')}"`);
+            await conn.query('ALTER TABLE social_links ALTER COLUMN guild_id DROP NOT NULL'); // now just "where it was first linked"
+            await conn.query('CREATE UNIQUE INDEX social_links_account ON social_links (platform, external_user_id)');
+            await conn.query('COMMIT');
+            console.log(`🔗 Linked accounts are now per account: ${rows.length} row(s), ${plan.reduce((n, p) => n + p.drop.length, 0)} duplicate(s) merged`);
+        } catch (e) {
+            await conn.query('ROLLBACK').catch(() => {});
+            throw e;
+        } finally {
+            conn.release();
+        }
+    } catch (e) {
+        console.error('❌ social_links migration failed (linking Instagram/TikTok will not work until this is fixed):', e.message);
+    }
+}
+
+// One watch per account per channel, enforced by the database (the check in the add flow alone can race: a double click or
+// two admins at once). Existing duplicates are reported and never deleted for you; the index is created once there are none.
+async function ensureUniqueWatches() {
+    try {
+        const dupes = (await pool.query('SELECT guild_id, platform, lower(handle) AS handle, channel_id, COUNT(*)::int AS n FROM watches GROUP BY 1, 2, 3, 4 HAVING COUNT(*) > 1')).rows;
+        if (dupes.length) {
+            console.error(`❌ ${dupes.length} group(s) of duplicate watches (same account twice in one channel), so the unique index was NOT created. Remove the extras with /social list, then restart. First few:`, JSON.stringify(dupes.slice(0, 5)));
+            return;
+        }
+        await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS watches_unique_account ON watches (guild_id, platform, lower(handle), channel_id)');
+    } catch (e) {
+        console.error('❌ could not enforce unique watches:', e.message);
+    }
+}
+
 async function initDB() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS configs   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
@@ -109,6 +185,19 @@ async function initDB() {
         );
         CREATE INDEX IF NOT EXISTS social_links_guild_platform ON social_links(guild_id, platform);
     `);
+    // verified_until = when the hub-confirmed push lease runs out (set by the hub's verification request, see
+    // markYouTubeSubscriptionVerified). Rows that predate the column were already live, so they start out trusted.
+    const hadVerifiedCol = (await pool.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'youtube_subscriptions' AND column_name = 'verified_until'")).rowCount > 0;
+    await pool.query('ALTER TABLE youtube_subscriptions ADD COLUMN IF NOT EXISTS verified_until BIGINT');
+    if (!hadVerifiedCol) await pool.query('UPDATE youtube_subscriptions SET verified_until = expires_at WHERE signed');
+    await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS poll_interval_ms INTEGER'); // RSS adaptive polling
+    await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS display_name TEXT'); // RSS: the feed title, shown instead of the URL
+    // Servers the bot was removed from, waiting out the grace period before their data is deleted.
+    await pool.query('CREATE TABLE IF NOT EXISTS guild_purge_queue (guild_id TEXT PRIMARY KEY, delete_after BIGINT NOT NULL, queued_at BIGINT NOT NULL, reason TEXT)');
+    await pool.query('CREATE INDEX IF NOT EXISTS watches_social_link ON watches(social_link_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS watches_youtube_channel ON watches(youtube_channel_id)');
+    await ensureUniqueWatches();
+    await migrateSocialLinks();
     // Backfill seen_post_ids for existing rows so nothing re-fires after migration
     await pool.query(`
         UPDATE watches
@@ -153,11 +242,18 @@ async function getAllWatches(platforms = null) {
     return res.rows;
 }
 
-async function addWatch({ guildId, platform, handle, channelId, messageTemplate, addedBy }) {
-    const res = await pool.query(
-        'INSERT INTO watches (guild_id, platform, handle, channel_id, message_template, added_by, added_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-        [guildId, platform, handle, channelId, messageTemplate ?? null, addedBy, Date.now()]
+async function addWatch({ guildId, platform, handle, channelId, messageTemplate, addedBy, displayName = null }) {
+    // Resolves to null when the same account is already watched in that channel (unique index), so callers can say so.
+    let res;
+    try {
+        res = await pool.query(
+        'INSERT INTO watches (guild_id, platform, handle, channel_id, message_template, added_by, added_at, display_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+        [guildId, platform, handle, channelId, messageTemplate ?? null, addedBy, Date.now(), displayName]
     );
+    } catch (e) {
+        if (e.code === '23505') return null;
+        throw e;
+    }
     return res.rows[0];
 }
 
@@ -226,6 +322,30 @@ async function upsertYouTubeSubscription(channelId, expiresAt) {
     );
 }
 
+// Called when the hub's verification request for OUR subscription arrives. Upserts, because that request can land
+// before ensureYouTubeSubscription has recorded its own row (it records after the hub's 202 comes back).
+async function markYouTubeSubscriptionVerified(channelId, leaseSeconds) {
+    const until = Date.now() + leaseSeconds * 1000;
+    await pool.query(
+        'INSERT INTO youtube_subscriptions (channel_id, expires_at, signed, verified_until) VALUES ($1, $2, TRUE, $2) ON CONFLICT (channel_id) DO UPDATE SET verified_until = $2, signed = TRUE',
+        [channelId, until]
+    );
+}
+
+// Channels whose push subscription the hub has confirmed and which hasn't lapsed: polling can slow down for these.
+async function getPushCoveredYouTubeChannels() {
+    const res = await pool.query('SELECT channel_id FROM youtube_subscriptions WHERE signed AND verified_until > $1', [Date.now()]);
+    return new Set(res.rows.map(r => r.channel_id));
+}
+
+async function setWatchDisplayName(id, name) {
+    await pool.query('UPDATE watches SET display_name = $2 WHERE id = $1', [id, String(name).slice(0, 200)]);
+}
+
+async function setWatchPollInterval(id, ms) {
+    await pool.query('UPDATE watches SET poll_interval_ms = $2 WHERE id = $1', [id, ms == null ? null : Math.round(ms)]); // null clears it
+}
+
 async function setWatchSocialLink(guildId, id, socialLinkId) {
     await pool.query('UPDATE watches SET social_link_id = $1 WHERE guild_id = $2 AND id = $3', [socialLinkId, guildId, id]);
 }
@@ -235,24 +355,80 @@ async function upsertSocialLink({ guildId, platform, externalUserId, externalUse
     const res = await pool.query(
         `INSERT INTO social_links (guild_id, platform, external_user_id, external_username, access_token, refresh_token, expires_at, linked_by, linked_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (guild_id, platform, external_user_id) DO UPDATE SET
+         ON CONFLICT (platform, external_user_id) DO UPDATE SET
             external_username = EXCLUDED.external_username, access_token = EXCLUDED.access_token,
             refresh_token = EXCLUDED.refresh_token, expires_at = EXCLUDED.expires_at,
-            linked_by = EXCLUDED.linked_by, linked_at = EXCLUDED.linked_at
+            linked_by = EXCLUDED.linked_by, linked_at = EXCLUDED.linked_at,
+            needs_relink_at = NULL, unused_since = NULL
          RETURNING *`,
         [guildId, platform, externalUserId, externalUsername, accessToken, refreshToken ?? null, expiresAt ?? null, linkedBy, Date.now()]
     );
-    return res.rows[0];
+    const link = res.rows[0];
+    // Watches that were paused by an unlink (social_link_id cleared) resume when the same account is linked again,
+    // in every server. A watch only ever matches by its tracked username, same as when it was created.
+    await pool.query('UPDATE watches SET social_link_id = $1 WHERE platform = $2 AND social_link_id IS NULL AND lower(handle) = lower($3)', [link.id, platform, externalUsername]);
+    return link;
 }
 
-async function getSocialLinks(guildId, platform) {
-    const res = await pool.query('SELECT * FROM social_links WHERE guild_id = $1 AND platform = $2 ORDER BY external_username', [guildId, platform]);
+// What a server's admins see in /social links: accounts this server's watches use, plus accounts they linked
+// themselves. Never the whole table, so usernames don't leak between servers.
+async function getSocialLinksVisible(guildId, userId) {
+    const res = await pool.query(
+        `SELECT * FROM social_links
+         WHERE linked_by = $2 OR id IN (SELECT social_link_id FROM watches WHERE guild_id = $1 AND social_link_id IS NOT NULL)
+         ORDER BY platform, external_username`, [guildId, userId]);
     return res.rows;
 }
 
-async function getSocialLinkByUsername(guildId, platform, username) {
-    const res = await pool.query('SELECT * FROM social_links WHERE guild_id = $1 AND platform = $2 AND lower(external_username) = lower($3)', [guildId, platform, username]);
+// Linked accounts work in every server, so the lookup is by account name alone.
+async function getSocialLinkByUsername(platform, username) {
+    const res = await pool.query('SELECT * FROM social_links WHERE platform = $1 AND lower(external_username) = lower($2) ORDER BY linked_at DESC LIMIT 1', [platform, username]);
     return res.rows[0] || null;
+}
+
+async function isLinkUsedInGuild(linkId, guildId) {
+    const res = await pool.query('SELECT 1 FROM watches WHERE social_link_id = $1 AND guild_id = $2 LIMIT 1', [linkId, guildId]);
+    return res.rowCount > 0;
+}
+
+// How widely a link is used, shown to the person deciding whether to unlink it.
+async function getLinkUsage(linkId) {
+    const res = await pool.query('SELECT COUNT(*)::int AS watches, COUNT(DISTINCT guild_id)::int AS guilds FROM watches WHERE social_link_id = $1', [linkId]);
+    return res.rows[0] || { watches: 0, guilds: 0 };
+}
+
+async function hasLinkApproval(linkId, guildId) {
+    const res = await pool.query('SELECT 1 FROM social_link_approvals WHERE link_id = $1 AND guild_id = $2', [linkId, guildId]);
+    return res.rowCount > 0;
+}
+
+async function approveLinkForGuild(linkId, guildId, approvedBy) {
+    await pool.query('INSERT INTO social_link_approvals (link_id, guild_id, approved_by, approved_at) VALUES ($1, $2, $3, $4) ON CONFLICT (link_id, guild_id) DO UPDATE SET approved_by = EXCLUDED.approved_by, approved_at = EXCLUDED.approved_at', [linkId, guildId, approvedBy, Date.now()]);
+}
+
+async function getWatchesByLink(linkId) {
+    return (await pool.query('SELECT id, guild_id, handle, platform FROM watches WHERE social_link_id = $1', [linkId])).rows;
+}
+
+async function countOtherWatchesUsingLink(linkId, exceptWatchId) {
+    const res = await pool.query('SELECT COUNT(*)::int AS n FROM watches WHERE social_link_id = $1 AND id <> $2', [linkId, exceptWatchId]);
+    return res.rows[0].n;
+}
+
+// Marks a link whose login the platform rejected. Resolves to the row only on the transition, so the
+// notices go out once, not on every poll.
+async function markSocialLinkDead(id) {
+    const res = await pool.query('UPDATE social_links SET needs_relink_at = $2 WHERE id = $1 AND needs_relink_at IS NULL RETURNING *', [id, Date.now()]);
+    return res.rows[0] || null;
+}
+
+// Links no watch uses for graceMs are removed (rows returned so the caller can revoke tokens). Self-correcting:
+// each run clears the marker on links that are in use again and stamps newly unused ones.
+async function sweepUnusedSocialLinks(graceMs, now = Date.now()) {
+    await pool.query('UPDATE social_links SET unused_since = NULL WHERE unused_since IS NOT NULL AND EXISTS (SELECT 1 FROM watches w WHERE w.social_link_id = social_links.id)');
+    await pool.query('UPDATE social_links SET unused_since = $1 WHERE unused_since IS NULL AND NOT EXISTS (SELECT 1 FROM watches w WHERE w.social_link_id = social_links.id)', [now]);
+    const res = await pool.query('DELETE FROM social_links WHERE unused_since IS NOT NULL AND unused_since < $1 AND NOT EXISTS (SELECT 1 FROM watches w WHERE w.social_link_id = social_links.id) RETURNING *', [now - graceMs]);
+    return res.rows;
 }
 
 async function getSocialLinkById(id) {
@@ -268,15 +444,31 @@ async function updateSocialLinkTokens(id, accessToken, refreshToken, expiresAt) 
 // (those watches stop polling — see the "not linked yet" guard in pollAll —
 // rather than being deleted outright, so removing a link doesn't silently
 // wipe someone's tracked-account/channel setup).
-async function deleteSocialLink(guildId, id) {
-    await pool.query('UPDATE watches SET social_link_id = NULL WHERE guild_id = $1 AND social_link_id = $2', [guildId, id]);
-    const res = await pool.query('DELETE FROM social_links WHERE guild_id = $1 AND id = $2', [guildId, id]);
+async function deleteSocialLink(id) {
+    await pool.query('UPDATE watches SET social_link_id = NULL WHERE social_link_id = $1', [id]);
+    const res = await pool.query('DELETE FROM social_links WHERE id = $1', [id]);
     return res.rowCount > 0;
+}
+
+// Grace period before a removed server's data is deleted. Resolves to true only when the server was newly queued
+// (an existing entry keeps its original deadline, so repeated removals or sweeps never push it back).
+async function scheduleGuildPurge(guildId, deleteAfter, reason) {
+    const res = await pool.query('INSERT INTO guild_purge_queue (guild_id, delete_after, queued_at, reason) VALUES ($1, $2, $3, $4) ON CONFLICT (guild_id) DO NOTHING', [guildId, deleteAfter, Date.now(), reason]);
+    return res.rowCount > 0;
+}
+
+async function cancelGuildPurge(guildId) {
+    const res = await pool.query('DELETE FROM guild_purge_queue WHERE guild_id = $1', [guildId]);
+    return res.rowCount > 0;
+}
+
+async function getQueuedGuildPurges() {
+    return (await pool.query('SELECT guild_id, delete_after, reason FROM guild_purge_queue ORDER BY delete_after')).rows.map(r => ({ ...r, delete_after: Number(r.delete_after) }));
 }
 
 // Every guild ID that has anything stored (watches, linked accounts or settings).
 async function getStoredGuildIds() {
-    const res = await pool.query('SELECT guild_id FROM watches UNION SELECT guild_id FROM social_links UNION SELECT guild_id FROM configs');
+    const res = await pool.query('SELECT guild_id FROM watches UNION SELECT guild_id FROM configs');
     return res.rows.map(r => r.guild_id);
 }
 
@@ -287,13 +479,15 @@ async function deleteGuildData(guildId) {
     const conn = await pool.connect();
     try {
         await conn.query('BEGIN');
-        const links = (await conn.query('DELETE FROM social_links WHERE guild_id = $1 RETURNING *', [guildId])).rows;
+        // Linked accounts belong to the account, not the server, so they stay; the unused-link sweep removes any that no watch uses.
         const watches = (await conn.query('DELETE FROM watches WHERE guild_id = $1', [guildId])).rowCount;
         await conn.query('DELETE FROM configs WHERE guild_id = $1', [guildId]);
+        await conn.query('DELETE FROM social_link_approvals WHERE guild_id = $1', [guildId]);
+        await conn.query('DELETE FROM guild_purge_queue WHERE guild_id = $1', [guildId]);
         await conn.query('DELETE FROM youtube_subscriptions WHERE channel_id NOT IN (SELECT youtube_channel_id FROM watches WHERE youtube_channel_id IS NOT NULL)');
         await conn.query('COMMIT');
         configCache.delete(guildId);
-        return { watches, links };
+        return { watches, links: [] };
     } catch (e) {
         await conn.query('ROLLBACK').catch(() => {});
         throw e;
@@ -320,4 +514,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getSocialLinkById, getSocialLinkByUsername, getSocialLinks, getStoredGuildIds, getWatch, getWatches, getWatchesByYouTubeChannel, getYouTubeSubscription, initDB, removeWatch, saveConfig, setWatchLiveMessage, setWatchSocialLink, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, approveLinkForGuild, cancelGuildPurge, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getQueuedGuildPurges, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, scheduleGuildPurge, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

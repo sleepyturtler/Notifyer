@@ -69,6 +69,7 @@ async function fetchLatestKickAll(handle) {
         timestamp: stream.started_at,
         postType: 'live',
         isLive: true,
+        category: stream.category?.name || null, // optional: the embed just omits the line if Kick sends none
     }];
 }
 

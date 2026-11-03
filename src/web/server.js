@@ -4,10 +4,11 @@
 const { URL } = require('url');
 const http = require('http');
 const crypto = require('crypto');
+const { client } = require('../client.js');
 const { SEEN_HISTORY_SIZE, WEBSUB_VERIFY_TOKEN, websubSecretFor } = require('../config.js');
 const { fetchText, xmlParser } = require('../net.js');
-const { getWatchesByYouTubeChannel, setWatchLiveMessage, setWatchYouTubeLiveVideo, updateLastPost, upsertSocialLink } = require('../db.js');
-const { classifyYouTubeVideos } = require('../platforms/youtube.js');
+const { getWatchesByYouTubeChannel, markYouTubeSubscriptionVerified, setWatchLiveMessage, setWatchYouTubeLiveVideo, updateLastPost, upsertSocialLink } = require('../db.js');
+const { classifyYouTubeVideos, noteQuotaOnce } = require('../platforms/youtube.js');
 const { sendNotification, shouldNotify } = require('../notify.js');
 const { sendOrExtendBatch } = require('../batch.js');
 const { consumeOAuthState } = require('../state.js');
@@ -38,7 +39,16 @@ function handleYouTubeWebSubVerify(req, res) {
     const verifyToken = u.searchParams.get('hub.verify_token');
     if ((mode === 'subscribe' || mode === 'unsubscribe') && verifyToken === WEBSUB_VERIFY_TOKEN && challenge) {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end(challenge);
+        res.end(challenge);
+        // The hub confirming OUR subscription is what lets polling slow down for that channel (see skipYouTubePoll).
+        if (mode === 'subscribe') {
+            const channelId = (() => { try { return new URL(u.searchParams.get('hub.topic') || '').searchParams.get('channel_id'); } catch { return null; } })();
+            const lease = parseInt(u.searchParams.get('hub.lease_seconds'), 10);
+            if (YT_CHANNEL_ID_RE.test(channelId || '') && lease > 0) {
+                markYouTubeSubscriptionVerified(channelId, Math.min(lease, 30 * 24 * 60 * 60)).catch(e => console.error('mark WebSub verified:', e.message));
+            }
+        }
+        return;
     }
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found');
@@ -114,7 +124,15 @@ async function handleYouTubeWebSubPush(req, res) {
                 for (const w of watches) {
                     const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
                     if (w.last_post_id === null || seenIds.includes(videoId)) continue; // baseline not seeded yet, or already handled
-                    if (!classified) classified = await classifyYouTubeVideos([videoId]);
+                    if (!classified) {
+                        try { classified = await classifyYouTubeVideos([videoId]); } catch (e) {
+                            // Quota used up: can't tell a short from a live stream or an upcoming premiere, so leave it unseen and
+                            // let polling announce it once the quota resets.
+                            if (!e.youtubeQuota) throw e;
+                            if (noteQuotaOnce()) console.warn('YouTube quota used up: pushed videos are left for polling after the reset.');
+                            break;
+                        }
+                    }
                     const c = classified[videoId];
                     if (c?.isUpcoming) continue; // scheduled, not live yet: leave it unseen so it notifies when it starts
                     const post = {
@@ -166,7 +184,7 @@ async function handleOAuthCallback(platform, req, res) {
             accessToken: identity.accessToken, refreshToken: identity.refreshToken, expiresAt: identity.expiresAt,
             linkedBy: stateEntry.userId,
         });
-        return htmlResponse(res, 200, 'Linked!', `<b>${escapeHtml(identity.externalUsername)}</b> is now linked. You can close this tab and go back to Discord, then use <code>/social add</code> to start tracking it.`);
+        return htmlResponse(res, 200, 'Linked!', `<b>${escapeHtml(identity.externalUsername)}</b> is now linked. It can be tracked in any server that uses Notifyer: close this tab, go back to Discord and use <code>/social add</code>. You can unlink it any time from <code>/social links</code>.`);
     } catch (e) {
         console.error(`OAuth callback (${platform}):`, e.message);
         return htmlResponse(res, 500, 'Link failed', `${escapeHtml(e.message)} — you can close this tab and try /social link again.`);
@@ -174,6 +192,16 @@ async function handleOAuthCallback(platform, req, res) {
 }
 
 const PORT = process.env.PORT || 3000;
+
+// /health says 503 once the Discord connection has been down for HEALTH_UNREADY_MS (default 5 minutes, which also covers a
+// slow start), so a host with a health check restarts a bot whose gateway died while the web server stayed up.
+const HEALTH_UNREADY_MS = parseInt(process.env.HEALTH_UNREADY_MS, 10) > 0 ? parseInt(process.env.HEALTH_UNREADY_MS, 10) : 5 * 60 * 1000;
+let unreadySince = Date.now();
+function healthStatus() {
+    if (client.isReady()) { unreadySince = null; return { code: 200, text: 'OK' }; }
+    if (!unreadySince) unreadySince = Date.now();
+    return Date.now() - unreadySince > HEALTH_UNREADY_MS ? { code: 503, text: 'Discord connection down' } : { code: 200, text: 'OK' };
+}
 
 http.createServer((req, res) => {
     // A single malformed request (e.g. one that trips new URL(req.url, ...) in a
@@ -183,7 +211,8 @@ http.createServer((req, res) => {
     try {
         const path = req.url.split('?')[0];
         if (path === '/health') {
-            res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('OK');
+            const h = healthStatus();
+            res.writeHead(h.code, { 'Content-Type': 'text/plain' }); return res.end(h.text);
         }
         if (path === '/') {
             res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(buildStatusHTML());

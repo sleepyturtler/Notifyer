@@ -17,13 +17,21 @@ const REFRESH_MARGIN_MS = { instagram: 24 * 60 * 60 * 1000, tiktok: 60 * 60 * 10
 // TikTok reports problems as { error, error_description } (sometimes { error: { code, message } }).
 // 429 and 5xx are TikTok's side and clear up by themselves; other 4xx mean the token was rejected, and
 // only then does re-linking help. The old code threw one generic "re-link" message for every failure.
+// An error flagged relinkNeeded means the platform definitively rejected the saved login (not a hiccup), so retrying
+// every poll is pointless: the poller marks the link dead and the owner is asked to run /social link again.
+function relinkError(message) { const e = new Error(message); e.relinkNeeded = true; return e; }
+
 function tiktokRefreshError(status, json) {
     const e = json?.error;
     const code = typeof e === 'string' ? e : e?.code;
     const desc = json?.error_description || (typeof e === 'object' ? e?.message : null);
     const detail = [status ? `HTTP ${status}` : null, code, desc].filter(Boolean).join(' ').replace(/\s+/g, ' ').slice(0, 200);
     if (status === 429 || status >= 500) return new Error(`TikTok is temporarily unavailable (${detail}); will retry.`);
-    if (status >= 400) return new Error(`TikTok rejected the token refresh (${detail}). Re-link with /social link.`);
+    // invalid_grant arrives as HTTP 200 with an error body, so the code matters as much as the status. invalid_client
+    // is OUR app credentials being wrong, which re-linking can't fix.
+    if (code !== 'invalid_client' && (code === 'invalid_grant' || (status >= 400 && status < 500))) {
+        return relinkError(`TikTok rejected the saved login (${detail}). The account owner needs to run /social link again.`);
+    }
     return new Error(`TikTok sent an unexpected refresh response (${detail}). If this keeps happening, re-link with /social link.`);
 }
 
@@ -37,7 +45,10 @@ async function ensureFreshToken(link) {
         const { json } = await fetchJson(
             `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${encodeURIComponent(link.access_token)}`
         );
-        if (!json?.access_token) throw new Error('Instagram token refresh failed — re-link with /social link.');
+        if (!json?.access_token) {
+            if (json?.error?.code === 190 || json?.error?.type === 'OAuthException') throw relinkError(`Instagram rejected the saved login (${json.error.message || 'token invalid'}). The account owner needs to run /social link again.`);
+            throw new Error('Instagram token refresh failed; will retry.');
+        }
         const expiresAt = Date.now() + (json.expires_in ? json.expires_in * 1000 : 55 * 24 * 60 * 60 * 1000);
         await updateSocialLinkTokens(link.id, json.access_token, null, expiresAt);
         return { ...link, access_token: json.access_token, expires_at: expiresAt };
@@ -71,7 +82,10 @@ async function fetchLatestInstagramAll(link) {
     const { json } = await fetchJson(
         `https://graph.instagram.com/me/media?fields=id,caption,media_type,media_product_type,media_url,permalink,timestamp&limit=10&access_token=${encodeURIComponent(fresh.access_token)}`
     );
-    if (json?.error) throw new Error(`Instagram API: ${json.error.message}`);
+    if (json?.error) {
+        if (json.error.code === 190) throw relinkError(`Instagram rejected the saved login (${json.error.message}). The account owner needs to run /social link again.`);
+        throw new Error(`Instagram API: ${json.error.message}`);
+    }
     const items = json?.data || [];
     return items.map(m => ({
         id: m.id,
@@ -111,7 +125,10 @@ async function fetchLatestTikTokAll(link) {
         { max_count: 10 },
         { Authorization: `Bearer ${fresh.access_token}` }
     );
-    if (json?.error?.code && json.error.code !== 'ok') throw new Error(`TikTok API: ${json.error.message || json.error.code}`);
+    if (json?.error?.code && json.error.code !== 'ok') {
+        if (json.error.code === 'access_token_invalid' || json.error.code === 'scope_not_authorized') throw relinkError(`TikTok rejected the saved login (${json.error.code}). The account owner needs to run /social link again.`);
+        throw new Error(`TikTok API: ${json.error.message || json.error.code}`);
+    }
     const items = json?.data?.videos || [];
     return items.map(v => ({
         id: v.id,
@@ -168,4 +185,4 @@ async function exchangeTikTokCode(code) {
     };
 }
 
-module.exports = { exchangeInstagramCode, exchangeTikTokCode, fetchLatestInstagramAll, fetchLatestTikTokAll, revokeTikTokToken };
+module.exports = { exchangeInstagramCode, exchangeTikTokCode, fetchLatestInstagramAll, fetchLatestTikTokAll, revokeTikTokToken, tiktokRefreshError };

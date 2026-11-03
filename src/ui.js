@@ -2,11 +2,12 @@
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { ButtonBuilder, ButtonStyle, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
-const { getSocialLinks, getWatches } = require('./db.js');
-const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
+const { getPushCoveredYouTubeChannels, getSocialLinksVisible, getWatches } = require('./db.js');
+const { describePollFrequency } = require('./rssPoll.js');
+const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds, linkablePlatforms } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
-const { canWatchBatch } = require('./helpers.js');
+const { canWatchBatch, watchName } = require('./helpers.js');
 const fs = require('fs');
 const path = require('path');
 // Beta-only "Admin" help category (see debugTools.js) — only added if that file is
@@ -19,19 +20,30 @@ const BUILD_NAME = debugTools ? 'Notifyer Beta' : 'Notifyer';
 // ── Embeds / UI builders ──────────────────────────────────────────────────
 const refreshBtn = (id) => new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
 
-async function buildWatchListEmbed(guildId) {
+// A page is kept small on purpose: Discord caps an embed at 6000 characters in total and a watch's field can run to a few
+// hundred, so 25 at a time (the menu limit) could be refused outright.
+const WATCHES_PER_PAGE = 10;
+
+async function buildWatchListEmbed(guildId, page = 0) {
     const watches = await getWatches(guildId);
     if (!watches.length) {
         return { embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setDescription('No accounts are being tracked yet. Use `/social add` to add one.')], components: [] };
     }
     const STALE_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
+    const pages = Math.ceil(watches.length / WATCHES_PER_PAGE);
+    page = Math.min(Math.max(Number.isInteger(page) ? page : 0, 0), pages - 1);
+    const shown = watches.slice(page * WATCHES_PER_PAGE, (page + 1) * WATCHES_PER_PAGE);
+    // Only YouTube's text depends on live data (whether push is confirmed for the channel).
+    const pushCovered = shown.some(x => x.platform === 'youtube') ? await getPushCoveredYouTubeChannels().catch(() => null) : null;
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Social Media Watches').setTimestamp()
         .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
-    for (const w of watches.slice(0, 25)) {
+    const fields = [];
+    for (const w of shown) {
         const p = PLATFORMS[w.platform];
         const lines = [
             `Posts to <#${w.channel_id}>`,
             `ID: \`${w.id}\``,
+            `Checks: ${describePollFrequency(w, pushCovered)}`,
             w.message_template ? `Custom message: \`${w.message_template.slice(0, 80)}${w.message_template.length > 80 ? '…' : ''}\`` : 'Using default message',
         ];
         if (w.last_post_at) {
@@ -52,49 +64,59 @@ async function buildWatchListEmbed(guildId) {
             // "Greyed out" look — embeds can't apply literal text color, so we use the
             // smaller/dimmer subtext style plus a clear label instead.
             lines.push(`-# ⚠️ ${p.label} is currently unavailable — see \`/help\` → Info for why.`);
-            embed.addFields({
-                name: `${p.emojiTag} ${p.label} — ${w.handle} *(unavailable)*${w.active ? '' : ' (paused)'}`,
-                value: lines.join('\n'),
-                inline: false,
-            });
+            fields.push({ name: (`${p.emojiTag} ${p.label} — ${watchName(w)} *(unavailable)*${w.active ? '' : ' (paused)'}`).slice(0, 256), value: lines.join('\n'), inline: false });
             continue;
         }
-        embed.addFields({
-            name: `${p.emojiTag} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
-            value: lines.join('\n'),
-            inline: false,
-        });
+        fields.push({ name: (`${p.emojiTag} ${p.label} — ${watchName(w)}${w.active ? '' : ' (paused)'}`).slice(0, 256), value: lines.join('\n'), inline: false });
     }
-    if (watches.length > 25) embed.setFooter({ text: `Showing first 25 of ${watches.length}` });
+    // Last line of defence for the 6000-character embed limit: shorten every field rather than have Discord refuse the list.
+    const fieldChars = () => fields.reduce((n, f) => n + f.name.length + f.value.length, 0);
+    if (fieldChars() > 5400) for (const f of fields) f.value = f.value.slice(0, 450);
+    if (fieldChars() > 5400) for (const f of fields) { f.value = f.value.slice(0, 300); f.name = f.name.slice(0, 120); }
+    embed.addFields(fields);
+    if (pages > 1) embed.setFooter({ text: `Page ${page + 1} of ${pages}` });
+    const nav = [refreshBtn(`sociallist_refresh_${guildId}_${page}`)];
+    if (pages > 1) {
+        nav.unshift(new ButtonBuilder().setCustomId(`sociallist_page_${guildId}_${page - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page === 0));
+        nav.splice(1, 0, new ButtonBuilder().setCustomId(`sociallist_page_${guildId}_${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page === pages - 1));
+    }
     const components = [
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallist_manage_${guildId}`).setPlaceholder('Manage a watch…')
-                .addOptions(watches.slice(0, 25).map(w => ({
-                    label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${w.handle}`.slice(0, 100),
+                .addOptions(shown.map(w => ({
+                    label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${watchName(w)}`.slice(0, 100),
                     value: `${w.id}`,
                     emoji: PLATFORMS[w.platform]?.emojiButton,
                 })))
         ),
-        new ActionRowBuilder().addComponents(refreshBtn(`sociallist_refresh_${guildId}`)),
+        new ActionRowBuilder().addComponents(...nav),
     ];
     return { embeds: [embed], components };
 }
 
-async function buildSocialLinksEmbed(guildId) {
-    const igLinks = await getSocialLinks(guildId, 'instagram');
-    const ttLinks = await getSocialLinks(guildId, 'tiktok');
-    const allLinks = [...igLinks, ...ttLinks];
+async function buildSocialLinksEmbed(guildId, userId) {
+    const links = await getSocialLinksVisible(guildId, userId);
+    const ofPlatform = p => links.filter(l => l.platform === p);
+    const line = l => `• ${l.external_username} (linked by <@${l.linked_by}>)${l.needs_relink_at ? ' ⚠️ needs re-link' : ''}`;
     const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Linked Accounts').setTimestamp()
-        .setDescription('Accounts authorized via `/social link` in this server. Only these can be added with `/social add`.')
+        .setDescription('Accounts this server tracks, plus accounts you linked. A linked account works in **any server** that uses Notifyer, and only the person who linked it can unlink it.')
         .addFields(
-            { name: '📸 Instagram', value: igLinks.length ? igLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
-            { name: '🎵 TikTok', value: ttLinks.length ? ttLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
+            { name: '📸 Instagram', value: (ofPlatform('instagram').map(line).join('\n') || '*(none)*').slice(0, 1000) },
+            { name: '🎵 TikTok', value: (ofPlatform('tiktok').map(line).join('\n') || '*(none)*').slice(0, 1000) },
         );
-    if (!allLinks.length) return { embeds: [embed], components: [] };
+    if (!links.length) {
+        // Nothing linked yet: offer to link one right here (the same sign-in a /social link would start).
+        if (!linkablePlatforms().length) {
+            embed.setFooter({ text: 'Linking is not set up on this bot yet.' });
+            return { embeds: [embed], components: [] };
+        }
+        return { embeds: [embed], components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`sociallinks_add_${guildId}`).setLabel('Link an account').setStyle(ButtonStyle.Primary))] };
+    }
     const components = [
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallinks_manage_${guildId}`).setPlaceholder('Manage a linked account…')
-                .addOptions(allLinks.slice(0, 25).map(l => ({
+                .addOptions(links.slice(0, 25).map(l => ({
                     label: `${PLATFORMS[l.platform].label} — ${l.external_username}`.slice(0, 100),
                     value: `${l.platform}:${l.id}`,
                     emoji: PLATFORMS[l.platform]?.emojiButton,
@@ -105,18 +127,21 @@ async function buildSocialLinksEmbed(guildId) {
     return { embeds: [embed], components };
 }
 
-function buildSocialLinkManageView(link) {
+// canUnlink: only the person who linked it (or the bot owner) may; usage = { watches, guilds } across all servers.
+function buildSocialLinkManageView(link, { guildId, canUnlink = false, usage = null } = {}) {
     const p = PLATFORMS[link.platform];
     const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage Link — ${p.emojiTag} ${link.external_username}`).setTimestamp()
         .addFields(
             { name: 'Platform', value: p.label, inline: true },
-            { name: 'Linked by', value: link.linked_by, inline: true },
+            { name: 'Linked by', value: `<@${link.linked_by}>`, inline: true },
+            { name: 'Status', value: link.needs_relink_at ? '⚠️ Needs re-link (`/social link`)' : '✅ Working', inline: true },
         );
-    const components = [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`sociallinkmanage_unlink_${link.platform}_${link.id}`).setLabel('Unlink').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`sociallinkmanage_back_${link.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
-    )];
-    return { embeds: [embed], components };
+    if (usage) embed.addFields({ name: 'Used by', value: `${usage.watches} watch${usage.watches === 1 ? '' : 'es'} in ${usage.guilds} server${usage.guilds === 1 ? '' : 's'}`, inline: true });
+    if (!canUnlink) embed.setFooter({ text: 'Only the person who linked this account can unlink it.' });
+    const row = new ActionRowBuilder();
+    if (canUnlink) row.addComponents(new ButtonBuilder().setCustomId(`sociallinkmanage_unlink_${link.platform}_${link.id}`).setLabel('Unlink').setStyle(ButtonStyle.Danger));
+    row.addComponents(new ButtonBuilder().setCustomId(`sociallinkmanage_back_${guildId}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary));
+    return { embeds: [embed], components: [row] };
 }
 
 // Shared modal builder used both from the manage view's "Edit Messages"
@@ -127,7 +152,7 @@ function buildSocialLinkManageView(link) {
 function buildPerTypeMessageModal(w, isNewFlow = false) {
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const templates = w.message_templates || {};
-    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}${isNewFlow ? '_new' : ''}`).setTitle(`Edit Messages for ${w.handle}`.slice(0, 45));
+    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}${isNewFlow ? '_new' : ''}`).setTitle(`Edit Messages for ${watchName(w)}`.slice(0, 45));
     // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
     modal.addComponents(
         ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
@@ -159,7 +184,8 @@ function buildBatchHeaderModal(w) {
 // One line per active notify type: that type's own message, else the watch's old single message, else "default".
 function describeMessages(w) {
     const all = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-    const active = (Array.isArray(w.notify_types) && w.notify_types.length) ? all.filter(t => w.notify_types.includes(t.id)) : all;
+    const ids = activeTypeIds(w);
+    const active = all.filter(t => ids.includes(t.id));
     const templates = w.message_templates || {};
     return active.map(t => {
         const text = String(templates[t.id] || w.message_template || '').replace(/\s+/g, ' ').replace(/`/g, "'").trim();
@@ -169,12 +195,12 @@ function describeMessages(w) {
 
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
-    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${w.handle}`).setTimestamp()
+    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${watchName(w)}`).setTimestamp()
         .addFields(
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
             { name: 'Ping role', value: w.role_id ? `<@&${w.role_id}>` : 'None', inline: true },
-            { name: 'Types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : 'All types', inline: true },
+            { name: 'Types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : ((PLATFORM_NOTIFY_TYPES[w.platform] || []).some(t => t.defaultOff) ? activeTypeIds(w).map(id => PLATFORM_NOTIFY_TYPES[w.platform].find(x => x.id === id).label).join(', ') : 'All types'), inline: true },
         );
     embed.addFields({ name: 'Messages', value: describeMessages(w) });
     embed.addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
@@ -205,7 +231,7 @@ function buildManageView(w) {
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
         new ButtonBuilder().setCustomId(`socialmanage_remove_${w.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`socialmanage_back_${w.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`socialmanage_back_${w.id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
     );
     return { embeds: [embed], components: [row1, ...row1b, row2] };
 }
@@ -263,8 +289,8 @@ const HELP_CATEGORIES = [
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Linking`)
             .setDescription("Instagram and TikTok need the account owner's consent.")
             .addFields(
-                { name: '/social link', value: 'Link an Instagram or TikTok account. The owner opens the link and approves.' },
-                { name: '/social links', value: 'See linked accounts. Pick one to unlink it.' },
+                { name: '/social link', value: 'Link an Instagram or TikTok account once. The owner approves. It then works in any server.' },
+                { name: '/social links', value: 'See linked accounts used here or linked by you. Whoever linked one can unlink it.' },
             ),
     },
     {
@@ -278,9 +304,9 @@ const HELP_CATEGORIES = [
         id: 'info', emoji: 'ℹ️', label: 'Info',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle(`🔔 ${BUILD_NAME} — Info`)
             .addFields(
-                { name: 'Platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') + '\n⚠️ = unavailable right now' },
+                { name: 'Platforms', value: Object.values(PLATFORMS).filter(p => !p.restricted).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') + '\n⚠️ = unavailable right now' },
                 { name: 'Placeholders', value: '`{author}` `{handle}` `{platform}` `{title}` `{url}`, plus `{is/was}` for Live.' },
-                { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. YouTube and Twitter: every 2 minutes (YouTube also pushes new uploads and streams instantly).' },
+                { name: 'Check speed', value: 'Twitch, Kick, TikTok, Instagram: about every 20 seconds. Bluesky: every 2 minutes. Twitter and RSS: adapts to how often the account posts (Twitter 2 to 30 min, RSS 2 to 60 min). YouTube: new uploads and streams arrive instantly by push, with a backup check every 20 minutes (every 2 minutes if push is not active for that channel).' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
                 { name: 'Links', value: `[GitHub](https://github.com/sleepyturtler/Notifyer) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),
@@ -310,7 +336,7 @@ function buildSetupView(tabId, watchCount = 0) {
         case 'welcome':
             embed.setDescription(
                 'Notifyer posts in a channel when an account you track uploads, posts or goes live.\n\n' +
-                `**Platforms:** ${Object.values(PLATFORMS).map(p => p.label + (p.unavailable ? ' (unavailable)' : '')).join(', ')}\n\n` +
+                `**Platforms:** ${Object.values(PLATFORMS).filter(p => !p.restricted).map(p => p.label + (p.unavailable ? ' (unavailable)' : '')).join(', ')}\n\n` +
                 'Click through the tabs to see how it works, then add your first account.');
             break;
         case 'track':
@@ -320,7 +346,7 @@ function buildSetupView(tabId, watchCount = 0) {
                 '`/social list` See every tracked account. Pick one to manage it.\n' +
                 '`/social preview` See a sample notification for any account.\n' +
                 '`/social check` Check everything now instead of waiting.' +
-                (oauthAvailable ? '\n`/social link` Link an Instagram or TikTok account first. The owner approves it.' : ''));
+                (oauthAvailable ? '\n`/social link` Link an Instagram or TikTok account first. The owner approves it, once, for every server.' : ''));
             break;
         case 'customize':
             embed.setDescription(
@@ -349,7 +375,7 @@ function buildSetupView(tabId, watchCount = 0) {
         new ButtonBuilder().setCustomId(`setup_tab_${t.id}`).setLabel(t.label).setStyle(t.id === tab.id ? ButtonStyle.Primary : ButtonStyle.Secondary)));
     const actions = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('setup_start').setLabel(n ? 'Add another account' : 'Add my first account').setStyle(ButtonStyle.Success),
-        ...(tab.id === 'customize' ? [new ButtonBuilder().setCustomId('setup_sample').setLabel('Show me a sample').setStyle(ButtonStyle.Secondary)] : []),
+        new ButtonBuilder().setCustomId('setup_sample').setLabel('Preview').setStyle(ButtonStyle.Secondary),
     );
     return { embeds: [embed], components: [tabs, actions] };
 }
@@ -367,4 +393,4 @@ function buildHelpView(activeId) {
     return { embeds: [active.build()], components: rows };
 }
 
-module.exports = { buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed };
+module.exports = { WATCHES_PER_PAGE, buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed };

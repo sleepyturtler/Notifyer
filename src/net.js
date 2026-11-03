@@ -20,7 +20,7 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 // (default 0: the 3xx is returned as-is); relative Location headers are resolved.
 // timeoutMs is an IDLE timeout: it restarts whenever data arrives, so a slow mirror that keeps sending is fine,
 // while a connection that goes silent is cut off. maxMs is the absolute cap for a response that trickles forever.
-function request(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs = 15000, maxMs = Math.max(60000, timeoutMs * 4), redirects = 0 } = {}) {
+function request(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs = 15000, maxMs = Math.max(60000, timeoutMs * 4), redirects = 0, lookup = null, maxBytes = MAX_BODY_BYTES } = {}) {
     return new Promise((resolve, reject) => {
         let u;
         try { u = new URL(urlStr); } catch (e) { return reject(e); }
@@ -35,18 +35,18 @@ function request(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs 
 
         const hdrs = { ...headers };
         if (body !== null) hdrs['Content-Length'] = Buffer.byteLength(body);
-        req = (u.protocol === 'https:' ? https : http).request(u, { method, headers: hdrs }, res => {
+        req = (u.protocol === 'https:' ? https : http).request(u, { method, headers: hdrs, ...(lookup ? { lookup } : {}) }, res => {
             if (redirects > 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 res.resume();
                 let next;
                 try { next = new URL(res.headers.location, u).toString(); } catch (e) { return done(reject, e); }
-                return done(resolve, request(next, { method, headers, body, timeoutMs, maxMs, redirects: redirects - 1 }));
+                return done(resolve, request(next, { method, headers, body, timeoutMs, maxMs, redirects: redirects - 1, lookup, maxBytes }));
             }
             const chunks = []; let size = 0;
             res.on('data', c => {
                 arm();
                 size += c.length;
-                if (size > MAX_BODY_BYTES) { req.destroy(); return done(reject, new Error('Response too large')); }
+                if (size > maxBytes) { req.destroy(); return done(reject, new Error('Response too large')); }
                 chunks.push(c);
             });
             res.on('end', () => done(resolve, { status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }));

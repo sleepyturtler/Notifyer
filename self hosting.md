@@ -21,20 +21,16 @@ You need your own Discord bot application, your own Render (or other host) servi
    ```
    npm install
    ```
-2. Either run the interactive setup script (recommended for a first-time boot):
-   ```
-   node setup.js
-   ```
-   which walks through the required variables, lets you opt into each platform integration one at a time, and writes a `.env` file for you — or copy `.env.example` to `.env` yourself (or set the same variables in your host's dashboard) and fill in at least `DISCORD_TOKEN` and `DATABASE_URL`; everything else is optional and enables specific platforms or features.
+2. Set your environment variables. Copy `.env.example` to `.env` and fill in at least `DISCORD_TOKEN` and `DATABASE_URL` (everything else is optional and enables specific platforms or features), or set the same variables in your host's dashboard. The bot reads real environment variables and does not load `.env` by itself: locally run it with `node --env-file=.env index.js` (Node 20.6 or newer), and on a host like Render use its environment settings instead.
 3. Run it:
    ```
-   node index.js
+   node --env-file=.env index.js
    ```
-   (`index.js` is the only entry point; it loads the rest from `src/`.)
+   (`index.js` is the only entry point; it loads the rest from `src/`. Drop `--env-file=.env` if your variables are already set in the environment.)
 4. On boot, the bot logs a startup config summary showing which platform integrations are active versus disabled (and why, if a credential's missing) — check this first if something isn't working, before assuming it's a bug.
 5. On first boot the bot also creates its own database tables automatically (`CREATE TABLE IF NOT EXISTS`) — there is no separate migration step to run.
 6. Slash commands are registered globally on every boot, which can take up to an hour to show up in Discord the very first time. Per-server registration is instant on subsequent boots since Discord caches the command list after that.
-7. Invite the bot to a server with the `bot` and `applications.commands` scopes and the permissions it needs (Send Messages, Embed Links, Use External Emojis if you've set custom platform emojis, Manage Roles only if you want it managing an access role for you). `setup.js` prints a ready-made invite link for you if it can decode your bot's client ID from the token.
+7. Invite the bot to a server with the `bot` and `applications.commands` scopes and the permissions it needs (Send Messages, Embed Links, Use External Emojis if you've set custom platform emojis, Manage Roles only if you want it managing an access role for you). The bot's own `/invite` command gives the same link once it is in a server; for the first server, build it from your application's client ID: `https://discord.com/api/oauth2/authorize?client_id=<CLIENT_ID>&permissions=2147485696&scope=bot%20applications.commands`.
 
 ## Environment variables
 
@@ -65,7 +61,10 @@ You need your own Discord bot application, your own Render (or other host) servi
 | `NITTER_INSTANCES` | Comma-separated list of Nitter mirror base URLs for Twitter/X tracking, since there's no free official API. Has a built-in default list if unset, but that list can go stale as mirrors disappear. If every configured mirror ever fails at once, the bot DMs `BOT_OWNER_ID` about it (rate-limited to once per 6 hours) rather than only failing silently in the logs. |
 | `DATABASE_SSL_VERIFY` | Set to `true` to make the bot verify the Postgres server's TLS certificate. Off by default because many managed databases use certificates a default CA bundle can't validate. |
 | `WEBSUB_SECRET` | Optional. Secret used to sign and verify YouTube push notifications. If unset, a value derived from `DISCORD_TOKEN` is used, which works fine; set this only if you want a dedicated secret. |
-| `ALLOW_BULK_ORPHAN_PURGE` | Optional safety override. When the bot starts, it deletes stored data for servers it is no longer in. If that would remove an unusually large share of your servers (more than 25%, and more than 5), it refuses and logs a warning, because that usually means a Discord or connection problem, not real removals. Set this to `true` for one restart if those servers really are gone. |
+| `ALLOW_BULK_ORPHAN_PURGE` | Optional safety override. When the bot starts, it queues stored data for servers it is no longer in (deleted after the grace period below). If that would queue an unusually large share of your servers (more than 25%, and more than 5), it refuses and logs a warning, because that usually means a Discord or connection problem, not real removals. Set this to `true` for one restart if those servers really are gone. |
+| `GUILD_PURGE_GRACE_MS` | How long a removed server's data is kept before it is deleted (milliseconds, default 7 days). Adding the bot back before then cancels the deletion. |
+| `SOCIAL_CHECK_COOLDOWN_MS` | How often a server can run `/social check` (default 60 seconds). |
+| `HEALTH_UNREADY_MS` | How long the Discord connection may be down before `/health` returns 503 so the host can restart the bot (default 5 minutes). |
 
 ### Deployment/ops (all optional; the bot works without any of these)
 

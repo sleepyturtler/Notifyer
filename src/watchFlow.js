@@ -3,21 +3,21 @@
 
 const { EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
-const { E, normalizeHandle } = require('./helpers.js');
+const { E, normalizeHandle, watchName } = require('./helpers.js');
 const { addWatch, getSocialLinkByUsername, getWatches, setWatchSocialLink, updateLastPost } = require('./db.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
-const { fetchLatestTwitchAll } = require('./platforms/twitch.js');
-const { fetchLatestKickAll } = require('./platforms/kick.js');
-const { fetchLatestPost } = require('./platforms/index.js');
+const { BULK_FETCHERS } = require('./platforms/index.js');
+const { fetchLatestTwitter } = require('./platforms/twitter.js');
 const { fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
+const { checkLinkAccess, requestLinkApproval } = require('./linkRequests.js');
 
 // ── Shared watch-creation flow ──────────────────────────────────────────────
 // Used by both /social add and the /setup wizard so there's exactly one place
 // that validates a platform+handle+channel and creates the watch — no risk of
 // the two entry points drifting apart. Returns { ok: true, watch, post } or
 // { ok: false, message } (message is already a user-facing ❌ reply string).
-async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByTag, bypassUnavailable = false) {
+async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByTag, bypassUnavailable = false, userId = null) {
     if (!PLATFORMS[platform]) {
         return { ok: false, message: `❌ Unrecognized platform \`${platform}\`. Please pick one of the options Discord suggests as you type.` };
     }
@@ -34,6 +34,7 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
     if (watches.length >= 50) return { ok: false, message: '❌ This server has reached the maximum of 50 tracked accounts.' };
 
     let post = null;
+    let displayName = null; // RSS: the feed's own title, used instead of the URL
     let baselineSeenIds = [];
     let fetchedOk = false; // a fetch really succeeded (even if it found nothing yet)
     let socialLinkId = null;
@@ -41,9 +42,17 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
         // Instagram/TikTok can only be watched for accounts that have gone through
         // /social link — there's no way to poll an arbitrary public account via
         // their official APIs without that account's consent.
-        const link = await getSocialLinkByUsername(guildId, platform, handle);
+        const link = await getSocialLinkByUsername(platform, handle);
+        if (link && link.needs_relink_at) {
+            return { ok: false, message: `❌ The linked **${handle}** account needs to be re-linked first: its owner has to run \`/social link\` again.` };
+        }
         if (!link) {
             return { ok: false, message: `❌ **${handle}** hasn't been linked yet. That account needs to run \`/social link\` and authorize with ${PLATFORMS[platform].label} first — this bot can't watch ${PLATFORMS[platform].label} accounts that haven't consented.\nUse \`/social links\` to see what's already linked in this server.` };
+        }
+        // Someone else's linked account can only be added by them, the bot owner, or a server that already uses it or
+        // was approved; anyone else triggers an approval request to the person who linked it.
+        if (!(await checkLinkAccess(link, guildId, userId)).allowed) {
+            return { ok: false, message: (await requestLinkApproval(link, guildId, userId, addedByTag)).message };
         }
         socialLinkId = link.id;
         try {
@@ -59,21 +68,18 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
         }
     } else {
         try {
-            if (platform === 'twitch') {
-                const posts = await fetchLatestTwitchAll(handle);
+            if (BULK_FETCHERS[platform]) {
+                const posts = await BULK_FETCHERS[platform](handle);
                 post = posts[0] || null;
-                baselineSeenIds = posts.map(p => p.id);
-            } else if (platform === 'kick') {
-                const posts = await fetchLatestKickAll(handle);
-                post = posts[0] || null;
+                if (platform === 'rss') displayName = posts[0]?.author || null;
                 baselineSeenIds = posts.map(p => p.id);
             } else if (platform === 'youtube') {
-                // fetchLatestPost() has no YouTube case — it's handled separately via
+                // YouTube is handled separately via
                 // the Data API + playlist-ID cache (fetchLatestYouTubeEntries), which
                 // needs a real watch.id to cache the resolved channel/playlist IDs
                 // against. Deferred until after addWatch() below, once we have one.
             } else {
-                post = await fetchLatestPost(platform, handle);
+                post = await fetchLatestTwitter(handle);
                 baselineSeenIds = post?.id ? [post.id] : [];
             }
             fetchedOk = platform !== 'youtube'; // YouTube's fetch happens after addWatch(), below
@@ -87,7 +93,8 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
         }
     }
 
-    const watch = await addWatch({ guildId, platform, handle, channelId, addedBy: addedByTag });
+    const watch = await addWatch({ guildId, platform, handle, channelId, addedBy: addedByTag, displayName });
+    if (!watch) return { ok: false, message: '❌ That account is already being tracked in this channel.' }; // lost a race with another add
     if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
 
     if (platform === 'youtube') {
@@ -122,7 +129,7 @@ function buildAddWatchSuccessResponse(watch, post, handle, channel) {
     const types = PLATFORM_NOTIFY_TYPES[watch.platform];
     const successEmbed = E('#00ff00', 'Now Tracking').addFields(
         { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
-        { name: 'Account', value: handle, inline: true },
+        { name: 'Account', value: watchName(watch) !== watch.handle ? watchName(watch) : handle, inline: true },
         { name: 'Channel', value: `${channel}`, inline: true },
         post?.title
             ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
@@ -155,7 +162,7 @@ function buildAddWatchSuccessResponse(watch, post, handle, channel) {
             .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
     );
     const skipRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel(`${types.some(t => t.defaultOff) ? 'Default types' : 'All types'} (skip)`).setStyle(ButtonStyle.Secondary)
     );
     return { embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] };
 }

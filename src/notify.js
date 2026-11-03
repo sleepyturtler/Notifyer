@@ -3,9 +3,9 @@
 
 const { URL } = require('url');
 const { MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
+const { PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { reportDeliveryFailure } = require('./announcements.js');
-const { profileUrl } = require('./helpers.js');
+const { profileUrl, watchName } = require('./helpers.js');
 const { fetchJson } = require('./net.js');
 const { client } = require('./client.js');
 const { setWatchLiveMessage } = require('./db.js');
@@ -20,7 +20,7 @@ const LIVE_DEFAULT_TEMPLATE = '🔴 **{author}** {is/was} live on {platform}!\n{
 // Shown wherever someone's about to set a custom message, so new users don't have to
 // dig through /help to discover these — Discord modals can't show static text inside
 // the form itself, so this goes on the embed screen right before the modal opens.
-const PLACEHOLDER_HELP = '`{author}` `{handle}` `{platform}` `{title}` `{url}` — for Live, also `{is/was}` (is/was live)';
+const PLACEHOLDER_HELP = '`{author}` `{handle}` `{platform}` `{title}` `{url}` — for Live, also `{is/was}` (is/was live) and `{category}`';
 
 // Resolves the message template for a watch + post, preferring a per-post-type
 // override (w.message_templates[post.postType]) over the watch's single
@@ -42,24 +42,33 @@ function renderTemplate(template, post, platform, handle, ended = false) {
         .replace(/\{handle\}/g, () => handle)
         .replace(/\{platform\}/g, () => PLATFORMS[platform].label)
         .replace(/\{title\}/g, () => post.title || '')
-        .replace(/\{url\}/g, () => post.url || '');
+        .replace(/\{url\}/g, () => post.url || '')
+        .replace(/\{category\}/g, () => post.category || '');
 }
 
 function shouldNotify(w, post) {
-    const types = Array.isArray(w.notify_types) && w.notify_types.length ? w.notify_types : null;
-    if (!types) return true; // no filter = all types
-    return post.postType ? types.includes(post.postType) : true;
+    if (!post.postType) return true;
+    // No saved selection = every type except those a platform marks defaultOff (Bluesky replies/reposts).
+    return activeTypeIds(w).includes(post.postType);
 }
 
 // ── Post-type → button label map (used instead of a generic "View post") ───
 const POST_TYPE_BUTTON_LABEL = {
     youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
     twitter:   { posts: 'View Tweet' },
+    rss:       { posts: 'Read More' },
+    bluesky:   { posts: 'View Post', replies: 'View Reply', reposts: 'View Repost' },
     twitch:    { live: 'Join Stream', vods: 'Watch VOD' },
-    kick:      { live: 'Join Stream' },
+    kick:      { live: 'Join Stream', vods: 'Watch VOD' },
     instagram: { posts: 'View Post', reels: 'Watch Reel', stories: 'View Story' },
     tiktok:    { videos: 'Watch TikTok' },
 };
+
+// After a stream ends its button stops saying "Join Stream": it becomes the platform's VOD / video label.
+function endedButtonLabel(platform) {
+    const l = POST_TYPE_BUTTON_LABEL[platform];
+    return l?.vods || l?.videos || null;
+}
 
 function buttonLabelFor(platform, post) {
     if (post.isLive) return POST_TYPE_BUTTON_LABEL[platform]?.live || 'Join Stream';
@@ -74,12 +83,36 @@ function buildSamplePost(w, postType) {
         id: 'preview',
         url: profileUrl(w.platform, w.handle) || 'https://example.com',
         title: 'Sample post title for preview',
-        author: w.handle,
+        author: watchName(w),
         thumbnail: null,
         timestamp: new Date().toISOString(),
         postType,
         isLive: postType === 'live',
+        category: postType === 'live' && (w.platform === 'twitch' || w.platform === 'kick') ? 'Just Chatting' : null,
     };
+}
+
+// The /setup preview: a made-up YouTube channel and video shown as a real embed. It is built from constants only, so
+// nothing is fetched (no YouTube call, no database) and nothing links to a real channel or video. A genuine YouTube
+// notification is just a link that Discord unfurls itself, which can't be shown in a preview, so this is an embed.
+function buildOnboardingPreview() {
+    const p = PLATFORMS.youtube;
+    const fakeUrl = 'https://www.youtube.com/';
+    const embed = new EmbedBuilder()
+        .setColor(p.color)
+        .setAuthor({ name: `Sample Creator • ${p.label}` })
+        .setTitle('I built my own Discord bot (full tutorial)')
+        .setURL(fakeUrl)
+        .setDescription('This is a made-up channel and video. A real notification looks like this, and arrives in the channel you pick as soon as the creator posts.')
+        .addFields(
+            { name: 'Channel', value: '@samplecreator', inline: true },
+            { name: 'Type', value: 'New video', inline: true },
+        )
+        .setFooter({ text: 'Preview only. Nothing was fetched or posted.' })
+        .setTimestamp(new Date());
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel('Watch Video').setStyle(ButtonStyle.Link).setURL(fakeUrl));
+    return { content: '**Preview** of a notification in your channel:', embeds: [embed], components: [row] };
 }
 
 // Platforms where Discord will render a native, playable video preview if the
@@ -141,12 +174,29 @@ async function ensureVideoEmbedFallback(channel, messageId, post) {
             .setAuthor({ name: `${oembed?.author || post.author || ''} • TikTok`.replace(/^ • /, '') })
             .setURL(post.url)
             .setDescription(oembed?.title || post.title || null)
-            .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
+            .setTimestamp(safeDate(post.timestamp));
         if (oembed?.thumbnail) fallback.setImage(oembed.thumbnail);
         await msg.edit({ embeds: [fallback] }).catch(e => console.error('embed fallback edit:', e.message));
     } catch (e) {
         console.error('ensureVideoEmbedFallback:', e.message);
     }
+}
+
+// Discord refuses a message over 2000 characters, and the post is already marked seen by then, so an over-long custom
+// template would silently lose the notification. Keep the start (role ping, text) and, for native-video links, the URL.
+const MAX_CONTENT = 2000;
+function clampContent(content, url = null) {
+    if (content.length <= MAX_CONTENT) return content;
+    if (url && content.endsWith(url)) return content.slice(0, MAX_CONTENT - url.length - 1) + '…' + url;
+    const cut = content.slice(0, MAX_CONTENT - 1) + '…';
+    return url && !cut.includes(url) ? content.slice(0, MAX_CONTENT - url.length - 2) + '…\n' + url : cut;
+}
+
+// A feed or poster can send any string as a date (Bluesky's is set by the poster's client), and an unparseable one makes
+// the embed builder throw, which would lose the notification. Fall back to "now".
+function safeDate(v) {
+    const d = v ? new Date(v) : null;
+    return d && Number.isFinite(d.getTime()) ? d : new Date();
 }
 
 // Builds the exact {content, embeds, components} a notification would use, without
@@ -155,15 +205,17 @@ async function ensureVideoEmbedFallback(channel, messageId, post) {
 function buildNotificationPayload(w, post) {
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
-    let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
+    let content = renderTemplate(resolveTemplate(w, post), post, w.platform, watchName(w));
     // For YouTube/TikTok, make sure a URL that Discord will actually unfurl into a
     // playable video is present on its own line (not just inside a custom embed).
     const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
+    let embedUrl = null;
     if (wantsNativeVideo) {
-        const embedUrl = embeddableUrl(w.platform, post.url);
+        embedUrl = embeddableUrl(w.platform, post.url);
         content = content.includes(post.url) ? content.split(post.url).join(embedUrl) : `${content}\n${embedUrl}`;
     }
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
+    content = clampContent(content, embedUrl);
     const linkRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton)
     );
@@ -173,12 +225,13 @@ function buildNotificationPayload(w, post) {
         return { content, embeds: [], components: [linkRow], wantsNativeVideo: true };
     }
     const embed = new EmbedBuilder()
-        .setColor(post.isLive ? '#FF0000' : p.color)
-        .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
+        .setColor(p.color) // live streams use the platform's own color too (Twitch purple, Kick green)
+        .setAuthor({ name: `${post.author || watchName(w)} • ${p.label}${typeLabel}`.slice(0, 256) })
         .setURL(post.url)
-        .setDescription(post.title || null)
-        .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
+        .setDescription([post.title, post.summary].filter(Boolean).join('\n\n').slice(0, 4000) || null)
+        .setTimestamp(safeDate(post.timestamp));
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
+    if (post.isLive && post.category) embed.addFields({ name: 'Category', value: String(post.category).slice(0, 1024), inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
     return { content, embeds: [embed], components: [linkRow], wantsNativeVideo: false };
 }
@@ -226,7 +279,16 @@ async function markStreamOffline(w) {
                 .setAuthor({ name: `${w.handle} • ${p.label}` })
                 .setDescription('Stream ended.')
                 .setTimestamp();
-            await msg.edit({ content, embeds: [endedEmbed], components: msg.components })
+            // Same link, relabelled (the channel page is where past broadcasts live). Left as it was if there is no link button.
+            let components = msg.components;
+            const label = endedButtonLabel(w.platform);
+            const old = label ? (msg.components || []).flatMap(r => r.components || []).find(c => c.url) : null;
+            if (old) {
+                const btn = new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(old.url);
+                if (old.emoji) btn.setEmoji(old.emoji);
+                components = [new ActionRowBuilder().addComponents(btn)];
+            }
+            await msg.edit({ content, embeds: [endedEmbed], components })
                 .catch(e => console.error(`edit live-ended message (${w.id}):`, e.message));
         }
     } catch (e) {
@@ -236,4 +298,4 @@ async function markStreamOffline(w) {
     }
 }
 
-module.exports = { DEFAULT_TEMPLATE, PLACEHOLDER_HELP, buildNotificationPayload, buildSamplePost, buttonLabelFor, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };
+module.exports = { PLACEHOLDER_HELP, clampContent, safeDate, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };

@@ -220,4 +220,24 @@ async function notifyGuildAdmins(guild, embed) {
     return sendDeliveryReport(guild, findAnnouncementChannel(guild), embed, [], []);
 }
 
-module.exports = { announceSupportServer, notifyGuildAdmins, reportDeliveryFailure, reportLinkProblem };
+// A watch's account doesn't exist on the platform (typo, renamed, deleted, banned): tell whoever added the watch to redo it.
+// The poller calls this only on the first "not found" (not on every 30-minute retry). If their DMs are closed (or nobody
+// is recorded), the server's admin channel gets it instead. Never throws.
+async function reportAccountNotFound(w) {
+    try {
+        const platform = PLATFORMS[w.platform]?.label || w.platform;
+        const guild = client.guilds?.cache?.get(w.guild_id);
+        const embed = new EmbedBuilder().setColor('#ED4245')
+            .setTitle('❌ A watched account was not found')
+            .setDescription(`${platform} says the account **${plainText(w.handle)}** doesn't exist${guild ? ` (watch in **${plainText(guild.name)}**, <#${w.channel_id}>)` : ''}. It may have been renamed, deleted or banned, or the name was mistyped.
+
+No notifications can be sent for it. To fix it, remove the watch (\`/social list\` → Remove) and add it again with \`/social add\` using the right name. Until then it is re-checked every 30 minutes.`);
+        const user = w.added_by ? await client.users.fetch(w.added_by).catch(() => null) : null;
+        const sent = user ? await user.send({ embeds: [embed], allowedMentions: { parse: [] } }).then(() => true).catch(() => false) : false;
+        if (!sent && guild) await notifyGuildAdmins(guild, embed);
+    } catch (e) {
+        console.error(`reportAccountNotFound (watch ${w?.id}):`, e.message);
+    }
+}
+
+module.exports = { announceSupportServer, notifyGuildAdmins, reportAccountNotFound, reportDeliveryFailure, reportLinkProblem };

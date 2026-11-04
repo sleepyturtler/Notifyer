@@ -10,7 +10,7 @@ const { sendOrExtendBatch } = require('./batch.js');
 const { computeInterval, hasAdaptivePolling, nextBackoff, pollDue } = require('./rssPoll.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { BULK_FETCHERS } = require('./platforms/index.js');
-const { reportLinkProblem } = require('./announcements.js');
+const { reportAccountNotFound, reportLinkProblem } = require('./announcements.js');
 
 // ── Polling loop ───────────────────────────────────────────────────────────
 const PLATFORM_MIN_INTERVAL_MS = {};
@@ -91,6 +91,8 @@ async function reportYouTubeQuota(resumeAt) {
     }
 }
 
+const NOT_FOUND_RETRY_MS = 30 * 60 * 1000;
+
 async function pollAll(platforms = null, onlyGuildId = null) {
     // /social check is a per-guild command, but pollAll(null) with no scoping
     // processes every watch on every server the bot is in — including the full
@@ -144,6 +146,10 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                 }
                 if (w.last_error && w.poll_interval_ms && Date.now() - Number(w.last_checked) < Number(w.poll_interval_ms)) continue; // failing: backed off
             }
+            // A Twitch/Kick account that doesn't exist (typo, renamed, banned) can't start working by itself: retry it every
+            // 30 minutes instead of every cycle, which was an API call and a log line every 20 seconds. /social check still tries now.
+            if (!onlyGuildId && (w.platform === 'twitch' || w.platform === 'kick') && /not found/i.test(w.last_error || '')
+                && w.last_checked && Date.now() - Number(w.last_checked) < NOT_FOUND_RETRY_MS) continue;
             if (watchesInFlight.has(w.id)) continue; // another pass is already handling this watch
             watchesInFlight.add(w.id);
             try {
@@ -326,6 +332,8 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                 if (w.platform === 'rss' || (w.platform === 'youtube' && !e.youtubeQuota) || (w.platform === 'twitter' && !/All Nitter instances failed/.test(e.message))) {
                     await setWatchPollInterval(w.id, nextBackoff(w.platform, w.poll_interval_ms)).catch(() => {});
                 }
+                // First time this account comes back "not found" (a stored not-found error means it was already reported).
+                if ((w.platform === 'twitch' || w.platform === 'kick') && /not found/i.test(e.message) && !/not found/i.test(w.last_error || '')) reportAccountNotFound(w);
                 await touchLastChecked(w.id, e.message).catch(() => {});
             } finally {
                 watchesInFlight.delete(w.id);

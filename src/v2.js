@@ -35,6 +35,7 @@ const view = (color, blocks, rows = []) => ({ components: [box(color, blocks), .
 
 // V2 messages carry no content or embeds, so these two keys are always dropped from a converted payload.
 function toV2Payload(payload, { alreadyV2 = false } = {}) {
+    if (typeof payload === 'string' && alreadyV2) payload = { content: payload }; // editReply('text') on a V2 message
     if (!payload || typeof payload !== 'object') return payload;
     const parts = Array.isArray(payload.components) ? payload.components : [];
     const hasV2 = parts.some(isV2Part);
@@ -48,6 +49,14 @@ function wrapInteraction(interaction) {
     if (!interaction || interaction.__v2wrapped) return interaction;
     interaction.__v2wrapped = true;
     const isV2 = () => Boolean(interaction.__v2 || interaction.message?.flags?.has?.(MessageFlags.IsComponentsV2));
+    // A deferred reply that will turn out to be V2 has to be deferred with the V2 flag.
+    if (typeof interaction.deferReply === 'function') {
+        const origDefer = interaction.deferReply.bind(interaction);
+        interaction.deferReply = (opts = {}, ...rest) => {
+            if ([].concat(opts?.flags || []).includes(MessageFlags.IsComponentsV2)) interaction.__v2 = true;
+            return origDefer(opts, ...rest);
+        };
+    }
     for (const m of ['reply', 'update', 'editReply', 'followUp']) {
         const orig = typeof interaction[m] === 'function' ? interaction[m].bind(interaction) : null;
         if (!orig) continue;

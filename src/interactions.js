@@ -130,7 +130,7 @@ client.on('interactionCreate', async interaction => {
                 const bypassUnavailable = Boolean(PLATFORMS[platform]?.ownerOnly && isOwner(interaction.user.id));
                 if (PLATFORMS[platform] && !canUsePlatform(platform, interaction.user.id)) return reply('❌ That platform is not available yet.');
 
-                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+                await interaction.deferReply({ flags: [MessageFlags.Ephemeral, MessageFlags.IsComponentsV2] }); // the result is a V2 screen
 
                 const result = await createWatchFlow(guildId, platform, rawHandle, channel.id, interaction.user.tag, bypassUnavailable, interaction.user.id);
                 if (!result.ok) return interaction.editReply(result.message);
@@ -243,7 +243,7 @@ client.on('interactionCreate', async interaction => {
         }
         const menu = new StringSelectMenuBuilder().setCustomId(`sociallinks_addpick_${guildId}`).setPlaceholder('Which account do you want to link?')
             .addOptions(options.map(k => ({ label: PLATFORMS[k].label, value: k, emoji: PLATFORMS[k].emojiButton })));
-        return reply({ content: 'Which account do you want to link?', components: [new ActionRowBuilder().addComponents(menu)], flags: [MessageFlags.Ephemeral] });
+        return reply({ ...view(RED, ['## Link an account', 'Which account do you want to link?'], [new ActionRowBuilder().addComponents(menu)]), flags: [MessageFlags.Ephemeral] });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallinks_addpick_')) {
@@ -518,7 +518,7 @@ client.on('interactionCreate', async interaction => {
         const row = new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId('setup_platform_pick').setPlaceholder('Choose a platform…').addOptions(options)
         );
-        return interaction.update({ content: 'Which platform is the account on?', embeds: [], components: [row] });
+        return interaction.update(view(RED, ['## Notifyer setup - Add an account', 'Which platform is the account on?'], [row]));
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'setup_platform_pick') {
@@ -546,7 +546,7 @@ client.on('interactionCreate', async interaction => {
         const row = new ActionRowBuilder().addComponents(
             new ChannelSelectMenuBuilder().setCustomId('setup_channel_pick').setPlaceholder('Choose a channel for notifications…').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
         );
-        return interaction.reply({ content: `Got it — **${rawHandle}**. Which channel should notifications post to?`, components: [row], flags: [MessageFlags.Ephemeral] });
+        return interaction.reply({ ...view(RED, ['## Notifyer setup - Channel', `Got it — **${rawHandle}**. Which channel should notifications post to?`], [row]), flags: [MessageFlags.Ephemeral] });
     }
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'setup_channel_pick') {
@@ -560,7 +560,7 @@ client.on('interactionCreate', async interaction => {
         pendingSetupPicks.delete(key);
         const channelId = interaction.values[0];
         const channel = interaction.guild.channels.cache.get(channelId);
-        await interaction.update({ content: 'Setting that up…', components: [] });
+        await interaction.update(view(RED, ['## Notifyer setup - Adding', 'Setting that up\u2026']));
         if (!canUsePlatform(pending.platform, interaction.user.id)) return interaction.editReply({ content: '❌ That platform is not available yet.' });
         const bypassUnavailable = Boolean(PLATFORMS[pending.platform]?.ownerOnly && isOwner(interaction.user.id));
         const result = await createWatchFlow(guildId, pending.platform, pending.rawHandle, channelId, interaction.user.tag, bypassUnavailable, interaction.user.id);

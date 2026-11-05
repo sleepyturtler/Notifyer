@@ -231,9 +231,11 @@ function buildNotificationPayload(w, post) {
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
         // thumbnail, and channel/author — a custom embed on top of that is redundant.
-        return { content, embeds: [], components: [linkRow], wantsNativeVideo: true };
+        // Embed turned off in the customizer: the same message, but the link is not unfurled (SuppressEmbeds, see sendNotification).
+        if (es.embed === false) return { content, embeds: [], components: [linkRow], wantsNativeVideo: false, suppressEmbeds: true, embedUrl };
+        return { content, embeds: [], components: [linkRow], wantsNativeVideo: true, embedUrl };
     }
-    if (es.embed === false) return { content, embeds: [], components: [linkRow], wantsNativeVideo: false };
+    if (es.embed === false) return { content, embeds: [], components: [linkRow], wantsNativeVideo: false, embedUrl: null };
     const embed = new EmbedBuilder()
         .setColor(HEX_RE.test(es.color || '') ? es.color : p.color) // live streams use the platform's own color too (Twitch purple, Kick green)
         .setAuthor({ name: `${post.author || watchName(w)} • ${p.label}${typeLabel}`.slice(0, 256) })
@@ -260,6 +262,7 @@ async function sendNotification(w, post) {
     const { guild, channel } = resolveWatchChannel(w);
     if (!channel) { reportDeliveryFailure(w, 'missing_channel'); return null; }
     const payload = buildNotificationPayload(w, post);
+    const noUnfurl = payload.suppressEmbeds ? { flags: [MessageFlags.SuppressEmbeds] } : {};
     if (payload.wantsNativeVideo) {
         const sent = await channel.send({ content: payload.content, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
         // Discord's crawler occasionally fails to unfurl TikTok links even via the mirror
@@ -267,7 +270,7 @@ async function sendNotification(w, post) {
         if (sent && w.platform === 'tiktok') ensureVideoEmbedFallback(channel, sent.id, post);
         return sent;
     }
-    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
+    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: pingRoles(w), ...noUnfurl }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
 }
 
 // Edits a previously-sent "went live" message to show the stream has ended, once a

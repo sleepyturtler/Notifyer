@@ -4,9 +4,9 @@
 //
 // The editor is a normal message (not Components V2): it has to hold a real embed to preview.
 
-const { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, ModalBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
-const { PLATFORM_NOTIFY_TYPES } = require('./config.js');
-const { canWatchBatch } = require('./helpers.js');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlags, ModalBuilder, RoleSelectMenuBuilder, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
+const { canWatchBatch, watchName } = require('./helpers.js');
 const { getWatch, saveWatchCustomization } = require('./db.js');
 const { buildNotificationPayload, buildSamplePost } = require('./notify.js');
 const { DEFAULT_BATCH_HEADER } = require('./batch.js');
@@ -46,12 +46,29 @@ const isDirty = d => snapshot(d) !== d.baseline;
 const draftWatch = d => ({ ...d.watch, embed_settings: cleanSettings(d.es), role_id: d.role_id, message_templates: d.templates, batch_header_template: d.header });
 const nativeVideo = w => w.platform === 'youtube' || w.platform === 'tiktok';
 
+// What Discord shows for a YouTube/TikTok link, drawn from the fake sample post.
+function fakeUnfurl(w, post) {
+    const p = PLATFORMS[w.platform];
+    const e = new EmbedBuilder().setColor(p.color).setAuthor({ name: String(post.author || watchName(w)).slice(0, 256) })
+        .setTitle(String(post.title).slice(0, 256)).setURL(post.url).setFooter({ text: p.label });
+    if (post.thumbnail) e.setImage(post.thumbnail);
+    return e;
+}
+
 function buildView(d, note = null) {
     const w = draftWatch(d);
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-    const payload = buildNotificationPayload(w, buildSamplePost(w, d.type, { withImage: true }));
+    const sample = buildSamplePost(w, d.type, { withImage: true }); // a made-up title and thumbnail
+    const payload = buildNotificationPayload(w, sample);
     const es = cleanSettings(d.es);
-    const off = nativeVideo(w);        // YouTube and TikTok use Discord's own video preview: no embed options
+    const off = nativeVideo(w);        // YouTube and TikTok: Discord draws the embed itself from the link, so only on/off applies
+    let { content, embeds } = payload;
+    if (off) {
+        // The real message is just the link. The preview draws what Discord shows for it from the fake title and thumbnail, and keeps the
+        // link itself from unfurling so there is only one embed. With the embed off, the real message is sent with its unfurl suppressed.
+        if (payload.embedUrl) content = content.split(payload.embedUrl).join(`<${payload.embedUrl}>`);
+        embeds = payload.suppressEmbeds ? [] : [fakeUnfurl(w, sample)];
+    }
     const embedOff = es.embed === false;
     const rows = [];
     if (types.length > 1) {
@@ -71,14 +88,14 @@ function buildView(d, note = null) {
     ));
     rows.push(new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`sc_text_${d.watchId}`).setLabel(es.text === 'message' ? 'Text - In message' : 'Text - In embed').setStyle(ButtonStyle.Primary).setDisabled(off),
-        new ButtonBuilder().setCustomId(`sc_embed_${d.watchId}`).setLabel('Embed').setStyle(embedOff ? ButtonStyle.Danger : ButtonStyle.Success).setDisabled(off),
+        new ButtonBuilder().setCustomId(`sc_embed_${d.watchId}`).setLabel('Embed').setStyle(embedOff ? ButtonStyle.Danger : ButtonStyle.Success),
     ));
     rows.push(new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`sc_reset_${d.watchId}`).setLabel('RESET').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(`sc_close_${d.watchId}`).setLabel('Discard').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(`sc_save_${d.watchId}`).setLabel('Save').setStyle(ButtonStyle.Success).setDisabled(!isDirty(d)),
     ));
-    return { content: [note, payload.content].filter(Boolean).join('\n').slice(0, 2000), embeds: payload.embeds, components: rows, allowedMentions: { parse: [] } };
+    return { content: [note, content].filter(Boolean).join('\n').slice(0, 2000), embeds, components: rows, allowedMentions: { parse: [] } };
 }
 
 // Starts (or resumes) the editor for one watch. `how` is 'reply' (a new private message) or 'update' (replace the picker).

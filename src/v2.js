@@ -10,13 +10,14 @@
 const {
     ContainerBuilder, MessageFlags, SeparatorBuilder, SeparatorSpacingSize, TextDisplayBuilder,
 } = require('discord.js');
+const { mentionCommands } = require('./commands.js');
 
 const RED = 0xE74C3C, ORANGE = 0xE67E22, GREEN = 0x2ECC71;
 const V2_TYPES = new Set([9, 10, 11, 12, 13, 14, 17]); // section, text, thumbnail, gallery, file, separator, container
 
 const toInt = hex => parseInt(String(hex).replace('#', ''), 16);
 const clip = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + '\u2026' : String(s));
-const text = s => new TextDisplayBuilder().setContent(clip(s, 3900));
+const text = s => new TextDisplayBuilder().setContent(clip(mentionCommands(String(s)), 3900));
 
 function typeOf(c) { try { return (typeof c?.toJSON === 'function' ? c.toJSON() : c)?.type; } catch { return undefined; } }
 const isV2Part = c => V2_TYPES.has(typeOf(c));
@@ -61,6 +62,9 @@ function wrapInteraction(interaction) {
         const orig = typeof interaction[m] === 'function' ? interaction[m].bind(interaction) : null;
         if (!orig) continue;
         interaction[m] = (payload, ...rest) => {
+            // commands named in a plain text reply become clickable (V2 text goes through text() above)
+            if (typeof payload === 'string') payload = mentionCommands(payload);
+            else if (payload && typeof payload.content === 'string') { const m = mentionCommands(payload.content); if (m !== payload.content) payload = { ...payload, content: m }; }
             const out = toV2Payload(payload, { alreadyV2: m === 'update' || m === 'editReply' ? isV2() : false });
             if (out !== payload && [].concat(out.flags || []).includes(MessageFlags.IsComponentsV2)) interaction.__v2 = true;
             return orig(out, ...rest);
@@ -70,3 +74,5 @@ function wrapInteraction(interaction) {
 }
 
 module.exports = { GREEN, ORANGE, RED, box, clip, toInt, toV2Payload, view, wrapInteraction };
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

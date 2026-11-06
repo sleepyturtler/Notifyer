@@ -79,14 +79,17 @@ function buttonLabelFor(platform, post) {
 // people can check every custom message variant, not just whichever type happens
 // to post next in reality.
 // Only the customizer shows an image, so that its image-size option has something to resize.
+// Shorts, Reels and TikToks are vertical videos, so their preview image is vertical (9:16) too.
 const PREVIEW_IMAGE_URL = 'https://placehold.co/640x360/png?text=Post+image';
+const PREVIEW_VERTICAL_IMAGE_URL = 'https://placehold.co/360x640/png?text=Post+image';
+const isShortForm = (platform, postType) => postType === 'shorts' || postType === 'reels' || postType === 'stories' || platform === 'tiktok';
 function buildSamplePost(w, postType, { withImage = false } = {}) {
     return {
         id: 'preview',
         url: profileUrl(w.platform, w.handle) || 'https://example.com',
         title: 'Sample post title for preview',
         author: watchName(w),
-        thumbnail: withImage ? PREVIEW_IMAGE_URL : null,
+        thumbnail: withImage ? (isShortForm(w.platform, postType) ? PREVIEW_VERTICAL_IMAGE_URL : PREVIEW_IMAGE_URL) : null,
         timestamp: new Date().toISOString(),
         postType,
         isLive: postType === 'live',
@@ -312,3 +315,5 @@ async function markStreamOffline(w) {
 }
 
 module.exports = { PLACEHOLDER_HELP, clampContent, safeDate, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

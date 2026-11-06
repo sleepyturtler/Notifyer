@@ -142,7 +142,7 @@ async function handleCustomizerInteraction(interaction, { guildId, hasPermission
         if (action === 'color') {
             await interaction.showModal(new ModalBuilder().setCustomId(`sc_colormodal_${watchId}`).setTitle('Accent color').addComponents(
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('v').setLabel('Hex color, like #ff8800 (blank = platform color)').setStyle(TextInputStyle.Short)
+                    new TextInputBuilder().setCustomId('v').setLabel('Hex color, like #ff8800 (blank = default)').setStyle(TextInputStyle.Short)
                         .setRequired(false).setMaxLength(7).setValue(d.es.color || '').setPlaceholder('#ff8800')
                 )
             ));
@@ -195,3 +195,5 @@ async function handleCustomizerInteraction(interaction, { guildId, hasPermission
 }
 
 module.exports = { handleCustomizerInteraction, openCustomizer, buildView, cleanSettings, drafts, newDraft };
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

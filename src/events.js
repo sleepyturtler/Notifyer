@@ -14,6 +14,7 @@ const path = require('path');
 // opted in by having that file in src/. Checked once here so a missing file is a
 // deliberate, expected release-build state, not a silently-swallowed error.
 const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
+const { setCommandIds } = require('./commands.js');
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
 // Events.ClientReady is 'ready' on older discord.js 14.x and 'clientReady' on newer ones; using the
@@ -44,7 +45,10 @@ client.once(Events.ClientReady, async () => {
     // Adds /social debug, /social oauthdebug, and /killbot only on builds that have
     // debugTools.js — mutates socialCommand in place and pushes killbot onto commands.
     if (debugTools) debugTools.extendCommands(socialCommand, commands);
-    await client.application.commands.set(commands).catch(e => console.error('command registration:', e));
+    const registered = await client.application.commands.set(commands).catch(e => { console.error('command registration:', e); return null; });
+    // Commands in the bot's own messages become clickable once their ids are known (commands.js). If registration just
+    // failed, the already-registered ones are still usable, so ask Discord for those instead.
+    setCommandIds(registered || await client.application.commands.fetch().catch(() => null));
 
     // Drop data for servers the bot is no longer in (left while offline, or from before this existed)
     // before polling starts, so they aren't polled for nothing. Guarded; see guildCleanup.js.
@@ -97,3 +101,5 @@ client.on('guildCreate', async (guild) => {
         console.error(`guildCreate announce (${guild.id}):`, e.message);
     }
 });
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

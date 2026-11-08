@@ -5,7 +5,7 @@ const { NITTER_INSTANCES, PLATFORMS, SEEN_HISTORY_SIZE, YOUTUBE_PUSH_POLL_INTERV
 const { client } = require('./client.js');
 const { getWatch, getAllWatches, getWatchesByLink, getPushCoveredYouTubeChannels, setWatchDisplayName, markWatchSeeded, setWatchPollInterval, getSocialLinkById, setWatchLiveMessage, setWatchYouTubeLiveVideo, touchLastChecked, updateLastPost } = require('./db.js');
 const { classifyYouTubeVideos, fetchLatestYouTubeEntries, noteQuotaOnce, youtubeQuotaBlockedUntil } = require('./platforms/youtube.js');
-const { markStreamOffline, sendNotification, shouldNotify } = require('./notify.js');
+const { markStreamOffline, sendNotification, shouldNotify, startLiveState, updateLiveMessage } = require('./notify.js');
 const { sendOrExtendBatch } = require('./batch.js');
 const { computeInterval, hasAdaptivePolling, nextBackoff, pollDue } = require('./rssPoll.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
@@ -299,7 +299,7 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         // otherwise it would keep saying "is live" forever once live_message_id is overwritten.
                         if (w.live_message_id) { await markStreamOffline(w); w.live_message_id = null; }
                         const sent = await sendNotification(w, post);
-                        if (sent) await setWatchLiveMessage(w.id, sent.id);
+                        if (sent) { await setWatchLiveMessage(w.id, sent.id); w.live_message_id = sent.id; w.live_state = await startLiveState(w, post); }
                     }
                     for (const post of toNotify.filter(p => !p.isLive)) await sendOrExtendBatch(w, post);
                     // Stream-ended detection: we were tracking a "went live" message, but this
@@ -307,6 +307,8 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                     // show it ended instead of leaving it saying "is live" forever. (No-op for
                     // Instagram/TikTok posts, which never set isLive in the first place.)
                     if (!posts.some(p => p.isLive) && w.live_message_id) await markStreamOffline(w);
+                    // Still live: a changed title or category edits the "went live" message, and the peak viewer count is tracked.
+                    else if (w.live_message_id && !silent) await updateLiveMessage(w, posts.find(p => p.isLive));
                     if (silent && posts.length) {
                         // Seed baseline from first check
                         await updateLastPost(w.id, posts[0].id, [...posts.map(p => p.id), ...seenIds]);

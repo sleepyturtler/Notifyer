@@ -2,13 +2,14 @@
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
 const { URL } = require('url');
-const { MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, TextDisplayBuilder } = require('discord.js');
 const { PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds } = require('./config.js');
 const { reportDeliveryFailure } = require('./announcements.js');
 const { profileUrl, watchName } = require('./helpers.js');
 const { fetchJson } = require('./net.js');
 const { client } = require('./client.js');
-const { setWatchLiveMessage } = require('./db.js');
+const { getConfig, setWatchLiveMessage, setWatchLiveState } = require('./db.js');
+const { buildCard } = require('./card.js');
 
 // ── Message templating ────────────────────────────────────────────────────
 const DEFAULT_TEMPLATE = '🔔 **{author}** just posted on {platform}!\n{url}';
@@ -81,6 +82,7 @@ function buttonLabelFor(platform, post) {
 // Only the customizer shows an image, so that its image-size option has something to resize.
 // Shorts, Reels and TikToks are vertical videos, so their preview image is vertical (9:16) too.
 const PREVIEW_IMAGE_URL = 'https://placehold.co/640x360/png?text=Post+image';
+const PREVIEW_IMAGE_URL_2 = 'https://placehold.co/640x360/png?text=Image+2';
 const PREVIEW_VERTICAL_IMAGE_URL = 'https://placehold.co/360x640/png?text=Post+image';
 const isShortForm = (platform, postType) => postType === 'shorts' || postType === 'reels' || postType === 'stories' || platform === 'tiktok';
 function buildSamplePost(w, postType, { withImage = false } = {}) {
@@ -90,6 +92,8 @@ function buildSamplePost(w, postType, { withImage = false } = {}) {
         title: 'Sample post title for preview',
         author: watchName(w),
         thumbnail: withImage ? (isShortForm(w.platform, postType) ? PREVIEW_VERTICAL_IMAGE_URL : PREVIEW_IMAGE_URL) : null,
+        // a tweet can carry several images, which a card shows as a gallery
+        ...(withImage && w.platform === 'twitter' ? { images: [PREVIEW_IMAGE_URL, PREVIEW_IMAGE_URL_2] } : {}),
         timestamp: new Date().toISOString(),
         postType,
         isLive: postType === 'live',
@@ -181,7 +185,15 @@ async function ensureVideoEmbedFallback(channel, messageId, post) {
             .setDescription(oembed?.title || post.title || null)
             .setTimestamp(safeDate(post.timestamp));
         if (oembed?.thumbnail) fallback.setImage(oembed.thumbnail);
-        await msg.edit({ embeds: [fallback] }).catch(e => console.error('embed fallback edit:', e.message));
+        // The backup is a Components V2 card. Turning the plain message into one means moving its text into the card's message line
+        // (the link shown there is the real TikTok URL, not the mirror) and clearing the old content; the link button stays. An edit
+        // pings nobody, so the role ping already sent with the first message is not repeated.
+        const line = (msg.content || '').split(embeddableUrl('tiktok', post.url)).join(post.url);
+        const card = buildCard(fallback, { images: oembed?.thumbnail ? [oembed.thumbnail] : [] });
+        await msg.edit({
+            content: null, embeds: [], flags: [MessageFlags.IsComponentsV2], allowedMentions: { parse: [] },
+            components: [new TextDisplayBuilder().setContent(line || '\u200b'), card, ...(msg.components || [])],
+        }).catch(e => console.error('embed fallback edit:', e.message));
     } catch (e) {
         console.error('ensureVideoEmbedFallback:', e.message);
     }
@@ -206,49 +218,69 @@ function safeDate(v) {
     return d && Number.isFinite(d.getTime()) ? d : new Date();
 }
 
+// How a notification is drawn: a Components V2 "card" (see card.js) or a classic embed. A watch can pick either in the
+// customizer. Without a choice every platform the bot draws itself is a card: Twitter/X, Bluesky, RSS, Instagram, and the Twitch
+// and Kick live and VOD posts. YouTube and TikTok are not drawn by the bot at all: the message is a link that Discord unfurls
+// (and plays) by itself, so they stay that way unless a watch chooses "Style: Card" (a thumbnail and a link button, no inline
+// player). TikTok's backup embed is a card, see below. CARD_DEFAULT=false makes every default a classic embed again.
+function defaultStyle(platform) {
+    if (process.env.CARD_DEFAULT === 'false') return 'embed';
+    return NATIVE_VIDEO_PLATFORMS.has(platform) ? 'embed' : 'card';
+}
+const styleOf = (w, post, es) => (es.style === 'card' || es.style === 'embed' ? es.style : defaultStyle(w.platform));
+// The watch's own look on top of the server's default look (set in the customizer), field by field.
+const lookOf = w => ({ ...(w.default_look || {}), ...(w.embed_settings || {}) });
+// The ping role for one post: the role chosen for its type, else the watch's default role.
+const roleFor = (w, post) => (post && w.type_roles?.[post.postType]) || w.role_id || null;
+
 // Builds the exact {content, embeds, components} a notification would use, without
-// sending anything — shared by sendNotification and /social preview so they can
-// never drift out of sync with each other.
+// sending anything \u2014 shared by sendNotification and /social customize so they can
+// never drift out of sync with each other. A card comes back as { v2: true, components } with no content or embeds.
 function buildNotificationPayload(w, post) {
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
     let content = renderTemplate(resolveTemplate(w, post), post, w.platform, watchName(w));
-    // For YouTube/TikTok, make sure a URL that Discord will actually unfurl into a
+    const es = lookOf(w);
+    const style = styleOf(w, post, es);
+    // For YouTube/TikTok in the embed style, make sure a URL that Discord will actually unfurl into a
     // playable video is present on its own line (not just inside a custom embed).
-    const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
+    const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url && style === 'embed';
     let embedUrl = null;
     if (wantsNativeVideo) {
         embedUrl = embeddableUrl(w.platform, post.url);
         content = content.includes(post.url) ? content.split(post.url).join(embedUrl) : `${content}\n${embedUrl}`;
     }
-    // Per-watch look, set in /social preview (the customizer). Nothing saved = today's default look.
-    const es = w.embed_settings || {};
     const postText = [post.title, post.summary].filter(Boolean).join('\n\n');
     const textInMessage = es.text === 'message' && !wantsNativeVideo && Boolean(postText);
     if (textInMessage) content = `${content}\n\n${postText}`;
-    if (w.role_id) content = `<@&${w.role_id}> ${content}`;
+    const role = roleFor(w, post);
+    if (role) content = `<@&${role}> ${content}`;
     content = clampContent(content, embedUrl);
     const linkRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton)
     );
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
-        // thumbnail, and channel/author — a custom embed on top of that is redundant.
+        // thumbnail, and channel/author \u2014 a custom embed on top of that is redundant.
         // Embed turned off in the customizer: the same message, but the link is not unfurled (SuppressEmbeds, see sendNotification).
         if (es.embed === false) return { content, embeds: [], components: [linkRow], wantsNativeVideo: false, suppressEmbeds: true, embedUrl };
         return { content, embeds: [], components: [linkRow], wantsNativeVideo: true, embedUrl };
     }
-    if (es.embed === false) return { content, embeds: [], components: [linkRow], wantsNativeVideo: false, embedUrl: null };
+    if (es.embed === false) return { content, embeds: [], components: [linkRow], wantsNativeVideo: false, suppressEmbeds: NATIVE_VIDEO_PLATFORMS.has(w.platform), embedUrl: null };
     const embed = new EmbedBuilder()
         .setColor(HEX_RE.test(es.color || '') ? es.color : p.color) // live streams use the platform's own color too (Twitch purple, Kick green)
-        .setAuthor({ name: `${post.author || watchName(w)} • ${p.label}${typeLabel}`.slice(0, 256) })
+        .setAuthor({ name: `${post.author || watchName(w)} \u2022 ${p.label}${typeLabel}`.slice(0, 256) })
         .setURL(post.url)
         .setDescription(textInMessage ? null : (postText.slice(0, 4000) || null))
         .setTimestamp(safeDate(post.timestamp));
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.isLive && post.category) embed.addFields({ name: 'Category', value: String(post.category).slice(0, 1024), inline: true });
+    if (style === 'card') {
+        const card = buildCard(embed, { images: post.images || (post.thumbnail ? [post.thumbnail] : []), small: es.image === 'small', noImage: es.image === 'none' });
+        return { content, embeds: [], components: [new TextDisplayBuilder().setContent(content), card, linkRow], v2: true, wantsNativeVideo: false, embedUrl: null };
+    }
     if (post.thumbnail && es.image !== 'none') (es.image === 'small' ? embed.setThumbnail(post.thumbnail) : embed.setImage(post.thumbnail));
-    return { content, embeds: [embed], components: [linkRow], wantsNativeVideo: false };
+    return { content, embeds: [embed], components: [linkRow], wantsNativeVideo: false, embedUrl: null };
 }
 
 // Shared by every place that needs to resolve a watch's target channel — sending
@@ -259,21 +291,93 @@ function resolveWatchChannel(w) {
 }
 
 // Only the watch's own ping role may notify; see the allowedMentions default in client.js.
-const pingRoles = w => ({ roles: w.role_id ? [w.role_id] : [] });
+const pingRoles = (w, post) => ({ roles: roleFor(w, post) ? [roleFor(w, post)] : [] });
 
 async function sendNotification(w, post) {
     const { guild, channel } = resolveWatchChannel(w);
     if (!channel) { reportDeliveryFailure(w, 'missing_channel'); return null; }
-    const payload = buildNotificationPayload(w, post);
+    const look = (await getConfig(w.guild_id).catch(() => null))?.defaultLook; // the server's default look, if it set one
+    const payload = buildNotificationPayload(look ? { ...w, default_look: look } : w, post);
+    if (payload.v2) {
+        return channel.send({ components: payload.components, flags: [MessageFlags.IsComponentsV2], allowedMentions: pingRoles(w, post) })
+            .catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); return null; });
+    }
     const noUnfurl = payload.suppressEmbeds ? { flags: [MessageFlags.SuppressEmbeds] } : {};
     if (payload.wantsNativeVideo) {
-        const sent = await channel.send({ content: payload.content, components: payload.components, allowedMentions: pingRoles(w) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
+        const sent = await channel.send({ content: payload.content, components: payload.components, allowedMentions: pingRoles(w, post) }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
         // Discord's crawler occasionally fails to unfurl TikTok links even via the mirror
         // domain — check back shortly and backfill a manual embed if nothing showed up.
         if (sent && w.platform === 'tiktok') ensureVideoEmbedFallback(channel, sent.id, post);
         return sent;
     }
-    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: pingRoles(w), ...noUnfurl }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
+    return channel.send({ content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: pingRoles(w, post), ...noUnfurl }).catch(e => { console.error(`send notification (${guild.name}/#${channel.name}, watch ${w.id}):`, e.message); reportDeliveryFailure(w, e); return null; });
+}
+
+// \u2500\u2500 Live streams: edits while live, summary when it ends \u2500\u2500
+// A watch's current stream is remembered in watches.live_state: { startedAt, title, category, peak, savedAt, editedAt }.
+// While the stream is live, a changed title or category edits the "went live" message in place (an edit never pings), at most once
+// per 30 s. The peak viewer count is the highest one seen while polling, so it is approximate; it is kept in memory and saved
+// at most every 2 minutes. When the stream ends, the ended message shows the duration and the peak.
+const livePeaks = new Map(); // watch id -> highest viewer count seen
+const LIVE_EDIT_MIN_MS = 30 * 1000;
+const LIVE_SAVE_MIN_MS = 2 * 60 * 1000;
+
+function formatDuration(ms) {
+    const mins = Math.floor(ms / 60000);
+    if (mins < 1) return 'under a minute';
+    const h = Math.floor(mins / 60), m = mins % 60;
+    return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function startLiveState(w, post) {
+    livePeaks.set(w.id, post.viewers || 0);
+    const now = Date.now();
+    const state = { startedAt: post.timestamp || new Date(now).toISOString(), title: post.title || null, category: post.category || null, peak: post.viewers || 0, savedAt: now, editedAt: now };
+    await setWatchLiveState(w.id, state).catch(e => console.error(`startLiveState (${w.id}):`, e.message));
+    return state;
+}
+
+// Returns true when the message was edited, false when there was nothing to edit (message gone), null when it cannot be edited.
+async function editLiveMessage(w, post) {
+    const { channel } = resolveWatchChannel(w);
+    const msg = channel ? await channel.messages.fetch(w.live_message_id).catch(() => null) : null;
+    if (!msg) return false;
+    const look = (await getConfig(w.guild_id).catch(() => null))?.defaultLook;
+    const payload = buildNotificationPayload(look ? { ...w, default_look: look } : w, post);
+    const msgIsV2 = Boolean(msg.flags?.has?.(MessageFlags.IsComponentsV2));
+    if (Boolean(payload.v2) !== msgIsV2) return null; // the look changed kind since it was posted; Discord cannot convert a message
+    const edit = payload.v2
+        ? { components: payload.components, flags: [MessageFlags.IsComponentsV2], allowedMentions: { parse: [] } }
+        : { content: payload.content, embeds: payload.embeds, components: payload.components, allowedMentions: { parse: [] } };
+    await msg.edit(edit).catch(e => { console.error(`edit live message (${w.id}):`, e.message); throw e; });
+    return true;
+}
+
+// Called on every poll while the watch is live. Cheap when nothing changed: no Discord or database call.
+async function updateLiveMessage(w, post) {
+    if (!w.live_message_id || !post?.isLive) return;
+    const st = w.live_state || {};
+    const peak = Math.max(livePeaks.get(w.id) ?? st.peak ?? 0, post.viewers || 0);
+    livePeaks.set(w.id, peak);
+    const now = Date.now();
+    const title = post.title || null, category = post.category || null;
+    const changed = title !== (st.title ?? null) || category !== (st.category ?? null);
+    const next = { ...st, startedAt: st.startedAt || post.timestamp || new Date(now).toISOString(), peak };
+    try {
+        if (changed) {
+            if (now - (st.editedAt || 0) < LIVE_EDIT_MIN_MS) return; // too soon after the last edit: try again next poll
+            if (await editLiveMessage(w, post) === null) return;
+            Object.assign(next, { title, category, editedAt: now, savedAt: now });
+        } else if (peak > (st.peak || 0) && now - (st.savedAt || 0) >= LIVE_SAVE_MIN_MS) {
+            next.savedAt = now;
+        } else {
+            return;
+        }
+        w.live_state = next;
+        await setWatchLiveState(w.id, next);
+    } catch (e) {
+        console.error(`updateLiveMessage (${w.id}):`, e.message);
+    }
 }
 
 // Edits a previously-sent "went live" message to show the stream has ended, once a
@@ -286,15 +390,21 @@ async function markStreamOffline(w) {
         const msg = channel ? await channel.messages.fetch(w.live_message_id).catch(() => null) : null;
         if (msg) {
             const p = PLATFORMS[w.platform];
-            // Reconstruct a minimal post-like object so the person's own custom "live"
+            // Reconstruct a minimal post-like object so the person\'s own custom "live"
             // message (with {is/was}) renders here too, instead of a hardcoded string.
             const syntheticPost = { author: w.handle, url: profileUrl(w.platform, w.handle), title: null, postType: 'live' };
-            const content = renderTemplate(resolveTemplate(w, syntheticPost), syntheticPost, w.platform, w.handle, true);
+            let content = renderTemplate(resolveTemplate(w, syntheticPost), syntheticPost, w.platform, w.handle, true);
             const endedEmbed = new EmbedBuilder()
                 .setColor(p.color) // stays the platform's color (Twitch purple, Kick green); the text and button say it ended
-                .setAuthor({ name: `${w.handle} • ${p.label}` })
+                .setAuthor({ name: `${w.handle} \u2022 ${p.label}` })
                 .setDescription('Stream ended.')
                 .setTimestamp();
+            // How long it lasted and how many people watched at the most (from the polls; approximate).
+            const st = w.live_state || {};
+            const started = st.startedAt ? new Date(st.startedAt).getTime() : NaN;
+            const peak = Math.max(livePeaks.get(w.id) || 0, st.peak || 0);
+            if (Number.isFinite(started) && Date.now() > started) endedEmbed.addFields({ name: 'Duration', value: formatDuration(Date.now() - started), inline: true });
+            if (peak > 0) endedEmbed.addFields({ name: 'Peak viewers', value: peak.toLocaleString('en-US'), inline: true });
             // Same link, relabelled (the channel page is where past broadcasts live). Left as it was if there is no link button.
             let components = msg.components;
             const label = endedButtonLabel(w.platform);
@@ -304,16 +414,21 @@ async function markStreamOffline(w) {
                 if (old.emoji) btn.setEmoji(old.emoji);
                 components = [new ActionRowBuilder().addComponents(btn)];
             }
-            await msg.edit({ content, embeds: [endedEmbed], components })
-                .catch(e => console.error(`edit live-ended message (${w.id}):`, e.message));
+            const msgIsV2 = Boolean(msg.flags?.has?.(MessageFlags.IsComponentsV2));
+            const edit = msgIsV2
+                ? { components: [new TextDisplayBuilder().setContent(content || '\u200b'), buildCard(endedEmbed), ...(components || [])], flags: [MessageFlags.IsComponentsV2], allowedMentions: { parse: [] } }
+                : { content, embeds: [endedEmbed], components, allowedMentions: { parse: [] } };
+            await msg.edit(edit).catch(e => console.error(`edit live-ended message (${w.id}):`, e.message));
         }
     } catch (e) {
         console.error(`markStreamOffline (${w.id}):`, e.message);
     } finally {
+        livePeaks.delete(w.id);
         await setWatchLiveMessage(w.id, null);
+        await setWatchLiveState(w.id, null).catch(() => {});
     }
 }
 
-module.exports = { PLACEHOLDER_HELP, clampContent, safeDate, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };
+module.exports = { NATIVE_VIDEO_PLATFORMS, PLACEHOLDER_HELP, defaultStyle, embeddableUrl, formatDuration, lookOf, roleFor, styleOf, startLiveState, updateLiveMessage, clampContent, safeDate, buildNotificationPayload, buildOnboardingPreview, buildSamplePost, buttonLabelFor, endedButtonLabel, markStreamOffline, resolveWatchChannel, sendNotification, shouldNotify };
 
 // build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

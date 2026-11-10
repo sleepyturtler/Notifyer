@@ -186,9 +186,10 @@ function buildManageView(w) {
     else if (canBatch) blocks.push(`**Batching:**\n**Header:** \`${w.batch_header_template || DEFAULT_BATCH_HEADER}\` (use \`{creators}\` to list accounts).`);
     blocks.push('**Placeholders:**\n\u2022 General: `{author}` `{handle}` `{platform}` `{title}` `{url}`\n\u2022 Lives: `{is/was}` (is/was live) and `{category}`');
     
-    // Row 1: Change Channel & Edit Types (if multiple types exist). Ping Role button removed from here.
+    // Row 1: Change Channel, Customize, and Edit Types (if multiple types exist). Ping Role button removed.
     const row1Components = [
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`socialmanage_customize_${w.id}`).setLabel('Customize').setStyle(ButtonStyle.Primary),
     ];
     if (types.length > 1) {
         row1Components.push(new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary));

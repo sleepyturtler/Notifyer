@@ -1,6 +1,6 @@
 {
   "name": "Notifyer",
-  "version": "2.2",
+  "version": "2.2.1",
   "license": "MIT",
   "main": "index.js",
   "type": "commonjs",

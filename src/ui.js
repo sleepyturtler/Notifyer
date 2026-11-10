@@ -127,16 +127,10 @@ function buildSocialLinkManageView(link, { guildId, canUnlink = false, usage = n
     return view(toInt(p.color), [`## Manage Link \u2014 ${p.emojiTag} ${link.external_username}`, info, ...(canUnlink ? [] : ['-# Only the person who linked this account can unlink it.'])], [row]);
 }
 
-// Shared modal builder used both from the manage view's "Edit Messages"
-// button and from the new guided /social add flow, so both stay in sync.
-// isNewFlow tags the modal's customId so its submit handler knows whether to
-// continue the add-flow wizard (offer the batch-header step next) or just
-// return to the manage view, since this same modal serves both entry points.
 function buildPerTypeMessageModal(w, isNewFlow = false) {
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const templates = w.message_templates || {};
     const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}${isNewFlow ? '_new' : ''}`).setTitle(`Edit Messages for ${watchName(w)}`.slice(0, 45));
-    // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
     modal.addComponents(
         ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
             new TextInputBuilder().setCustomId(`tmpl_${t.id}`).setLabel(`Message for ${t.label} (blank = default)`)
@@ -150,8 +144,6 @@ function buildPerTypeMessageModal(w, isNewFlow = false) {
     return modal;
 }
 
-// Shared by the manage view's "Batch Header" button and the guided add-flow's
-// optional batch-header step below, so both stay in sync.
 function buildBatchHeaderModal(w) {
     return new ModalBuilder().setCustomId(`socialbatchheader_modal_${w.id}`).setTitle('Edit Batch Header')
         .addComponents(
@@ -164,7 +156,6 @@ function buildBatchHeaderModal(w) {
         );
 }
 
-// One line per active notify type: that type's own message, else the watch's old single message, else "default".
 function describeMessages(w) {
     const all = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const ids = activeTypeIds(w);
@@ -178,7 +169,8 @@ function describeMessages(w) {
 
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
-    const typesText = (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : ((PLATFORM_NOTIFY_TYPES[w.platform] || []).some(t => t.defaultOff) ? activeTypeIds(w).map(id => PLATFORM_NOTIFY_TYPES[w.platform].find(x => x.id === id).label).join(', ') : 'All types');
+    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+    const typesText = (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : (types.some(t => t.defaultOff) ? activeTypeIds(w).map(id => types.find(x => x.id === id).label).join(', ') : 'All types');
     const info = [
         `**Types:** ${typesText}`,
         `**Ping Role:** ${w.role_id ? `<@&${w.role_id}>` : 'None'}`,
@@ -187,20 +179,22 @@ function buildManageView(w) {
     ].join('\n');
     const blocks = [`## Manage - ${p.emojiTag} ${watchName(w)}`, info, `**Messages:**\n${describeMessages(w)}`];
     if (p.unavailable) blocks.push(`**\u26a0\ufe0f Unavailable**\n${p.label} isn't working right now (see /help, Info). Your settings are kept.`);
-    // A watch can only ever contribute to a batch if at least one of its active notify types isn't "live" (live events
-    // always send individually, see pollAll), so a Kick watch (live-only) or a YouTube watch restricted to just Live
-    // can never actually batch, regardless of platform.
-    const batchPossible = canWatchBatch(w); // this watch has at least one non-live type
+    
+    const batchPossible = canWatchBatch(w);
     const canBatch = batchPossible && !w.batch_disabled;
     if (batchPossible && w.batch_disabled) blocks.push('**Batching:**\nOff for this watch. Its posts always send on their own.');
     else if (canBatch) blocks.push(`**Batching:**\n**Header:** \`${w.batch_header_template || DEFAULT_BATCH_HEADER}\` (use \`{creators}\` to list accounts).`);
     blocks.push('**Placeholders:**\n\u2022 General: `{author}` `{handle}` `{platform}` `{title}` `{url}`\n\u2022 Lives: `{is/was}` (is/was live) and `{category}`');
-    const row1 = new ActionRowBuilder().addComponents(
+    
+    // Row 1: Change Channel & Edit Types (if multiple types exist). Ping Role button removed from here.
+    const row1Components = [
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`socialmanage_role_${w.id}`).setLabel('Change Ping Role').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary),
-    );
-    // Batch Settings is server-wide (min posts / cross-channel), so it is offered on every watch.
+    ];
+    if (types.length > 1) {
+        row1Components.push(new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary));
+    }
+    const row1 = new ActionRowBuilder().addComponents(...row1Components);
+
     const row2 = new ActionRowBuilder().addComponents(
         ...(batchPossible ? [new ButtonBuilder().setCustomId(`socialmanage_togglebatch_${w.id}`).setLabel(w.batch_disabled ? 'Batching: Off' : 'Batching: On').setStyle(w.batch_disabled ? ButtonStyle.Secondary : ButtonStyle.Success)] : []),
         new ButtonBuilder().setCustomId(`socialmanage_batchsettings_${w.id}`).setLabel('Batch Settings').setStyle(ButtonStyle.Secondary),
@@ -213,7 +207,6 @@ function buildManageView(w) {
     return view(toInt(p.color), blocks, [row1, row2, row3]);
 }
 
-// Server-wide batch settings, reached from a watch's manage view. cfg is the guild config; w is only used to route the Back button.
 function buildBatchSettingsView(w, cfg) {
     const minPosts = cfg.batchMinThreshold || 2;
     const cross = !!cfg.batchCrossChannel;
@@ -231,8 +224,6 @@ function buildBatchSettingsView(w, cfg) {
     ]);
 }
 
-// \u2500\u2500 Help (tabbed) \u2500\u2500
-// build() returns the text sections under the title. Command lists are one bulleted section; Info has one section per topic.
 const bullets = items => items.map(i => `\u2022 **${i.name}**\n${i.value}`).join('\n');
 const HELP_CATEGORIES = [
     {
@@ -277,7 +268,7 @@ const HELP_CATEGORIES = [
         ],
     },
 ];
-// Beta-only (see debugTools.js). Pushed here rather than inline above so this array is identical whether or not that file is present.
+
 if (debugTools) HELP_CATEGORIES.push(debugTools.getExtraHelpCategory());
 
 function buildHelpView(activeId) {
@@ -286,15 +277,11 @@ function buildHelpView(activeId) {
         .setCustomId(`help_cat_${c.id}`)
         .setLabel(c.label)
         .setStyle(c.id === active.id ? ButtonStyle.Primary : ButtonStyle.Secondary));
-    // Chunk into rows of up to 5 buttons (Discord's per-row limit)
     const rows = [];
     for (let i = 0; i < buttons.length; i += 5) rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
     return view(RED, [`## ${BUILD_NAME} - ${active.label}`, ...active.build()], rows);
 }
 
-// \u2500\u2500 /setup wizard \u2500\u2500
-// Tabs of the /setup tour. Every tab keeps the "Add account" button, which starts the unchanged
-// first-watch flow (setup_start -> platform -> handle -> channel -> types/messages/batch header).
 const SETUP_TABS = [
     { id: 'welcome', label: 'Welcome' },
     { id: 'track', label: 'Watches' },
@@ -350,3 +337,5 @@ function buildSetupView(tabId, watchCount = 0) {
 }
 
 module.exports = { WATCHES_PER_PAGE, buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed };
+
+// build-marker: ui-v3

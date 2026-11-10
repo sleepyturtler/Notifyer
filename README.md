@@ -8,7 +8,7 @@ Get fast and free notifications from you favourite creators across YouTube, Twit
 - **/social check:** Manually checks if new posts are available.
 - **/social link:** Link your Tiktok/Instagram account, so you can track it's posts.
 - **/social links:** View all OAuth linked accounts.
-- **/social preview:** Preview your settings for a watch, using placeholder content.
+- **/social customize:** Preview a watch's notification and customize it (message, batch header, ping role, embed color, image, embed on/off), then Save.
 
 ## Other:
 - **/help:** Shows all commands and other useful info.

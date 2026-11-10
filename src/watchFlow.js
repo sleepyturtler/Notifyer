@@ -1,14 +1,15 @@
 // Shared watch-creation flow used by /social add and /setup.
 // Moved verbatim out of the former single-file index.js; only the require/export lines are new.
 
-const { EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
-const { E, normalizeHandle, watchName } = require('./helpers.js');
+const { normalizeHandle, watchName } = require('./helpers.js');
 const { addWatch, getSocialLinkByUsername, getWatches, markWatchSeeded, setWatchSocialLink, updateLastPost } = require('./db.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { BULK_FETCHERS } = require('./platforms/index.js');
 const { fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
 const { PLACEHOLDER_HELP } = require('./notify.js');
+const { GREEN, RED, box } = require('./v2.js');
 const { checkLinkAccess, requestLinkApproval } = require('./linkRequests.js');
 
 // ── Shared watch-creation flow ──────────────────────────────────────────────
@@ -124,44 +125,45 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
 function buildAddWatchSuccessResponse(watch, post, handle, channel) {
     const p = PLATFORMS[watch.platform];
     const types = PLATFORM_NOTIFY_TYPES[watch.platform];
-    const successEmbed = E('#00ff00', 'Now Tracking').addFields(
-        { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
-        { name: 'Account', value: watchName(watch) !== watch.handle ? watchName(watch) : handle, inline: true },
-        { name: 'Channel', value: `${channel}`, inline: true },
-        post?.title
-            ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
-            : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
-    );
+    const info = [
+        `**Platform:** ${p.emojiTag} ${p.label}`,
+        `**Account:** ${watchName(watch) !== watch.handle ? watchName(watch) : handle}`,
+        `**Channel:** ${channel}`,
+    ].join('\n');
+    const baseline = post?.title
+        ? `**Latest post (baseline)**\n[${post.title.slice(0, 100)}](${post.url})`
+        : '**Baseline**\nNo posts found yet \u2014 will track from first post.';
+    const success = box(GREEN, ['## Now Tracking', info, baseline]);
 
-    // Single-type platforms (TikTok, Twitter) skip the type-choice step entirely —
+    // Single-type platforms (TikTok, Twitter) skip the type-choice step entirely \u2014
     // there's only one kind of post, so go straight to a "set your message" button.
     if (types.length <= 1) {
-        successEmbed.setDescription('One more step — set the notification message below.')
-            .addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
+        const next = box(GREEN, ['One more step \u2014 set the notification message below.', `**Placeholders**\n${PLACEHOLDER_HELP}`]);
         const msgRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}_new`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
         );
-        return { embeds: [successEmbed], components: [msgRow] };
+        return { components: [success, next, msgRow] };
     }
 
-    // Multi-type platforms: choose notification types first — selecting (or skipping)
+    // Multi-type platforms: choose notification types first \u2014 selecting (or skipping)
     // chains straight into the per-type message form, so this is a single guided path
     // instead of separate optional buttons.
-    const typeEmbed = new EmbedBuilder().setColor('#5865F2')
-        .setTitle(`${p.emojiTag} Choose Notification Types`)
-        .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`)
-        .addFields({ name: 'Placeholders (for the message you set next)', value: PLACEHOLDER_HELP });
+    const choose = box(RED, [
+        `## ${p.emojiTag} Choose Notification Types`,
+        `Which types of **${p.label}** content do you want notifications for?\nSelect one or more below \u2014 you'll set the message for each right after.`,
+        `**Placeholders (for the message you set next)**\n${PLACEHOLDER_HELP}`,
+    ]);
     const typeRow = new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
             .setCustomId(`socialtypeadd_select_${watch.id}`)
-            .setPlaceholder('Select notification types…')
+            .setPlaceholder('Select notification types\u2026')
             .setMinValues(1).setMaxValues(types.length)
             .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
     );
     const skipRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel(`${types.some(t => t.defaultOff) ? 'Default types' : 'All types'} (skip)`).setStyle(ButtonStyle.Secondary)
     );
-    return { embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] };
+    return { components: [success, choose, typeRow, skipRow] };
 }
 
 module.exports = { buildAddWatchSuccessResponse, createWatchFlow };

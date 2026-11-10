@@ -192,6 +192,9 @@ async function initDB() {
     if (!hadVerifiedCol) await pool.query('UPDATE youtube_subscriptions SET verified_until = expires_at WHERE signed');
     await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS poll_interval_ms INTEGER'); // RSS adaptive polling
     await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS feed_seeded BOOLEAN NOT NULL DEFAULT FALSE'); // Twitter: the feed now includes replies/reposts; false = its current items still need silently marking as seen
+    await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS embed_settings JSONB'); // how this watch\'s notification embed looks (see customizer.js)
+    await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS type_roles JSONB'); // ping role per post type, e.g. {"live":"123"}; role_id is the default for types without one
+    await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS live_state JSONB'); // the current stream: start time, last title/category, peak viewers
     await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS display_name TEXT'); // RSS: the feed title, shown instead of the URL
     // Servers the bot was removed from, waiting out the grace period before their data is deleted.
     await pool.query('CREATE TABLE IF NOT EXISTS guild_purge_queue (guild_id TEXT PRIMARY KEY, delete_after BIGINT NOT NULL, queued_at BIGINT NOT NULL, reason TEXT)');
@@ -515,8 +518,40 @@ async function markWatchSeeded(id) {
     await pool.query('UPDATE watches SET feed_seeded = TRUE WHERE id = $1', [id]);
 }
 
+// Applies everything the embed customizer edited in one statement, so Save is all-or-nothing.
+async function saveWatchCustomization(guildId, id, { embed_settings, role_id, type_roles, message_templates, batch_header_template }) {
+    const res = await pool.query(
+        'UPDATE watches SET embed_settings = $1, role_id = $2, type_roles = $3, message_templates = $4, batch_header_template = $5 WHERE guild_id = $6 AND id = $7',
+        [embed_settings && Object.keys(embed_settings).length ? JSON.stringify(embed_settings) : null, role_id || null,
+            type_roles && Object.keys(type_roles).length ? JSON.stringify(type_roles) : null,
+            JSON.stringify(message_templates || {}), batch_header_template || null, guildId, id]
+    );
+    return res.rowCount > 0;
+}
+
+// "Apply to..." in the customizer: copies only the fields that are present in `fields` onto the given watches of one server.
+// Returns how many watches were changed.
+async function copyWatchCustomization(guildId, ids, fields) {
+    if (!ids.length) return 0;
+    const sets = [], vals = [];
+    const add = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+    if ('embed_settings' in fields) add('embed_settings', fields.embed_settings && Object.keys(fields.embed_settings).length ? JSON.stringify(fields.embed_settings) : null);
+    if ('message_templates' in fields) add('message_templates', JSON.stringify(fields.message_templates || {}));
+    if ('batch_header_template' in fields) add('batch_header_template', fields.batch_header_template || null);
+    if ('role_id' in fields) add('role_id', fields.role_id || null);
+    if ('type_roles' in fields) add('type_roles', fields.type_roles && Object.keys(fields.type_roles).length ? JSON.stringify(fields.type_roles) : null);
+    if (!sets.length) return 0;
+    vals.push(guildId, ids);
+    const res = await pool.query(`UPDATE watches SET ${sets.join(', ')} WHERE guild_id = $${vals.length - 1} AND id = ANY($${vals.length}::int[])`, vals);
+    return res.rowCount;
+}
+
+async function setWatchLiveState(id, state) {
+    await pool.query('UPDATE watches SET live_state = $1 WHERE id = $2', [state ? JSON.stringify(state) : null, id]);
+}
+
 async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, approveLinkForGuild, cancelGuildPurge, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getQueuedGuildPurges, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markWatchSeeded, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, scheduleGuildPurge, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addWatch, approveLinkForGuild, cancelGuildPurge, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getQueuedGuildPurges, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markWatchSeeded, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, saveWatchCustomization, copyWatchCustomization, setWatchLiveState, scheduleGuildPurge, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

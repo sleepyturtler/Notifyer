@@ -211,11 +211,12 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
             // Already converted on an earlier post — normal edit-extend.
             try {
                 const msg = await channel.messages.fetch(state.messageId);
-                // Converting a normal single-embed/content message into Components V2
+                // Converting a normal single-embed/content message into Components V2 (embeds: [] rather than null: discord.js drops a null
+                // field from the request, which leaves an old embed on the message and Discord then refuses the V2 flag)
                 // (or re-editing one that already is) requires explicitly nulling out
                 // content/embeds/stickers/poll on the edit — passing only
                 // flags+components isn't enough for Discord to accept the switch.
-                return await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
+                return await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: [], stickers: null, poll: null });
             } catch (e) {
                 // Original message is gone (deleted, too old to fetch, lost permissions),
                 // OR this batch still somehow exceeds Discord's limits despite the cap
@@ -254,7 +255,7 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
             }
             try {
                 const msg = await channel.messages.fetch(state.entries[0].standaloneMessageId);
-                const edited = await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: null, stickers: null, poll: null });
+                const edited = await msg.edit({ ...buildBatchPayload(state.entries), content: null, embeds: [], stickers: null, poll: null });
                 state.messageId = state.entries[0].standaloneMessageId;
                 state.isBatch = true;
                 return edited;
@@ -290,3 +291,5 @@ async function sendOrExtendBatchLocked(w, post, key, cfg) {
 
 
 module.exports = { DEFAULT_BATCH_HEADER, renderBatchHeader, renderBatchHeaderForEntries, sendOrExtendBatch, MAX_BATCH_ENTRIES_PER_MESSAGE };
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

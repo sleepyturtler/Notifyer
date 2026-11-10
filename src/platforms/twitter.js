@@ -65,17 +65,24 @@ function parseNitterItems(list, handle, feedTitle = null) {
     return out;
 }
 
-async function fetchMirror(base, handle) {
-    // with_replies has everything; if a mirror doesn't serve it, the plain feed still gives posts and reposts.
-    let xml;
-    try { xml = await fetchText(`${base}/${handle}/with_replies/rss`); }
-    catch { xml = await fetchText(`${base}/${handle}/rss`); }
-    const data = xmlParser.parse(xml);
+// One feed URL -> posts. Throws when the request fails or the feed has no usable items.
+async function fetchFeed(url, handle) {
+    const data = xmlParser.parse(await fetchText(url));
     const items = data?.rss?.channel?.item;
     if (!items) throw new Error('No items in feed');
     const posts = parseNitterItems(Array.isArray(items) ? items : [items], handle, text(data?.rss?.channel?.title) || null);
     if (!posts.length) throw new Error('Could not parse tweet ID');
     return posts;
+}
+
+async function fetchMirror(base, handle) {
+    // with_replies has everything. Some mirrors don't serve it (an error, or an empty feed), and the plain feed still
+    // has posts and reposts, so any failure of the first falls back to the second.
+    try { return await fetchFeed(`${base}/${handle}/with_replies/rss`, handle); }
+    catch (first) {
+        try { return await fetchFeed(`${base}/${handle}/rss`, handle); }
+        catch (second) { throw new Error(`${second.message}${first.message === second.message ? '' : ` (with_replies: ${first.message})`}`); }
+    }
 }
 
 async function fetchLatestTwitterAll(handle) {

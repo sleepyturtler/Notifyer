@@ -14,6 +14,7 @@ const path = require('path');
 // opted in by having that file in src/. Checked once here so a missing file is a
 // deliberate, expected release-build state, not a silently-swallowed error.
 const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
+const { setCommandIds } = require('./commands.js');
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
 // Events.ClientReady is 'ready' on older discord.js 14.x and 'clientReady' on newer ones; using the
@@ -22,14 +23,12 @@ client.once(Events.ClientReady, async () => {
     console.log(`✅ Social notify bot online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Refreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
     const socialCommand = new SlashCommandBuilder().setName('social').setDescription('Manage social media notifications')
-        .addSubcommand(s => s.setName('add').setDescription('Track a new account')
-            .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true).setAutocomplete(true))
-            .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
-            .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(s => s.setName('add').setDescription('Add an account to track (a guided flow)'))
         .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
-        .addSubcommand(s => s.setName('preview').setDescription('Preview what a tracked account\'s notifications will look like')
-            .addIntegerOption(o => o.setName('watch').setDescription('The watch to preview (skips the picker)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('customize').setDescription("Preview and customize how a tracked account's notifications look")
+            .addIntegerOption(o => o.setName('watch').setDescription('The watch to customize (skips the picker)').setAutocomplete(true)))
         .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
+        .addSubcommand(s => s.setName('status').setDescription('See problems with your tracked accounts and how each platform is doing'))
         .addSubcommand(s => s.setName('link').setDescription('Connect an Instagram or TikTok account via OAuth so it can be tracked')
             .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
                 .addChoices({ name: '📸 Instagram', value: 'instagram' }, { name: '🎵 TikTok', value: 'tiktok' })))
@@ -44,7 +43,10 @@ client.once(Events.ClientReady, async () => {
     // Adds /social debug, /social oauthdebug, and /killbot only on builds that have
     // debugTools.js — mutates socialCommand in place and pushes killbot onto commands.
     if (debugTools) debugTools.extendCommands(socialCommand, commands);
-    await client.application.commands.set(commands).catch(e => console.error('command registration:', e));
+    const registered = await client.application.commands.set(commands).catch(e => { console.error('command registration:', e); return null; });
+    // Commands in the bot's own messages become clickable once their ids are known (commands.js). If registration just
+    // failed, the already-registered ones are still usable, so ask Discord for those instead.
+    setCommandIds(registered || await client.application.commands.fetch().catch(() => null));
 
     // Drop data for servers the bot is no longer in (left while offline, or from before this existed)
     // before polling starts, so they aren't polled for nothing. Guarded; see guildCleanup.js.
@@ -97,3 +99,5 @@ client.on('guildCreate', async (guild) => {
         console.error(`guildCreate announce (${guild.id}):`, e.message);
     }
 });
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

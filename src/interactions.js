@@ -17,6 +17,8 @@ const { revokeTikTokToken } = require('./platforms/social.js');
 const { SETUP_PICK_TTL_MS, createOAuthState, pendingSetupPicks } = require('./state.js');
 const { buildOnboardingPreview } = require('./notify.js');
 const { handleCustomizerInteraction, openCustomizer } = require('./customizer.js');
+const { buildStatusView } = require('./status.js');
+const { PRESETS, expandPreset } = require('./rssPresets.js');
 const { GREEN, RED, toInt, view, wrapInteraction } = require('./v2.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const fs = require('fs');
@@ -53,6 +55,28 @@ function buildLinkPrompt(guildId, userId, platform) {
 }
 
 const lastChecks = new Map(); // guild id -> when /social check last started
+
+// The channel step: up to 5 channels, each becoming its own watch.
+function channelStepView(shown) {
+    const row = new ActionRowBuilder().addComponents(
+        new ChannelSelectMenuBuilder().setCustomId('setup_channel_pick').setPlaceholder('Choose up to 5 channels for notifications\u2026').setMinValues(1).setMaxValues(5)
+            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+    );
+    return view(RED, ['## Add an account - Channel', `Got it \u2014 **${shown}**. Which channels should notifications post to? Pick up to 5.`], [row]);
+}
+
+// The first screen of adding an account: which platform. Used by /social add and by the setup tour's "Add my first account" button;
+// everything after it (handle form or RSS source picker, channels, the result) is shared too.
+function addPlatformView(userId) {
+    const ownerHere = isOwner(userId);
+    const options = Object.entries(PLATFORMS)
+        .filter(([k, v]) => canUsePlatform(k, userId) && (!v.unavailable || (v.ownerOnly && ownerHere)))
+        .map(([k, v]) => ({ label: v.label, value: k, emoji: v.emojiButton }));
+    const row = new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder().setCustomId('setup_platform_pick').setPlaceholder('Choose a platform\u2026').addOptions(options)
+    );
+    return view(RED, ['## Add an account - Platform', 'Which platform is the account on?'], [row]);
+}
 
 client.on('interactionCreate', async interaction => {
   try {
@@ -124,20 +148,12 @@ client.on('interactionCreate', async interaction => {
             if (!await hasCommandPermission(interaction, guildId)) return reply('❌ No permission. An administrator must configure access with `/social access`.');
 
             if (sub === 'add') {
-                const platform = interaction.options.getString('platform');
-                const rawHandle = interaction.options.getString('handle');
-                const channel = interaction.options.getChannel('channel');
-                const bypassUnavailable = Boolean(PLATFORMS[platform]?.ownerOnly && isOwner(interaction.user.id));
-                if (PLATFORMS[platform] && !canUsePlatform(platform, interaction.user.id)) return reply('❌ That platform is not available yet.');
+                // A guided flow: platform, then the handle (or an RSS source), then the channels
+                return interaction.reply({ ...addPlatformView(interaction.user.id), flags: [MessageFlags.Ephemeral] });
+            }
 
-                await interaction.deferReply({ flags: [MessageFlags.Ephemeral, MessageFlags.IsComponentsV2] }); // the result is a V2 screen
-
-                const result = await createWatchFlow(guildId, platform, rawHandle, channel.id, interaction.user.tag, bypassUnavailable, interaction.user.id);
-                if (!result.ok) return interaction.editReply(result.message);
-
-                const v = buildAddWatchSuccessResponse(result.watch, result.post, result.handle, channel);
-                await interaction.editReply({ ...v });
-                return;
+            if (sub === 'status') {
+                return interaction.reply({ ...(await buildStatusView(guildId, { isOwnerHere: isOwner(interaction.user.id) })), flags: [MessageFlags.Ephemeral] });
             }
 
             if (sub === 'list') {
@@ -254,6 +270,11 @@ client.on('interactionCreate', async interaction => {
         if (r.error) return interaction.update({ content: r.error, components: [] });
         const { flags, ...rest } = r.payload; // the picker message is already private
         return interaction.update({ content: null, ...rest });
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('socialstatus_refresh_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '\u274c No permission.', flags: [MessageFlags.Ephemeral] });
+        return interaction.update(await buildStatusView(guildId, { isOwnerHere: isOwner(interaction.user.id) }));
     }
 
     // Platform tabs of the linked accounts view (sociallinks_tab_<guild>_<platform>); old refresh buttons just redraw the default tab.
@@ -511,14 +532,7 @@ client.on('interactionCreate', async interaction => {
     }
     if (interaction.isButton() && interaction.customId === 'setup_start') {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const ownerHere = isOwner(interaction.user.id);
-        const options = Object.entries(PLATFORMS)
-            .filter(([k, v]) => canUsePlatform(k, interaction.user.id) && (!v.unavailable || (v.ownerOnly && ownerHere)))
-            .map(([k, v]) => ({ label: v.label, value: k, emoji: v.emojiButton }));
-        const row = new ActionRowBuilder().addComponents(
-            new StringSelectMenuBuilder().setCustomId('setup_platform_pick').setPlaceholder('Choose a platform…').addOptions(options)
-        );
-        return interaction.update(view(RED, ['## Notifyer setup - Add an account', 'Which platform is the account on?'], [row]));
+        return interaction.update(addPlatformView(interaction.user.id));
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'setup_platform_pick') {
@@ -526,11 +540,44 @@ client.on('interactionCreate', async interaction => {
         const platform = interaction.values[0];
         if (!canUsePlatform(platform, interaction.user.id)) return interaction.update({ content: '❌ That platform is not available yet.', components: [] });
         pendingSetupPicks.set(`${guildId}_${interaction.user.id}`, { platform, expires: Date.now() + SETUP_PICK_TTL_MS });
+        if (platform === 'rss') {
+            // RSS: pick a ready-made source (Reddit, GitHub, ...) or a custom address
+            const menu = new StringSelectMenuBuilder().setCustomId('setup_rsspreset').setPlaceholder('Choose a source\u2026')
+                .addOptions([...PRESETS.map(p => ({ label: p.label, value: p.id, description: `Example: ${p.example}`.slice(0, 100) })), { label: 'Custom URL', value: 'custom', description: 'A feed, or any website that has one' }]);
+            return interaction.update(view(RED, ['## Add an account - RSS source', 'Pick a source and type one value, or choose **Custom URL** to paste a feed or any website link.'], [new ActionRowBuilder().addComponents(menu)]));
+        }
         const modal = new ModalBuilder().setCustomId('setup_handle_modal').setTitle(`Add a ${PLATFORMS[platform].label} account`)
             .addComponents(new ActionRowBuilder().addComponents(
                 new TextInputBuilder().setCustomId('handle').setLabel('Username, handle, or profile URL').setStyle(TextInputStyle.Short).setRequired(true)
             ));
         return interaction.showModal(modal);
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'setup_rsspreset') {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '\u274c No permission.', flags: [MessageFlags.Ephemeral] });
+        const key = `${guildId}_${interaction.user.id}`;
+        const pending = pendingSetupPicks.get(key);
+        if (!pending || pending.expires < Date.now()) { pendingSetupPicks.delete(key); return interaction.update({ content: '\u274c This session expired \u2014 run /social add again.', components: [] }); }
+        const choice = interaction.values[0];
+        const preset = PRESETS.find(p => p.id === choice);
+        pendingSetupPicks.set(key, { ...pending, preset: preset ? preset.id : null, expires: Date.now() + SETUP_PICK_TTL_MS });
+        if (!preset) {
+            return interaction.showModal(new ModalBuilder().setCustomId('setup_handle_modal').setTitle('Add an RSS feed').addComponents(new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId('handle').setLabel('Website or feed link').setPlaceholder('https://example.com/blog').setStyle(TextInputStyle.Short).setRequired(true))));
+        }
+        return interaction.showModal(new ModalBuilder().setCustomId('setup_preset_modal').setTitle(preset.label.slice(0, 45)).addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('handle').setLabel(preset.ask.slice(0, 45)).setPlaceholder(preset.example.slice(0, 100)).setStyle(TextInputStyle.Short).setRequired(true))));
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'setup_preset_modal') {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '\u274c No permission.', flags: [MessageFlags.Ephemeral] });
+        const key = `${guildId}_${interaction.user.id}`;
+        const pending = pendingSetupPicks.get(key);
+        if (!pending || !pending.preset || pending.expires < Date.now()) { pendingSetupPicks.delete(key); return interaction.reply({ content: '\u274c This session expired \u2014 run /social add again.', flags: [MessageFlags.Ephemeral] }); }
+        const built = expandPreset(pending.preset, interaction.fields.getTextInputValue('handle'));
+        if (!built.ok) return interaction.reply({ content: built.message, flags: [MessageFlags.Ephemeral] });
+        pendingSetupPicks.set(key, { ...pending, rawHandle: built.url, expires: Date.now() + SETUP_PICK_TTL_MS });
+        return interaction.reply({ ...channelStepView(built.url), flags: [MessageFlags.Ephemeral] });
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'setup_handle_modal') {
@@ -539,14 +586,11 @@ client.on('interactionCreate', async interaction => {
         const pending = pendingSetupPicks.get(key);
         if (!pending || pending.expires < Date.now()) {
             pendingSetupPicks.delete(key);
-            return interaction.reply({ content: '❌ This setup session expired — run `/setup` again.', flags: [MessageFlags.Ephemeral] });
+            return interaction.reply({ content: '❌ This session expired — run `/social add` again.', flags: [MessageFlags.Ephemeral] });
         }
         const rawHandle = interaction.fields.getTextInputValue('handle').trim();
         pendingSetupPicks.set(key, { ...pending, rawHandle, expires: Date.now() + SETUP_PICK_TTL_MS });
-        const row = new ActionRowBuilder().addComponents(
-            new ChannelSelectMenuBuilder().setCustomId('setup_channel_pick').setPlaceholder('Choose a channel for notifications…').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-        );
-        return interaction.reply({ ...view(RED, ['## Notifyer setup - Channel', `Got it — **${rawHandle}**. Which channel should notifications post to?`], [row]), flags: [MessageFlags.Ephemeral] });
+        return interaction.reply({ ...channelStepView(rawHandle), flags: [MessageFlags.Ephemeral] });
     }
 
     if (interaction.isChannelSelectMenu() && interaction.customId === 'setup_channel_pick') {
@@ -555,17 +599,25 @@ client.on('interactionCreate', async interaction => {
         const pending = pendingSetupPicks.get(key);
         if (!pending || !pending.rawHandle || pending.expires < Date.now()) {
             pendingSetupPicks.delete(key);
-            return interaction.update({ content: '❌ This setup session expired — run `/setup` again.', components: [] });
+            return interaction.update({ content: '❌ This session expired — run `/social add` again.', components: [] });
         }
         pendingSetupPicks.delete(key);
-        const channelId = interaction.values[0];
-        const channel = interaction.guild.channels.cache.get(channelId);
-        await interaction.update(view(RED, ['## Notifyer setup - Adding', 'Setting that up\u2026']));
-        if (!canUsePlatform(pending.platform, interaction.user.id)) return interaction.editReply({ content: '❌ That platform is not available yet.' });
+        const channelIds = [...new Set(interaction.values)];
+        await interaction.update(view(RED, ['## Add an account - Adding', 'Setting that up\u2026']));
+        if (!canUsePlatform(pending.platform, interaction.user.id)) return interaction.editReply({ content: '\u274c That platform is not available yet.' });
         const bypassUnavailable = Boolean(PLATFORMS[pending.platform]?.ownerOnly && isOwner(interaction.user.id));
-        const result = await createWatchFlow(guildId, pending.platform, pending.rawHandle, channelId, interaction.user.tag, bypassUnavailable, interaction.user.id);
-        if (!result.ok) return interaction.editReply({ content: result.message });
-        const v = buildAddWatchSuccessResponse(result.watch, result.post, result.handle, channel);
+        // Each channel is its own watch (the same account can post to several channels), so the account is added once per channel.
+        const added = [], failed = [];
+        for (const channelId of channelIds) {
+            const result = await createWatchFlow(guildId, pending.platform, pending.rawHandle, channelId, interaction.user.tag, bypassUnavailable, interaction.user.id);
+            (result.ok ? added : failed).push({ channelId, result });
+        }
+        if (!added.length) return interaction.editReply({ content: failed[0].result.message });
+        const first = added[0].result;
+        const notes = [];
+        if (added.length > 1) notes.push(`Added to ${added.length} channels, each as its own watch. The steps below set up the first one (<#${added[0].channelId}>). Use \`/social customize\`, then **Apply to\u2026**, to give the others the same look.`);
+        if (failed.length) notes.push(`Not added: ${failed.map(f => `<#${f.channelId}> (${String(f.result.message).replace(/^\S+\s*/, '').slice(0, 120)})`).join(', ')}`);
+        const v = buildAddWatchSuccessResponse(first.watch, first.post, first.handle, added.map(a => `<#${a.channelId}>`).join(', '), notes);
         return interaction.editReply({ ...v });
     }
 
@@ -706,3 +758,5 @@ client.on('interactionCreate', async interaction => {
       } catch {}
   }
 });
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

@@ -69,6 +69,6 @@ function wrapInteraction(interaction) {
     return interaction;
 }
 
-module.exports = { GREEN, ORANGE, RED, box, clip, toInt, toV2Payload, view, wrapInteraction };
+module.exports = { GREEN, ORANGE, RED, box, clip, toInt, toV2Payload, view, wrapInteraction, isV2Part };
 
 // build-marker: ui-v3

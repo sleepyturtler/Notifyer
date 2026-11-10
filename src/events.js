@@ -23,14 +23,12 @@ client.once(Events.ClientReady, async () => {
     console.log(`✅ Social notify bot online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Refreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
     const socialCommand = new SlashCommandBuilder().setName('social').setDescription('Manage social media notifications')
-        .addSubcommand(s => s.setName('add').setDescription('Track a new account')
-            .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true).setAutocomplete(true))
-            .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
-            .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(s => s.setName('add').setDescription('Add an account to track (a guided flow)'))
         .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
         .addSubcommand(s => s.setName('customize').setDescription("Preview and customize how a tracked account's notifications look")
             .addIntegerOption(o => o.setName('watch').setDescription('The watch to customize (skips the picker)').setAutocomplete(true)))
         .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
+        .addSubcommand(s => s.setName('status').setDescription('See problems with your tracked accounts and how each platform is doing'))
         .addSubcommand(s => s.setName('link').setDescription('Connect an Instagram or TikTok account via OAuth so it can be tracked')
             .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
                 .addChoices({ name: '📸 Instagram', value: 'instagram' }, { name: '🎵 TikTok', value: 'tiktok' })))

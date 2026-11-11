@@ -1,0 +1,123 @@
+// Discord client ready + guildCreate handlers (command registration, poll loops start).
+// Moved verbatim out of the former single-file index.js; only the require/export lines are new.
+
+const { ActivityType, ChannelType, Events, SlashCommandBuilder } = require('discord.js');
+const { client } = require('./client.js');
+const { pollAll } = require('./poller.js');
+const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, TRANSFER_ENABLED } = require('./config.js');
+const { announceSupportServer } = require('./announcements.js');
+const { getConfig, saveConfig } = require('./db.js');
+const { cancelQueuedPurge, purgeOrphanedGuilds, queueGuildPurge, sweepRemovedGuilds, sweepUnusedLinks } = require('./guildCleanup.js');
+const fs = require('fs');
+const path = require('path');
+// Beta-only owner/debug commands (see debugTools.js) — present only on builds that
+// opted in by having that file in src/. Checked once here so a missing file is a
+// deliberate, expected release-build state, not a silently-swallowed error.
+const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
+const { setCommandIds } = require('./commands.js');
+const transfer = require('./transfer.js');
+const { startHealthChecks } = require('./health.js');
+
+// ── Bot ready ──────────────────────────────────────────────────────────────
+// Events.ClientReady is 'ready' on older discord.js 14.x and 'clientReady' on newer ones; using the
+// enum means the handler fires on either (a hardcoded name never fires on the other).
+client.once(Events.ClientReady, async () => {
+    console.log(`✅ Social notify bot online as ${client.user.tag}`);
+    client.user.setPresence({ activities: [{ name: 'Refreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
+    const socialCommand = new SlashCommandBuilder().setName('social').setDescription('Manage social media notifications')
+        .addSubcommand(s => s.setName('add').setDescription('Add an account to track (a guided flow)'))
+        .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
+        .addSubcommand(s => s.setName('customize').setDescription("Preview and customize how a tracked account's notifications look")
+            .addIntegerOption(o => o.setName('watch').setDescription('The watch to customize (skips the picker)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
+        .addSubcommand(s => s.setName('status').setDescription('See problems with your tracked accounts and how each platform is doing'))
+        .addSubcommand(s => s.setName('link').setDescription('Connect an Instagram or TikTok account via OAuth so it can be tracked')
+            .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
+                .addChoices({ name: '📸 Instagram', value: 'instagram' }, { name: '🎵 TikTok', value: 'tiktok' })))
+        .addSubcommand(s => s.setName('links').setDescription('View accounts linked via OAuth in this server'))
+        .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications'));
+    // /transfer: copy another notification bot's watches (see transfer.js). Part of the bot only when TRANSFER_ENABLED=true;
+    // otherwise the command isn't registered at all (registering replaces the whole list, so a previously registered /transfer disappears).
+    const transferCommand = new SlashCommandBuilder().setName('transfer').setDescription("Move your watches over from another notification bot")
+        .addSubcommand(s => s.setName('start').setDescription("Start copying another bot's notifications into paused watches")
+            .addChannelOption(o => o.setName('channel').setDescription('The channel where your current notification bot posts').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+            .addUserOption(o => o.setName('bot').setDescription('The notification bot to copy').setRequired(true)))
+        .addSubcommand(s => s.setName('status').setDescription('See what has been copied so far')
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('rescan').setDescription("Read the channel's recent history again")
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('finish').setDescription('End the transfer period and switch on every copied watch')
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('cancel').setDescription('Stop the transfer and delete the copied watches that are still paused')
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)));
+    const commands = [
+        new SlashCommandBuilder().setName('invite').setDescription('Get a link to invite this bot to another server'),
+        new SlashCommandBuilder().setName('help').setDescription('View commands and features'),
+        new SlashCommandBuilder().setName('setup').setDescription('New here? Get a quick walkthrough and set up your first tracked account'),
+        socialCommand,
+        ...(TRANSFER_ENABLED ? [transferCommand] : []),
+    ];
+    // Adds /social debug, /social oauthdebug, and /killbot only on builds that have
+    // debugTools.js — mutates socialCommand in place and pushes killbot onto commands.
+    if (debugTools) debugTools.extendCommands(socialCommand, commands);
+    const registered = await client.application.commands.set(commands).catch(e => { console.error('command registration:', e); return null; });
+    // Commands in the bot's own messages become clickable once their ids are known (commands.js). If registration just
+    // failed, the already-registered ones are still usable, so ask Discord for those instead.
+    setCommandIds(registered || await client.application.commands.fetch().catch(() => null));
+
+    startHealthChecks(client); // hourly report in the logs (health.js)
+    await transfer.init().catch(e => console.error('transfer init:', e.message)); // transfers still running from before a restart
+
+    // Drop data for servers the bot is no longer in (left while offline, or from before this existed)
+    // before polling starts, so they aren't polled for nothing. Guarded; see guildCleanup.js.
+    await purgeOrphanedGuilds().catch(e => console.error('orphan sweep:', e.message));
+    sweepUnusedLinks();
+    setInterval(sweepUnusedLinks, 6 * 60 * 60 * 1000);
+    sweepRemovedGuilds();
+    setInterval(sweepRemovedGuilds, 6 * 60 * 60 * 1000);
+
+    // Start polling — two independent cadences, see FAST/SLOW_POLL_* above.
+    pollAll(FAST_POLL_PLATFORMS).catch(e => console.error('initial fast poll:', e.message));
+    pollAll(SLOW_POLL_PLATFORMS).catch(e => console.error('initial slow poll:', e.message));
+    setInterval(() => pollAll(FAST_POLL_PLATFORMS).catch(e => console.error('fast poll loop:', e.message)), FAST_POLL_INTERVAL_MS);
+    setInterval(() => pollAll(SLOW_POLL_PLATFORMS).catch(e => console.error('slow poll loop:', e.message)), SLOW_POLL_INTERVAL_MS);
+
+    // Announce the support server to existing guilds, once each.
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            const cfg = await getConfig(guild.id);
+            if (cfg.supportAnnounced) continue;
+            if (await announceSupportServer(guild)) { // only mark it done if it was actually sent
+                cfg.supportAnnounced = true;
+                saveConfig(guild.id, cfg);
+            }
+        } catch (e) {
+            console.error(`support announce (${guild.id}):`, e.message);
+        }
+        await new Promise(r => setTimeout(r, 1000)); // light stagger to avoid rate limits
+    }
+
+});
+
+// The bot was removed from a server (kicked, left, or the server was deleted): start the grace period after which what we
+// stored for it is deleted. discord.js reports a temporary outage as a separate event, but guard against an unavailable guild anyway.
+client.on(Events.GuildDelete, guild => {
+    if (guild.available === false) return;
+    queueGuildPurge(guild.id, 'the bot was removed from the server');
+});
+
+client.on('guildCreate', async (guild) => {
+    cancelQueuedPurge(guild.id); // re-added within the grace period: keep everything
+    try {
+        const cfg = await getConfig(guild.id);
+        if (cfg.supportAnnounced) return;
+        if (await announceSupportServer(guild)) {
+            cfg.supportAnnounced = true;
+            saveConfig(guild.id, cfg);
+        }
+    } catch (e) {
+        console.error(`guildCreate announce (${guild.id}):`, e.message);
+    }
+});
+
+// build-marker: ui-v3 (check-requires.js reports any file missing this, i.e. an older copy pasted next to newer ones)

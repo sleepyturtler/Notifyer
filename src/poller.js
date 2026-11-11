@@ -11,6 +11,7 @@ const { computeInterval, hasAdaptivePolling, nextBackoff, pollDue } = require('.
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { BULK_FETCHERS } = require('./platforms/index.js');
 const { reportAccountNotFound, reportLinkProblem } = require('./announcements.js');
+const { noteCheck } = require('./health.js');
 
 // ── Polling loop ───────────────────────────────────────────────────────────
 const PLATFORM_MIN_INTERVAL_MS = {};
@@ -317,7 +318,9 @@ async function pollAll(platforms = null, onlyGuildId = null) {
                         await touchLastChecked(w.id);
                     }
                 }
+                noteCheck(w.platform, true); // for /social status and the hourly log report
             } catch (e) {
+                noteCheck(w.platform, false, e.message);
                 if (e.youtubeQuota) {
                     if (noteQuotaOnce()) reportYouTubeQuota(e.resumeAt);
                 } else if (/HTTP 429/.test(e.message)) {

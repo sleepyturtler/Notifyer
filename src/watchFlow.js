@@ -4,7 +4,7 @@
 const { ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { PLATFORMS, PLATFORM_NOTIFY_TYPES } = require('./config.js');
 const { normalizeHandle, watchName } = require('./helpers.js');
-const { addWatch, getSocialLinkByUsername, getWatches, markWatchSeeded, setWatchSocialLink, updateLastPost } = require('./db.js');
+const { addWatch, getSocialLinkById, getSocialLinkByUsername, getWatches, markWatchSeeded, setWatchSocialLink, updateLastPost } = require('./db.js');
 const { fetchLatestInstagramAll, fetchLatestTikTokAll } = require('./platforms/social.js');
 const { BULK_FETCHERS } = require('./platforms/index.js');
 const { fetchLatestYouTubeEntries } = require('./platforms/youtube.js');
@@ -119,6 +119,32 @@ async function createWatchFlow(guildId, platform, rawHandle, channelId, addedByT
     return { ok: true, watch, post, handle };
 }
 
+// Records everything the account has posted so far as already seen: the same baseline createWatchFlow sets when a watch is added, so the
+// first real poll only announces what is new. For a watch that was created paused and is switched on later (a transfer), because posts
+// made in the meantime were already announced by whatever else was watching. Resolves to true when it worked, false when the fetch failed
+// (the watch is left with no baseline, and the poller's own silent first check seeds it on its next pass instead).
+async function seedWatchBaseline(watch) {
+    try {
+        let posts = [];
+        if (PLATFORMS[watch.platform]?.oauth) {
+            const link = watch.social_link_id ? await getSocialLinkById(watch.social_link_id) : null;
+            if (!link || link.needs_relink_at) throw new Error('the linked account is missing or needs to be re-linked');
+            posts = watch.platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
+        } else if (BULK_FETCHERS[watch.platform]) {
+            posts = await BULK_FETCHERS[watch.platform](watch.handle);
+        } else if (watch.platform === 'youtube') {
+            posts = await fetchLatestYouTubeEntries(watch);
+        }
+        // Nothing found yet gets the same 'baseline' marker as in createWatchFlow, so that the first thing that ever appears is announced.
+        await updateLastPost(watch.id, posts[0]?.id || 'baseline', posts.map(p => p.id));
+        if (watch.platform === 'twitter' && posts.length) await markWatchSeeded(watch.id);
+        return true;
+    } catch (e) {
+        console.error(`baseline for ${watch.platform}/${watch.handle} (watch ${watch.id}):`, e.message);
+        return false;
+    }
+}
+
 // Builds the same "Now Tracking" + next-step (type picker or message-set button)
 // response used right after a watch is created, regardless of whether it came
 // from /social add or the /setup wizard.
@@ -166,4 +192,4 @@ function buildAddWatchSuccessResponse(watch, post, handle, channel) {
     return { components: [success, choose, typeRow, skipRow] };
 }
 
-module.exports = { buildAddWatchSuccessResponse, createWatchFlow };
+module.exports = { buildAddWatchSuccessResponse, createWatchFlow, seedWatchBaseline };

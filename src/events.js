@@ -4,7 +4,7 @@
 const { ActivityType, ChannelType, Events, SlashCommandBuilder } = require('discord.js');
 const { client } = require('./client.js');
 const { pollAll } = require('./poller.js');
-const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS } = require('./config.js');
+const { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, TRANSFER_ENABLED } = require('./config.js');
 const { announceSupportServer } = require('./announcements.js');
 const { getConfig, saveConfig } = require('./db.js');
 const { cancelQueuedPurge, purgeOrphanedGuilds, queueGuildPurge, sweepRemovedGuilds, sweepUnusedLinks } = require('./guildCleanup.js');
@@ -15,6 +15,8 @@ const path = require('path');
 // deliberate, expected release-build state, not a silently-swallowed error.
 const debugTools = fs.existsSync(path.join(__dirname, 'debugTools.js')) ? require('./debugTools.js') : null;
 const { setCommandIds } = require('./commands.js');
+const transfer = require('./transfer.js');
+const { startHealthChecks } = require('./health.js');
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
 // Events.ClientReady is 'ready' on older discord.js 14.x and 'clientReady' on newer ones; using the
@@ -34,11 +36,26 @@ client.once(Events.ClientReady, async () => {
                 .addChoices({ name: '📸 Instagram', value: 'instagram' }, { name: '🎵 TikTok', value: 'tiktok' })))
         .addSubcommand(s => s.setName('links').setDescription('View accounts linked via OAuth in this server'))
         .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications'));
+    // /transfer: copy another notification bot's watches (see transfer.js). Part of the bot only when TRANSFER_ENABLED=true;
+    // otherwise the command isn't registered at all (registering replaces the whole list, so a previously registered /transfer disappears).
+    const transferCommand = new SlashCommandBuilder().setName('transfer').setDescription("Move your watches over from another notification bot")
+        .addSubcommand(s => s.setName('start').setDescription("Start copying another bot's notifications into paused watches")
+            .addChannelOption(o => o.setName('channel').setDescription('The channel where your current notification bot posts').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+            .addUserOption(o => o.setName('bot').setDescription('The notification bot to copy').setRequired(true)))
+        .addSubcommand(s => s.setName('status').setDescription('See what has been copied so far')
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('rescan').setDescription("Read the channel's recent history again")
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('finish').setDescription('End the transfer period and switch on every copied watch')
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)))
+        .addSubcommand(s => s.setName('cancel').setDescription('Stop the transfer and delete the copied watches that are still paused')
+            .addIntegerOption(o => o.setName('transfer').setDescription('Which transfer (only needed if several are running)').setAutocomplete(true)));
     const commands = [
         new SlashCommandBuilder().setName('invite').setDescription('Get a link to invite this bot to another server'),
         new SlashCommandBuilder().setName('help').setDescription('View commands and features'),
         new SlashCommandBuilder().setName('setup').setDescription('New here? Get a quick walkthrough and set up your first tracked account'),
         socialCommand,
+        ...(TRANSFER_ENABLED ? [transferCommand] : []),
     ];
     // Adds /social debug, /social oauthdebug, and /killbot only on builds that have
     // debugTools.js — mutates socialCommand in place and pushes killbot onto commands.
@@ -47,6 +64,9 @@ client.once(Events.ClientReady, async () => {
     // Commands in the bot's own messages become clickable once their ids are known (commands.js). If registration just
     // failed, the already-registered ones are still usable, so ask Discord for those instead.
     setCommandIds(registered || await client.application.commands.fetch().catch(() => null));
+
+    startHealthChecks(client); // hourly report in the logs (health.js)
+    await transfer.init().catch(e => console.error('transfer init:', e.message)); // transfers still running from before a restart
 
     // Drop data for servers the bot is no longer in (left while offline, or from before this existed)
     // before polling starts, so they aren't polled for nothing. Guarded; see guildCleanup.js.

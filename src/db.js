@@ -198,6 +198,23 @@ async function initDB() {
     await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS display_name TEXT'); // RSS: the feed title, shown instead of the URL
     // Servers the bot was removed from, waiting out the grace period before their data is deleted.
     await pool.query('CREATE TABLE IF NOT EXISTS guild_purge_queue (guild_id TEXT PRIMARY KEY, delete_after BIGINT NOT NULL, queued_at BIGINT NOT NULL, reason TEXT)');
+    // /transfer: copying another notification bot's watches. One row per transfer; the watches it created carry its id and stay paused until it finishes.
+    await pool.query(`CREATE TABLE IF NOT EXISTS transfers (
+        id SERIAL PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        source_bot_id TEXT NOT NULL,
+        started_by TEXT,
+        started_at BIGINT NOT NULL,
+        ended_at BIGINT,
+        status TEXT NOT NULL DEFAULT 'active',
+        messages_seen INTEGER NOT NULL DEFAULT 0,
+        unrecognized INTEGER NOT NULL DEFAULT 0,
+        skipped JSONB NOT NULL DEFAULT '[]'
+    )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS transfers_guild ON transfers(guild_id)');
+    await pool.query('ALTER TABLE watches ADD COLUMN IF NOT EXISTS transfer_id INTEGER');
+    await pool.query('CREATE INDEX IF NOT EXISTS watches_transfer ON watches(transfer_id)');
     await pool.query('CREATE INDEX IF NOT EXISTS watches_social_link ON watches(social_link_id)');
     await pool.query('CREATE INDEX IF NOT EXISTS watches_youtube_channel ON watches(youtube_channel_id)');
     await ensureUniqueWatches();
@@ -488,6 +505,7 @@ async function deleteGuildData(guildId) {
         await conn.query('DELETE FROM configs WHERE guild_id = $1', [guildId]);
         await conn.query('DELETE FROM social_link_approvals WHERE guild_id = $1', [guildId]);
         await conn.query('DELETE FROM guild_purge_queue WHERE guild_id = $1', [guildId]);
+        await conn.query('DELETE FROM transfers WHERE guild_id = $1', [guildId]);
         await conn.query('DELETE FROM youtube_subscriptions WHERE channel_id NOT IN (SELECT youtube_channel_id FROM watches WHERE youtube_channel_id IS NOT NULL)');
         await conn.query('COMMIT');
         configCache.delete(guildId);
@@ -498,6 +516,83 @@ async function deleteGuildData(guildId) {
     } finally {
         conn.release();
     }
+}
+
+// ── Transfers (copying another bot's watches, see transfer.js) ──────────────
+async function createTransfer({ guildId, channelId, sourceBotId, startedBy }) {
+    const res = await pool.query(
+        'INSERT INTO transfers (guild_id, channel_id, source_bot_id, started_by, started_at) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [guildId, channelId, sourceBotId, startedBy, Date.now()]
+    );
+    return res.rows[0];
+}
+
+const transferRow = r => (r ? { ...r, started_at: Number(r.started_at), ended_at: r.ended_at === null ? null : Number(r.ended_at), skipped: Array.isArray(r.skipped) ? r.skipped : [] } : null);
+
+async function getTransfer(guildId, id) {
+    return transferRow((await pool.query('SELECT * FROM transfers WHERE guild_id = $1 AND id = $2', [guildId, id])).rows[0]);
+}
+
+async function getTransfers(guildId, status = null) {
+    const res = status
+        ? await pool.query('SELECT * FROM transfers WHERE guild_id = $1 AND status = $2 ORDER BY id', [guildId, status])
+        : await pool.query('SELECT * FROM transfers WHERE guild_id = $1 ORDER BY id', [guildId]);
+    return res.rows.map(transferRow);
+}
+
+async function getActiveTransfers() {
+    return (await pool.query("SELECT * FROM transfers WHERE status = 'active' ORDER BY id")).rows.map(transferRow);
+}
+
+async function setTransferStatus(id, status) {
+    await pool.query('UPDATE transfers SET status = $2, ended_at = $3 WHERE id = $1', [id, status, status === 'active' ? null : Date.now()]);
+}
+
+// Progress counters and the list of accounts that could not be copied (with why), written back after each message.
+async function saveTransferProgress(id, { messagesSeen, unrecognized, skipped }) {
+    await pool.query('UPDATE transfers SET messages_seen = $2, unrecognized = $3, skipped = $4 WHERE id = $1', [id, messagesSeen, unrecognized, JSON.stringify(skipped || [])]);
+}
+
+async function getTransferWatches(guildId, transferId) {
+    return (await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND transfer_id = $2 ORDER BY id', [guildId, transferId])).rows;
+}
+
+// Inserted paused and complete in one statement, so the poller can never see it half set up.
+// Resolves to null when the account is already watched in that channel (the unique index).
+async function addTransferWatch({ guildId, platform, handle, channelId, addedBy, transferId, messageTemplates, roleId, embedSettings, socialLinkId }) {
+    try {
+        const res = await pool.query(
+            `INSERT INTO watches (guild_id, platform, handle, channel_id, message_templates, role_id, embed_settings, social_link_id, added_by, added_at, active, transfer_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,$11) RETURNING *`,
+            [guildId, platform, handle, channelId,
+                messageTemplates && Object.keys(messageTemplates).length ? JSON.stringify(messageTemplates) : null,
+                roleId || null,
+                embedSettings && Object.keys(embedSettings).length ? JSON.stringify(embedSettings) : null,
+                socialLinkId ?? null, addedBy, Date.now(), transferId]
+        );
+        return res.rows[0];
+    } catch (e) {
+        if (e.code === '23505') return null;
+        throw e;
+    }
+}
+
+// Fills in what a later message of the old bot revealed about a watch this transfer made. Only the columns listed here can be changed.
+async function updateTransferWatchFields(id, fields) {
+    const sets = [], vals = [];
+    const add = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+    if ('message_templates' in fields) add('message_templates', fields.message_templates && Object.keys(fields.message_templates).length ? JSON.stringify(fields.message_templates) : null);
+    if ('embed_settings' in fields) add('embed_settings', fields.embed_settings && Object.keys(fields.embed_settings).length ? JSON.stringify(fields.embed_settings) : null);
+    if ('role_id' in fields) add('role_id', fields.role_id || null);
+    if (!sets.length) return;
+    vals.push(id);
+    await pool.query(`UPDATE watches SET ${sets.join(', ')} WHERE id = $${vals.length} AND transfer_id IS NOT NULL`, vals);
+}
+
+// Cancelling a transfer removes what it created, but not a watch an admin already switched on by hand.
+async function deletePausedTransferWatches(guildId, transferId) {
+    const res = await pool.query('DELETE FROM watches WHERE guild_id = $1 AND transfer_id = $2 AND active = FALSE', [guildId, transferId]);
+    return res.rowCount;
 }
 
 async function getWatch(guildId, id) {
@@ -554,4 +649,4 @@ async function touchLastChecked(id, errorMessage = null) {
     await pool.query('UPDATE watches SET last_checked = $1, last_error = $2 WHERE id = $3', [Date.now(), errorMessage, id]);
 }
 
-module.exports = { addWatch, approveLinkForGuild, cancelGuildPurge, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getQueuedGuildPurges, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markWatchSeeded, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, saveWatchCustomization, copyWatchCustomization, setWatchLiveState, scheduleGuildPurge, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };
+module.exports = { addTransferWatch, createTransfer, deletePausedTransferWatches, getActiveTransfers, getTransfer, getTransferWatches, getTransfers, saveTransferProgress, setTransferStatus, updateTransferWatchFields, addWatch, approveLinkForGuild, cancelGuildPurge, countOtherWatchesUsingLink, deleteGuildData, deleteSocialLink, ensureIPv4Pool, getAllWatches, getConfig, getLinkUsage, getPushCoveredYouTubeChannels, getQueuedGuildPurges, getSocialLinkById, getSocialLinkByUsername, getSocialLinksVisible, getStoredGuildIds, getWatch, getWatches, getWatchesByLink, getWatchesByYouTubeChannel, getYouTubeSubscription, hasLinkApproval, initDB, isLinkUsedInGuild, markSocialLinkDead, markWatchSeeded, markYouTubeSubscriptionVerified, migrateSocialLinks, planSocialLinkMerge, removeWatch, saveConfig, saveWatchCustomization, copyWatchCustomization, setWatchLiveState, scheduleGuildPurge, setWatchDisplayName, setWatchLiveMessage, setWatchPollInterval, setWatchSocialLink, setWatchYouTubeLiveVideo, sweepUnusedSocialLinks, touchLastChecked, updateLastPost, updateSocialLinkTokens, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole, updateWatchYouTubeIds, upsertSocialLink, upsertYouTubeSubscription };

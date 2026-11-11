@@ -4,7 +4,7 @@
 const { ButtonBuilder, ButtonStyle, ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { getPushCoveredYouTubeChannels, getSocialLinksVisible, getWatches } = require('./db.js');
 const { describePollFrequency } = require('./rssPoll.js');
-const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, activeTypeIds, linkablePlatforms } = require('./config.js');
+const { LEGAL_BASE_URL, PLATFORMS, PLATFORM_NOTIFY_TYPES, TRANSFER_ENABLED, activeTypeIds, linkablePlatforms } = require('./config.js');
 const { DEFAULT_BATCH_HEADER, MAX_BATCH_ENTRIES_PER_MESSAGE } = require('./batch.js');
 const { canWatchBatch, watchName } = require('./helpers.js');
 const { GREEN, ORANGE, RED, clip, toInt, view } = require('./v2.js');
@@ -253,6 +253,15 @@ const HELP_CATEGORIES = [
         ])],
     },
     {
+        id: 'transfer', label: 'Transfer',
+        build: () => ['Switching from another notification bot? Notifyer can copy its watches by reading the notifications it posts.', bullets([
+            { name: '/transfer start', value: 'Pick the channel your current bot posts in and the bot itself. I read its recent messages and every new one, and make a **paused** watch for each account (link, message text, embed color and look, ping role).' },
+            { name: '/transfer status', value: 'See what was copied and what could not be.' },
+            { name: '/transfer finish', value: 'End the transfer period (administrators): every copied watch is switched on. Turn the old bot off around then.' },
+            { name: '/transfer cancel', value: 'Stop and delete the copied watches that are still paused.' },
+        ])],
+    },
+    {
         id: 'settings', label: 'Settings',
         build: () => [bullets([
             { name: '/social access', value: 'Choose a role (besides admins) that can manage notifications.' },
@@ -270,6 +279,7 @@ const HELP_CATEGORIES = [
     },
 ];
 
+if (!TRANSFER_ENABLED) HELP_CATEGORIES.splice(HELP_CATEGORIES.findIndex(c => c.id === 'transfer'), 1); // /transfer is switched off
 if (debugTools) HELP_CATEGORIES.push(debugTools.getExtraHelpCategory());
 
 function buildHelpView(activeId) {

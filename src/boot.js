@@ -4,6 +4,7 @@
 require('./events.js'); // registers handlers / starts the server on load
 require('./interactions.js'); // registers handlers / starts the server on load
 require('./web/server.js'); // registers handlers / starts the server on load
+require('./transfer.js'); // registers the message listeners for /transfer (only when TRANSFER_ENABLED=true)
 const { ensureIPv4Pool, initDB } = require('./db.js');
 const { logStartupConfigSummary } = require('./config.js');
 const { client } = require('./client.js');

@@ -218,6 +218,14 @@ const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
 
 const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter', 'bluesky', 'rss']);
 
+// /transfer needs to read the messages another bot posts, which takes the privileged "Message Content" intent. Discord refuses
+// the login of a bot that asks for a privileged intent it has not been given, so this is opt-in: set TRANSFER_ENABLED=true AND turn
+// on "Message Content Intent" for the bot in the Developer Portal (Bot tab). Without it /transfer just explains how to enable it.
+const TRANSFER_ENABLED = process.env.TRANSFER_ENABLED === 'true';
+
+// /transfer start looks back this many messages in the channel (pages of 100) to find accounts the old bot already posted about.
+const TRANSFER_SCAN_PAGES = Math.min(10, Math.max(1, parseInt(process.env.TRANSFER_SCAN_PAGES, 10) || 3));
+
 const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
 
 const SEEN_HISTORY_SIZE = 20;
@@ -257,10 +265,13 @@ function logStartupConfigSummary() {
         else off('TikTok', 'TIKTOK_CLIENT_KEY/SECRET set, but PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) is missing — OAuth has nowhere to send the callback');
     } else off('TikTok', 'missing TIKTOK_CLIENT_KEY/TIKTOK_CLIENT_SECRET');
 
+    if (TRANSFER_ENABLED) lines.push('   ✅ /transfer (reads other bots\' notifications; needs Message Content Intent enabled in the Developer Portal)');
+    else lines.push('   ➖ /transfer is off (set TRANSFER_ENABLED=true and enable Message Content Intent to use it)');
+
     if (!PUBLIC_BASE_URL) lines.push('   ⚠️  YouTube WebSub push notifications also need PUBLIC_BASE_URL — falling back to polling-only for YouTube.');
     if (!process.env.BOT_OWNER_ID) lines.push('   ⚠️  BOT_OWNER_ID not set — /social debug, /social oauthdebug, and /killbot are unreachable by anyone.');
 
     console.log(`⚙️  Startup config summary:\n${lines.join('\n')}`);
 }
 
-module.exports = { FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, ADAPTIVE_POLL, GUILD_PURGE_GRACE_MS, SOCIAL_CHECK_COOLDOWN_MS, linkablePlatforms, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };
+module.exports = { TRANSFER_ENABLED, TRANSFER_SCAN_PAGES, FAST_POLL_INTERVAL_MS, FAST_POLL_PLATFORMS, LEGAL_BASE_URL, NITTER_INSTANCES, OAUTH_CONFIG, PLATFORMS, PLATFORM_NOTIFY_TYPES, PUBLIC_BASE_URL, SEEN_HISTORY_SIZE, SLOW_POLL_INTERVAL_MS, SLOW_POLL_PLATFORMS, SUPPORT_SERVER_URL, WEBSUB_HUB_URL, WEBSUB_VERIFY_TOKEN, websubSecretFor, YOUTUBE_API_KEY, YOUTUBE_PUSH_POLL_INTERVAL_MS, ADAPTIVE_POLL, GUILD_PURGE_GRACE_MS, SOCIAL_CHECK_COOLDOWN_MS, linkablePlatforms, canUnlinkLink, canUsePlatform, activeTypeIds, isOwner, logStartupConfigSummary };

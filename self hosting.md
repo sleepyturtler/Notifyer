@@ -46,6 +46,7 @@ You need your own Discord bot application, your own Render (or other host) servi
 | Variable | What it's for |
 |---|---|
 | `PUBLIC_BASE_URL` | The public URL your bot is reachable at (e.g. `https://yourbot.onrender.com`). Needed for Instagram/TikTok OAuth callbacks and YouTube WebSub push subscriptions. Falls back to `RENDER_EXTERNAL_URL` if unset, which Render sets automatically on its own services. Without either, OAuth linking and WebSub push are silently disabled (routine polling still works). |
+| `TRANSFER_ENABLED` | Optional. Set to `true` to turn on `/transfer` (copying another notification bot's watches). It makes the bot read messages, which needs the privileged **Message Content Intent**: switch it on for the bot in the Discord Developer Portal (Bot tab) *before* setting this, otherwise Discord refuses the bot's login. Bots in 100+ servers need Discord's approval for that intent. `TRANSFER_SCAN_PAGES` (default 3, max 10) sets how many pages of 100 past messages `/transfer start` looks through. |
 | `BOT_OWNER_ID` | Your Discord user ID. Gates the owner-only debug commands (`/social debug`, `/social oauthdebug`, `/killbot`), which only exist while `src/debugTools.js` is present. It is also who gets a DM if every Twitter mirror goes down at once. Without it, those commands refuse everyone. |
 | `PORT` | The port the built-in HTTP server (health check, OAuth callbacks, legal pages) listens on. Defaults to `3000`, and most hosts (including Render) set this automatically. |
 

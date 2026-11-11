@@ -9,7 +9,8 @@ const { E, canWatchBatch, watchName } = require('./helpers.js');
 const { WATCHES_PER_PAGE, buildBatchHeaderModal, buildBatchSettingsView, buildHelpView, buildManageView, buildPerTypeMessageModal, buildSetupView, buildSocialLinkManageView, buildSocialLinksEmbed, buildWatchListEmbed } = require('./ui.js');
 const { countOtherWatchesUsingLink, deleteSocialLink, getConfig, getLinkUsage, getSocialLinkById, getWatch, getWatches, getWatchesByLink, isLinkUsedInGuild, removeWatch, saveConfig, updateWatchActive, updateWatchBatchDisabled, updateWatchBatchHeader, updateWatchChannel, updateWatchMessageTemplates, updateWatchNotifyTypes, updateWatchRole } = require('./db.js');
 const { hasCommandPermission } = require('./permissions.js');
-const { buildAddWatchSuccessResponse, createWatchFlow } = require('./watchFlow.js');
+const { buildAddWatchSuccessResponse, createWatchFlow, seedWatchBaseline } = require('./watchFlow.js');
+const transfer = require('./transfer.js');
 const { pollAll } = require('./poller.js');
 const { reportLinkProblem } = require('./announcements.js');
 const { handleLinkRequestButton } = require('./linkRequests.js');
@@ -86,12 +87,14 @@ client.on('interactionCreate', async interaction => {
     if (!guildId) return;
     wrapInteraction(interaction); // makes replies with V2 components valid (flag, content line); see v2.js
     if (!interaction.isAutocomplete() && !interaction.isChatInputCommand() && await handleCustomizerInteraction(interaction, { guildId, hasPermission: hasCommandPermission })) return;
+    if (interaction.isButton() && await transfer.handleComponent(interaction, { guildId })) return; // /transfer finish and /transfer cancel confirmations
     const reply = (payload) => {
         const opts = typeof payload === 'string' ? { content: payload, flags: [MessageFlags.Ephemeral] } : payload;
         return interaction.replied || interaction.deferred ? interaction.editReply(opts) : interaction.reply(opts);
     };
 
     if (interaction.isAutocomplete()) {
+        if (interaction.commandName === 'transfer') return transfer.handleAutocomplete(interaction, guildId);
         // /social customize watch:<…>. Only people who can use the command see the watch names.
         if (interaction.commandName === 'social' && interaction.options.getSubcommand() === 'customize') {
             if (!await hasCommandPermission(interaction, guildId)) return interaction.respond([]);
@@ -132,6 +135,8 @@ client.on('interactionCreate', async interaction => {
             const watches = await getWatches(guildId);
             return reply({ ...buildSetupView(watches.length ? 'track' : 'welcome', watches.length), flags: [MessageFlags.Ephemeral] });
         }
+
+        if (commandName === 'transfer') return transfer.handleCommand(interaction, { guildId, reply });
 
         if (commandName === 'social') {
             const sub = interaction.options.getSubcommand();
@@ -210,7 +215,7 @@ client.on('interactionCreate', async interaction => {
                 return reply({ ...v, flags: [MessageFlags.Ephemeral] });
             }
         }
-        if (commandName === 'invite' || commandName === 'help' || commandName === 'social') return;
+        if (commandName === 'invite' || commandName === 'help' || commandName === 'social' || commandName === 'transfer') return;
     }
 
     // Beta-only: /killbot — see debugTools.js. Entirely absent as a registered
@@ -445,6 +450,9 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'toggle') {
+            // A watch a /transfer made has no baseline until it is switched on. Resuming one by hand gives it one first, so it doesn't
+            // announce what the old bot already announced.
+            if (!w.active && w.transfer_id && w.last_post_id === null) await seedWatchBaseline(w);
             await updateWatchActive(guildId, id, !w.active);
             const updated = await getWatch(guildId, id);
             const v = buildManageView(updated);

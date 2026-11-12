@@ -9,6 +9,7 @@
 // made. So duplicates are detected by ID only, never by date or by "newer than the last ID seen".
 
 const { NITTER_INSTANCES } = require('../config.js');
+const { noteMirror } = require('../health.js');
 const { fetchText, xmlParser } = require('../net.js');
 
 // Must not exceed SEEN_HISTORY_SIZE (config.js): items beyond it would fall out of the seen list and be re-announced.
@@ -90,6 +91,8 @@ async function fetchLatestTwitterAll(handle) {
     // newest tweet, since individual instances are often stale/cached.
     const instances = NITTER_INSTANCES;
     const results = await Promise.allSettled(instances.map(base => fetchMirror(base, handle)));
+    // per-mirror results for /social status and the hourly log report
+    results.forEach((r, i) => noteMirror(instances[i], r.status === 'fulfilled', r.status === 'fulfilled' ? null : (r.reason?.message || r.reason?.code || r.reason?.name || 'connection failed')));
 
     const successes = results.filter(r => r.status === 'fulfilled').map(r => r.value);
     if (!successes.length) {

@@ -2,6 +2,7 @@
 // Nothing here is stored: a restart starts the picture again, which is fine for "is it working right now".
 
 const platforms = new Map(); // platform -> { at, checked, failed, lastError, lastErrorAt }
+const lastMirrorReport = new Map(); // base URL -> { ok, fail } at the previous hourly report
 const lastReport = new Map(); // platform -> { checked, failed } at the previous hourly report, so each report shows only its own hour
 const mirrors = new Map();   // base URL -> { ok, fail, streak, lastOk, lastFail, lastError }
 
@@ -23,7 +24,7 @@ function noteMirror(base, ok, error = null) {
 
 const platformStats = () => new Map([...platforms].map(([k, v]) => [k, { ...v }]));
 const mirrorStats = () => new Map([...mirrors].map(([k, v]) => [k, { ...v }]));
-function reset() { platforms.clear(); mirrors.clear(); lastReport.clear(); }
+function reset() { platforms.clear(); mirrors.clear(); lastReport.clear(); lastMirrorReport.clear(); }
 
 // ── Hourly report in the logs ───────────────────────────────────────────────
 // Once an hour (HEALTH_REPORT_INTERVAL_MS to change it) one block goes to the console: uptime, memory, servers, watches, and how each
@@ -34,6 +35,13 @@ let started = false;
 const fmtDuration = s => {
     const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
     return `${d ? `${d}d ` : ''}${h || d ? `${h}h ` : ''}${m}m`;
+};
+
+// Keeps a log line readable: the combined "all Nitter instances failed" text already has its own per-mirror lines in the report.
+const shortError = (msg, max = 100) => {
+    const m = String(msg);
+    if (m.startsWith('All Nitter instances failed')) return 'all Nitter mirrors failed';
+    return m.length > max ? `${m.slice(0, max - 1)}…` : m;
 };
 
 async function buildReport(client) {
@@ -58,12 +66,21 @@ async function buildReport(client) {
         const checked = now.checked - prev.checked, failed = now.failed - prev.failed;
         lastReport.set(platform, { checked: now.checked, failed: now.failed });
         if (!checked) continue;
-        rows.push(`   ${platform}: ${checked} checks, ${failed} failed${failed && now.lastError ? ` (last: ${now.lastError})` : ''}`);
+        rows.push(`   ${platform}: ${checked} checks, ${failed} failed${failed && now.lastError ? ` (last: ${shortError(now.lastError)})` : ''}`);
     }
     lines.push(rows.length ? `   polling this hour:\n${rows.join('\n')}` : '   polling this hour: no checks recorded');
 
-    const bad = [...mirrorStats()].filter(([, m]) => m.streak > 0);
-    if (bad.length) lines.push(`   Nitter mirrors failing: ${bad.map(([b, m]) => `${b} (${m.streak} in a row)`).join(', ')}`);
+    // Each Nitter mirror is asked on every Twitter check, so this shows which ones are carrying the load and which are dead weight.
+    const mirrorRows = [];
+    for (const [base, now] of mirrorStats()) {
+        const prev = lastMirrorReport.get(base) || { ok: 0, fail: 0 };
+        const ok = now.ok - prev.ok, fail = now.fail - prev.fail;
+        lastMirrorReport.set(base, { ok: now.ok, fail: now.fail });
+        if (!ok && !fail) continue;
+        const why = fail && now.lastError ? ` (last: ${shortError(now.lastError, 50)})` : '';
+        mirrorRows.push(`   ${fail === 0 ? '✅' : ok === 0 ? '❌' : '⚠️'} ${base.replace(/^https?:\/\//, '')}: ${ok}/${ok + fail} ok${why}`);
+    }
+    if (mirrorRows.length) lines.push(`   Nitter mirrors this hour:\n${mirrorRows.join('\n')}`);
     return lines.join('\n');
 }
 

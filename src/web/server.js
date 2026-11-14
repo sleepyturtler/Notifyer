@@ -214,6 +214,13 @@ http.createServer((req, res) => {
             const h = healthStatus();
             res.writeHead(h.code, { 'Content-Type': 'text/plain' }); return res.end(h.text);
         }
+        // Public server count for a shields.io badge (/badge/dynamic/json?query=$.servers). Only this one number is exposed.
+        // 503 while the gateway is not ready, so the badge keeps showing its last good value instead of a wrong 0.
+        if (path === '/stats') {
+            if (!client.isReady()) { res.writeHead(503, { 'Content-Type': 'text/plain' }); return res.end('Not ready'); }
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' });
+            return res.end(JSON.stringify({ servers: client.guilds.cache.size }));
+        }
         if (path === '/') {
             res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(buildStatusHTML());
         }
